@@ -68,6 +68,24 @@ Use `--incognito-mode` when testing tools, prompts, or onboarding without touchi
 
 `--test-mode` is a visible alias for the same behavior. No heart path or heart passphrase is required. Spine creates a private temporary directory and a randomly keyed heart, suppresses recovery material and snapshots, and removes the heart, encrypted blobs, and action audit when the process exits normally. Provider credentials and local model paths work exactly as they do in persistent mode.
 
+### Web interface
+
+Add `--web-server` to project the same partner session through the embedded browser UI:
+
+```bash
+./target/release/spine chat "$HOME/.local/share/spine/default.spine" \
+  --web-server \
+  --model-dir "$SPINE_MINILM_DIR" \
+  --nli-model-dir "$SPINE_NLI_DIR" \
+  --server-url http://127.0.0.1:9001
+```
+
+The default UI address is `127.0.0.1:9002`. Spine prints the complete access URL at startup; open that URL rather than the bare address because its fragment contains a random per-process browser token. The fragment is kept out of HTTP requests and moved into browser session storage. Every JSON API call must then present it through `X-Spine-Token`.
+
+The browser and terminal share one harness, history, heart, task manager, and operator control plane. Live activity, tool calls/results, grounding, messages, guidance, graceful stop, interrupt, resume, and task inspection are available in the web view. The server accepts only loopback addresses or Tailscale's managed address range; wildcard and ordinary LAN binding are rejected.
+
+The single-binary asset approach and visual direction are inspired by llama.cpp's MIT-licensed `llama-ui`, while Spine's compact HTML/CSS/JavaScript and host API are implemented specifically for the Spine harness.
+
 ## Memory boundary
 
 This standalone baseline reads the new encrypted Rust heart only. The legacy Python DCMDb may run as a separate backup, but it is not a transparent fallback for `heart_recall`. Old memories must be imported or exposed through a deliberate dual-read bridge before they participate in the native partner's recall.

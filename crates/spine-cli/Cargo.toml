@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 async-trait.workspace = true
+axum.workspace = true
 clap.workspace = true
 blake3.workspace = true
 glob.workspace = true

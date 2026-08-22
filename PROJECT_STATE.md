@@ -10,6 +10,8 @@
 - The llama.cpp/OpenAI-compatible provider uses retry/backoff, explicit context budgeting, TCP keepalive, fresh request connections, and causal transport diagnostics.
 - Terminal activity updates in place rather than printing one line per tool event.
 - `--incognito-mode` (alias `--test-mode`) runs against a randomly keyed heart in a private temporary directory and does not require or modify a persistent heart.
+- `--web-server` serves an embedded single-binary UI on `127.0.0.1:9002` by default. Browser messages and controls enter the same harness loop as the terminal; no parallel agent session is created.
+- Web APIs require a random per-process fragment token and binding is restricted to loopback or Tailscale's managed address range.
 
 ## Security invariants
 
@@ -25,7 +27,7 @@ Legacy Python DCMDb/Thymos state is not queried by the native runtime. Running t
 
 ## Accepted verification
 
-- `cargo test --workspace --locked`: 53 tests.
+- `cargo test --workspace --locked`: 57 tests.
 - Strict workspace Clippy with all targets and features.
 - Formatting check across the workspace.
 - Optimized release build.

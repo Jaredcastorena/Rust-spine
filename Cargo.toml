@@ -17,6 +17,7 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 argon2 = "0.5.3"
 async-trait = "0.1.89"
+axum = "0.8"
 bip39 = { version = "2.2.2", features = ["rand", "zeroize"] }
 blake3 = "1.8.2"
 candle-core = "0.11.0"
@@ -39,7 +40,7 @@ sha2 = "0.11.0-rc.2"
 thiserror = "2.0.17"
 tempfile = "3.23.0"
 tokenizers = "0.22.2"
-tokio = { version = "1.47.1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "sync", "signal", "time"] }
+tokio = { version = "1.47.1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "signal", "time"] }
 uuid = { version = "1.18.1", features = ["v7", "serde"] }
 walkdir = "2.5.0"
 x25519-dalek = { version = "3.0.0", features = ["static_secrets", "zeroize"] }

@@ -5,6 +5,7 @@ mod cognition_tools;
 mod grounding;
 mod longmem;
 mod partner_tools;
+mod web_server;
 
 use std::{
     collections::BTreeMap,
@@ -108,6 +109,12 @@ enum Command {
         path: Option<PathBuf>,
         #[arg(long, visible_alias = "test-mode")]
         incognito_mode: bool,
+        #[arg(long)]
+        web_server: bool,
+        #[arg(long, default_value = "127.0.0.1")]
+        web_host: String,
+        #[arg(long, default_value_t = 9_002)]
+        web_port: u16,
         #[arg(long)]
         passphrase: Option<String>,
         #[arg(long)]
@@ -416,6 +423,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Chat {
             path,
             incognito_mode,
+            web_server: enable_web_server,
+            web_host,
+            web_port,
             passphrase,
             model_dir,
             server_url,
@@ -524,36 +534,79 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?
             .with_agent_id(agent_id.clone());
 
+            let (line_sender, mut line_receiver) = tokio::sync::mpsc::unbounded_channel();
+            let web_server = if enable_web_server {
+                Some(
+                    web_server::start(
+                        &web_host,
+                        web_port,
+                        line_sender.clone(),
+                        if incognito_mode {
+                            "temporary incognito heart".into()
+                        } else {
+                            path.display().to_string()
+                        },
+                        incognito_mode,
+                        grounding.is_some(),
+                        harness.registry().len(),
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
+            let web_ui = web_server.as_ref().map(web_server::WebServer::ui);
+            if let Some(server) = &web_server {
+                println!("Spine web UI: {}", server.access_url);
+            }
+
             let status = Arc::new(TerminalStatus::new());
             let event_status = Arc::clone(&status);
+            let event_web = web_ui.clone();
             let mut events = harness.subscribe();
             let event_task = tokio::spawn(async move {
                 while let Ok(event) = events.recv().await {
                     match event {
-                        HarnessEvent::ToolStarted { name, .. } => {
+                        HarnessEvent::ToolStarted { id, name } => {
                             event_status.show(tool_activity(&name));
+                            if let Some(web) = &event_web {
+                                web.activity(tool_activity(&name));
+                                web.tool_started(&id, &name);
+                            }
                         }
-                        HarnessEvent::ToolCompleted { .. } => {
+                        HarnessEvent::ToolCompleted { id, success, .. } => {
                             event_status.tool_completed();
+                            if let Some(web) = &event_web {
+                                web.tool_completed(&id, success);
+                            }
                         }
                         HarnessEvent::GuidanceInjected { .. } => {
                             event_status.show("Applying guidance");
+                            if let Some(web) = &event_web {
+                                web.activity("Applying guidance");
+                            }
                         }
                         HarnessEvent::GracefulStopBoundary => {
                             event_status.show("Stopping safely");
+                            if let Some(web) = &event_web {
+                                web.activity("Stopping safely");
+                            }
                         }
                         HarnessEvent::ModelTurnCompleted => {
                             event_status.show("Thinking");
+                            if let Some(web) = &event_web {
+                                web.activity("Thinking");
+                            }
                         }
                     }
                 }
             });
 
-            let (line_sender, mut line_receiver) = tokio::sync::mpsc::unbounded_channel();
+            let stdin_sender = line_sender.clone();
             thread::spawn(move || {
                 let stdin = io::stdin();
                 for line in stdin.lock().lines() {
-                    if line_sender.send(line).is_err() {
+                    if stdin_sender.send(line).is_err() {
                         break;
                     }
                 }
@@ -589,19 +642,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
                 if task == "/tasks" {
-                    println!("{}", running_tasks.format());
+                    let tasks = running_tasks.format();
+                    println!("{tasks}");
+                    if let Some(web) = &web_ui {
+                        web.notice(tasks);
+                    }
                     continue;
                 }
                 if let Some(task_id) = task.strip_prefix("/cancel-task ") {
-                    println!("{}", running_tasks.cancel(task_id.trim()));
+                    let result = running_tasks.cancel(task_id.trim());
+                    println!("{result}");
+                    if let Some(web) = &web_ui {
+                        web.notice(result);
+                    }
                     continue;
                 }
                 let is_resume = task == "/resume";
                 if is_resume && checkpoint.is_none() {
                     println!("[no resumable checkpoint]");
+                    if let Some(web) = &web_ui {
+                        web.notice("No resumable checkpoint");
+                        web.complete("", false, false);
+                    }
                     continue;
                 }
                 if !is_resume {
+                    if let Some(web) = &web_ui {
+                        web.begin_turn(task);
+                    }
                     status.begin("Checking memory");
                     let recalled = if heart.stats()?.events == 0 {
                         "[]".into()
@@ -667,6 +735,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "provider_or_harness_error",
                             )?;
                             status.end();
+                            if let Some(web) = &web_ui {
+                                web.fail(&error.to_string());
+                            }
                             eprintln!("[turn failed: {error}]");
                             if controlled.quit_after {
                                 break;
@@ -684,6 +755,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             "interrupted",
                         )?;
                         status.end();
+                        if let Some(web) = &web_ui {
+                            web.complete("", true, checkpoint.is_some());
+                        }
                         println!("[active turn interrupted]");
                         if controlled.quit_after {
                             break;
@@ -702,6 +776,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         && !outcome.response.trim().is_empty()
                     {
                         status.show("Verifying answer");
+                        if let Some(web) = &web_ui {
+                            web.activity("Verifying answer");
+                        }
                         let evidence = grounding::evidence_from_recall_and_messages(
                             &recalled,
                             &outcome.messages,
@@ -713,6 +790,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         heart.update_risk(&agent_id, &task_embedding, &retrieval_stats, tension)?;
                         if decision.needs_repair {
                             status.show("Repairing answer");
+                            if let Some(web) = &web_ui {
+                                web.activity("Repairing answer");
+                            }
                             let repair_history = outcome.messages[1..].to_vec();
                             let repair_start = repair_history.len() + 2;
                             let repair_task = format!(
@@ -755,6 +835,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         "interrupted",
                                     )?;
                                     status.show("Repair interrupted; using draft");
+                                    if let Some(web) = &web_ui {
+                                        web.notice("Repair interrupted; using draft");
+                                    }
                                 }
                                 Err(error) => {
                                     commit_control_text(
@@ -766,6 +849,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         "grounding_repair_error",
                                     )?;
                                     status.show("Repair unavailable; using draft");
+                                    if let Some(web) = &web_ui {
+                                        web.notice("Repair unavailable; using draft");
+                                    }
                                 }
                             }
                         } else if decision.claim_count == 0 {
@@ -776,11 +862,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     if !turn_leaves.is_empty() {
                         status.show("Saving context");
+                        if let Some(web) = &web_ui {
+                            web.activity("Saving context");
+                        }
                         heart.compact_context(turn_leaves, 6)?;
                     }
                     completed_turns = completed_turns.saturating_add(1);
                     if completed_turns.is_multiple_of(10) {
                         status.show("Maintaining memory");
+                        if let Some(web) = &web_ui {
+                            web.activity("Maintaining memory");
+                        }
                         heart.maintain_cognition(4)?;
                     }
                     checkpoint_from_outcome(
@@ -793,6 +885,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     )?;
                     history.push(Message::new(MessageRole::User, task));
                     status.end();
+                    if let Some(web) = &web_ui {
+                        web.capture_messages(&outcome.messages);
+                        web.complete(
+                            &outcome.response,
+                            outcome.stopped_gracefully,
+                            outcome.checkpoint.is_some(),
+                        );
+                    }
                     finish_visible_turn(
                         &outcome,
                         &mut history,
@@ -813,6 +913,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     unreachable!("new turns are handled above")
                 };
+                if let Some(web) = &web_ui {
+                    web.begin_resume();
+                }
                 status.begin("Resuming");
                 let controlled =
                     run_with_operator_controls(&harness, run, &mut line_receiver, status.as_ref())
@@ -829,6 +932,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             "provider_or_harness_error",
                         )?;
                         status.end();
+                        if let Some(web) = &web_ui {
+                            web.fail(&error.to_string());
+                        }
                         eprintln!("[resumed turn failed: {error}]");
                         if controlled.quit_after {
                             break;
@@ -846,6 +952,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "interrupted",
                     )?;
                     status.end();
+                    if let Some(web) = &web_ui {
+                        web.complete("", true, checkpoint.is_some());
+                    }
                     println!("[active turn interrupted]");
                     if controlled.quit_after {
                         break;
@@ -872,6 +981,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &mut checkpoint,
                 )?;
                 status.end();
+                if let Some(web) = &web_ui {
+                    web.capture_messages(&outcome.messages);
+                    web.complete(
+                        &outcome.response,
+                        outcome.stopped_gracefully,
+                        outcome.checkpoint.is_some(),
+                    );
+                }
                 finish_visible_turn(&outcome, &mut history, max_history_turns, max_history_chars);
                 if controlled.quit_after {
                     break;
@@ -883,6 +1000,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 let snapshot = heart.snapshot(Some("interactive-exit".into()))?;
                 println!("saved encrypted heart snapshot={snapshot}");
+            }
+            if let Some(server) = web_server {
+                server.shutdown().await;
             }
         }
         Command::HarnessRun {
