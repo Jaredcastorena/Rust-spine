@@ -55,6 +55,19 @@ On the first launch at a new heart path, Spine creates and initializes the encry
 
 During a turn, type guidance and press Enter to queue it at the next completed-tool boundary. `/stop` requests a graceful checkpoint, `/interrupt` stops immediately, `/resume` continues a checkpoint, `/tasks` shows host work, and `/quit` exits at a safe boundary.
 
+### Incognito test sessions
+
+Use `--incognito-mode` when testing tools, prompts, or onboarding without touching the persistent heart:
+
+```bash
+./target/release/spine chat --incognito-mode \
+  --model-dir "$SPINE_MINILM_DIR" \
+  --nli-model-dir "$SPINE_NLI_DIR" \
+  --server-url http://127.0.0.1:9001
+```
+
+`--test-mode` is a visible alias for the same behavior. No heart path or heart passphrase is required. Spine creates a private temporary directory and a randomly keyed heart, suppresses recovery material and snapshots, and removes the heart, encrypted blobs, and action audit when the process exits normally. Provider credentials and local model paths work exactly as they do in persistent mode.
+
 ## Memory boundary
 
 This standalone baseline reads the new encrypted Rust heart only. The legacy Python DCMDb may run as a separate backup, but it is not a transparent fallback for `heart_recall`. Old memories must be imported or exposed through a deliberate dual-read bridge before they participate in the native partner's recall.

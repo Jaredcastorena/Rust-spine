@@ -2409,7 +2409,9 @@ dependencies = [
  "async-trait",
  "blake3",
  "clap",
+ "getrandom 0.4.3",
  "glob",
+ "hex",
  "regex",
  "reqwest",
  "serde",
@@ -2417,6 +2419,7 @@ dependencies = [
  "spine-heart",
  "spine-models",
  "spine-runtime",
+ "tempfile",
  "tokio",
  "walkdir",
 ]

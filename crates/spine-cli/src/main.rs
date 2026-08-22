@@ -104,7 +104,10 @@ enum Command {
         embedding_batch_size: NonZeroUsize,
     },
     Chat {
-        path: PathBuf,
+        #[arg(required_unless_present = "incognito_mode")]
+        path: Option<PathBuf>,
+        #[arg(long, visible_alias = "test-mode")]
+        incognito_mode: bool,
         #[arg(long)]
         passphrase: Option<String>,
         #[arg(long)]
@@ -412,6 +415,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Chat {
             path,
+            incognito_mode,
             passphrase,
             model_dir,
             server_url,
@@ -430,31 +434,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_history_turns,
             max_history_chars,
         } => {
-            let passphrase = passphrase
-                .or_else(|| std::env::var("SPINE_HEART_PASSPHRASE").ok())
-                .filter(|value| !value.is_empty())
-                .ok_or("set SPINE_HEART_PASSPHRASE or pass --passphrase")?;
+            let heart_target = ChatHeartTarget::resolve(path, incognito_mode)?;
+            let path = &heart_target.path;
+            let passphrase = if incognito_mode {
+                ephemeral_passphrase()?
+            } else {
+                passphrase
+                    .or_else(|| std::env::var("SPINE_HEART_PASSPHRASE").ok())
+                    .filter(|value| !value.is_empty())
+                    .ok_or("set SPINE_HEART_PASSPHRASE or pass --passphrase")?
+            };
             let encoder = Arc::new(MiniLmEncoder::load(
                 MiniLmAssets::from_directory(model_dir),
                 256,
             )?);
             let heart = if path.exists() {
                 SpineHeart::open(
-                    HeartConfig::new(&path),
+                    HeartConfig::new(path),
                     KeySource::Passphrase(passphrase.clone()),
                 )?
             } else {
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                let created = SpineHeart::create(HeartConfig::new(&path), &passphrase)?;
+                let created = SpineHeart::create(HeartConfig::new(path), &passphrase)?;
                 created.heart.initialize_cognition(CognitiveConfig::new(
                     1,
                     encoder.manifest().clone(),
                     8,
                 )?)?;
-                println!("created new encrypted heart: {}", path.display());
-                println!("recovery phrase: {}", created.recovery_phrase.expose());
+                if incognito_mode {
+                    println!("Incognito mode: temporary encrypted heart; nothing will persist");
+                } else {
+                    println!("created new encrypted heart: {}", path.display());
+                    println!("recovery phrase: {}", created.recovery_phrase.expose());
+                }
                 created.heart
             };
             let heart = Arc::new(heart);
@@ -864,8 +878,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             event_task.abort();
-            let snapshot = heart.snapshot(Some("interactive-exit".into()))?;
-            println!("saved encrypted heart snapshot={snapshot}");
+            if incognito_mode {
+                println!("Incognito session ended; temporary heart discarded");
+            } else {
+                let snapshot = heart.snapshot(Some("interactive-exit".into()))?;
+                println!("saved encrypted heart snapshot={snapshot}");
+            }
         }
         Command::HarnessRun {
             path,
@@ -979,6 +997,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 const PARTNER_SYSTEM_PROMPT: &str = "You are Spine, a long-running partner backed by an encrypted portable heart. Preserve continuity with the supplied conversation history. Use heart_recall or fact tools whenever a request may depend on older conversations or stored facts. Use action tools to complete requested work, treat tool output as authoritative, never fabricate tool results or memories, and continue testing until the requested outcome is genuinely handled. Destructive actions remain host-gated. Give a clear final response after completing any needed tool calls.";
+
+struct ChatHeartTarget {
+    path: PathBuf,
+    _temporary: Option<tempfile::TempDir>,
+}
+
+impl ChatHeartTarget {
+    fn resolve(path: Option<PathBuf>, incognito_mode: bool) -> io::Result<Self> {
+        if incognito_mode {
+            let temporary = tempfile::Builder::new()
+                .prefix("rust-spine-incognito-")
+                .tempdir()?;
+            let path = temporary.path().join("incognito.spine");
+            return Ok(Self {
+                path,
+                _temporary: Some(temporary),
+            });
+        }
+        let path = path.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a heart path is required outside incognito mode",
+            )
+        })?;
+        Ok(Self {
+            path,
+            _temporary: None,
+        })
+    }
+}
+
+fn ephemeral_passphrase() -> Result<String, getrandom::Error> {
+    let mut random = [0_u8; 32];
+    getrandom::fill(&mut random)?;
+    Ok(hex::encode(random))
+}
 
 struct TerminalStatus {
     enabled: bool,
@@ -1312,4 +1366,62 @@ fn persist_harness_messages(
         }
     }
     Ok(leaves)
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    fn incognito_args(flag: &str) -> Vec<&str> {
+        vec!["spine", "chat", flag, "--model-dir", "models"]
+    }
+
+    #[test]
+    fn incognito_mode_does_not_require_a_heart_path() {
+        let cli = Cli::try_parse_from(incognito_args("--incognito-mode")).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Chat {
+                path: None,
+                incognito_mode: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_mode_is_a_visible_incognito_alias() {
+        let cli = Cli::try_parse_from(incognito_args("--test-mode")).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Chat {
+                path: None,
+                incognito_mode: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn persistent_chat_still_requires_a_heart_path() {
+        assert!(Cli::try_parse_from(["spine", "chat", "--model-dir", "models"]).is_err());
+    }
+
+    #[test]
+    fn temporary_heart_directory_is_removed_with_its_guard() {
+        let target = ChatHeartTarget::resolve(None, true).unwrap();
+        let directory = target.path.parent().unwrap().to_owned();
+        std::fs::write(&target.path, b"temporary-heart-marker").unwrap();
+        assert!(target.path.exists());
+        drop(target);
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn ephemeral_passphrases_are_random_and_nonempty() {
+        let first = ephemeral_passphrase().unwrap();
+        let second = ephemeral_passphrase().unwrap();
+        assert_eq!(first.len(), 64);
+        assert_ne!(first, second);
+    }
 }

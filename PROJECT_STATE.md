@@ -9,6 +9,7 @@
 - Tool rounds are unlimited by default and remain configurable with a positive ceiling.
 - The llama.cpp/OpenAI-compatible provider uses retry/backoff, explicit context budgeting, TCP keepalive, fresh request connections, and causal transport diagnostics.
 - Terminal activity updates in place rather than printing one line per tool event.
+- `--incognito-mode` (alias `--test-mode`) runs against a randomly keyed heart in a private temporary directory and does not require or modify a persistent heart.
 
 ## Security invariants
 
@@ -24,7 +25,7 @@ Legacy Python DCMDb/Thymos state is not queried by the native runtime. Running t
 
 ## Accepted verification
 
-- `cargo test --workspace --locked`: 48 tests.
+- `cargo test --workspace --locked`: 53 tests.
 - Strict workspace Clippy with all targets and features.
 - Formatting check across the workspace.
 - Optimized release build.
