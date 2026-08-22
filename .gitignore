@@ -1,0 +1,21 @@
+/target/
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/corpus/
+
+# Runtime state and secrets
+*.spine
+*.spine.blobs/
+*.jsonl
+*.log
+.env
+.env.*
+
+# Local tools
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

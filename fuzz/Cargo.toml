@@ -1,0 +1,26 @@
+[package]
+name = "spine-heart-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+spine-heart = { path = "../crates/spine-heart" }
+
+[[bin]]
+name = "text_boundaries"
+path = "fuzz_targets/text_boundaries.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cognitive_state"
+path = "fuzz_targets/cognitive_state.rs"
+test = false
+doc = false
+bench = false

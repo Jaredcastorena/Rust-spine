@@ -1,0 +1,25 @@
+[package]
+name = "spine-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "spine"
+path = "src/main.rs"
+
+[dependencies]
+async-trait.workspace = true
+clap.workspace = true
+blake3.workspace = true
+glob.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+spine-heart = { path = "../spine-heart" }
+spine-models = { path = "../spine-models" }
+spine-runtime = { path = "../spine-runtime" }
+tokio.workspace = true
+walkdir.workspace = true
