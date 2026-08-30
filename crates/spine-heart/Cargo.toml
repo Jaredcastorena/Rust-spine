@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Encrypted, portable cognitive state for Spine"
+publish = false
 
 [dependencies]
 argon2.workspace = true

@@ -4,11 +4,14 @@ mod agent_tools;
 mod cognition_tools;
 mod grounding;
 mod longmem;
+mod onboarding;
 mod partner_tools;
+#[cfg(test)]
+mod tool_smoke_tests;
 mod web_server;
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     future::Future,
     io::{self, BufRead, IsTerminal, Write},
     num::{NonZeroU64, NonZeroUsize},
@@ -33,7 +36,11 @@ use spine_runtime::{
 };
 
 #[derive(Parser)]
-#[command(name = "spine", version, about = "Portable encrypted Spine heart")]
+#[command(
+    name = "spine",
+    version,
+    about = "Single-binary encrypted AI partner for the terminal and browser"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -41,36 +48,41 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Create a new encrypted heart.
     Create {
         path: PathBuf,
-        #[arg(long)]
-        passphrase: String,
+        #[arg(long, help = "Heart passphrase (prefer the environment or prompt)")]
+        passphrase: Option<String>,
     },
+    /// Show encrypted-heart storage statistics.
     Stats {
         path: PathBuf,
-        #[arg(long)]
-        passphrase: String,
+        #[arg(long, help = "Heart passphrase (prefer the environment or prompt)")]
+        passphrase: Option<String>,
     },
+    /// Save a named encrypted snapshot.
     Snapshot {
         path: PathBuf,
-        #[arg(long)]
-        passphrase: String,
+        #[arg(long, help = "Heart passphrase (prefer the environment or prompt)")]
+        passphrase: Option<String>,
         #[arg(long)]
         label: Option<String>,
     },
+    /// Initialize native cognitive state for an existing heart.
     CognitionInit {
         path: PathBuf,
-        #[arg(long)]
-        passphrase: String,
+        #[arg(long, help = "Heart passphrase (prefer the environment or prompt)")]
+        passphrase: Option<String>,
         #[arg(long)]
         model_dir: PathBuf,
         #[arg(long, default_value_t = 8)]
         thymos_channels: usize,
     },
+    /// Store one message in native cognitive memory.
     Remember {
         path: PathBuf,
-        #[arg(long)]
-        passphrase: String,
+        #[arg(long, help = "Heart passphrase (prefer the environment or prompt)")]
+        passphrase: Option<String>,
         #[arg(long)]
         model_dir: PathBuf,
         #[arg(long, default_value = "main")]
@@ -79,10 +91,11 @@ enum Command {
         thread: String,
         text: String,
     },
+    /// Search native cognitive memory.
     Recall {
         path: PathBuf,
-        #[arg(long)]
-        passphrase: String,
+        #[arg(long, help = "Heart passphrase (prefer the environment or prompt)")]
+        passphrase: Option<String>,
         #[arg(long)]
         model_dir: PathBuf,
         #[arg(long, default_value_t = 8)]
@@ -93,10 +106,11 @@ enum Command {
         max_events_per_node: usize,
         query: String,
     },
+    /// Import a LongMemEval dataset into an empty heart.
     LongMemIngest {
         path: PathBuf,
-        #[arg(long)]
-        passphrase: String,
+        #[arg(long, help = "Heart passphrase (prefer the environment or prompt)")]
+        passphrase: Option<String>,
         #[arg(long)]
         model_dir: PathBuf,
         #[arg(long)]
@@ -104,32 +118,106 @@ enum Command {
         #[arg(long, default_value_t = NonZeroUsize::new(32).expect("nonzero"))]
         embedding_batch_size: NonZeroUsize,
     },
+    /// Talk to Spine in the terminal or embedded browser.
     Chat {
-        #[arg(required_unless_present = "incognito_mode")]
+        #[arg(
+            value_name = "HEART",
+            env = "SPINE_HEART_PATH",
+            hide_env_values = true,
+            help = "Encrypted heart path (defaults to the platform data directory)"
+        )]
         path: Option<PathBuf>,
-        #[arg(long, visible_alias = "test-mode")]
+        #[arg(
+            long,
+            visible_alias = "test-mode",
+            help = "Use a temporary heart that is deleted on exit"
+        )]
         incognito_mode: bool,
-        #[arg(long)]
+        #[arg(
+            long = "web",
+            visible_alias = "web-server",
+            help = "Serve the embedded browser interface"
+        )]
         web_server: bool,
-        #[arg(long, default_value = "127.0.0.1")]
+        #[arg(
+            long,
+            default_value = "127.0.0.1",
+            requires = "web_server",
+            help = "Address for the embedded web interface"
+        )]
         web_host: String,
-        #[arg(long, default_value_t = 9_002)]
+        #[arg(
+            long,
+            default_value_t = 8_088,
+            requires = "web_server",
+            help = "Port for the embedded web interface"
+        )]
         web_port: u16,
-        #[arg(long)]
+        #[arg(
+            long,
+            requires = "web_server",
+            help = "Allow a non-loopback web bind (HTTP token authentication is not TLS)"
+        )]
+        allow_remote_web: bool,
+        #[arg(
+            long,
+            env = "SPINE_HEART_PASSPHRASE",
+            hide_env_values = true,
+            help = "Heart passphrase (prefer the environment or prompt)"
+        )]
         passphrase: Option<String>,
-        #[arg(long)]
-        model_dir: PathBuf,
-        #[arg(long, default_value = "http://127.0.0.1:9001")]
+        #[arg(
+            long,
+            env = "SPINE_MINILM_DIR",
+            hide_env_values = true,
+            help = "MiniLM snapshot directory"
+        )]
+        model_dir: Option<PathBuf>,
+        #[arg(
+            long,
+            env = "SPINE_LLAMA_MODEL",
+            hide_env_values = true,
+            requires = "llama_server_bin",
+            help = "GGUF model to serve in a managed local llama.cpp process"
+        )]
+        llama_model: Option<PathBuf>,
+        #[arg(
+            long,
+            env = "SPINE_LLAMA_SERVER",
+            hide_env_values = true,
+            requires = "llama_model",
+            help = "llama-server executable to start and stop with this session"
+        )]
+        llama_server_bin: Option<PathBuf>,
+        #[arg(
+            long,
+            default_value_t = -1,
+            allow_hyphen_values = true,
+            help = "GPU layers for a managed llama-server (-1 means all)"
+        )]
+        gpu_layers: i32,
+        #[arg(
+            long,
+            env = "SPINE_LLM_URL",
+            hide_env_values = true,
+            default_value = "http://127.0.0.1:8080",
+            help = "OpenAI-compatible server base URL"
+        )]
         server_url: String,
-        #[arg(long)]
+        #[arg(long, env = "SPINE_LLM_API_KEY", hide = true, hide_env_values = true)]
         api_key: Option<String>,
-        #[arg(long)]
+        #[arg(
+            long,
+            env = "SPINE_LLM_MODEL",
+            hide_env_values = true,
+            help = "Provider model name when the endpoint requires one"
+        )]
         server_model: Option<String>,
         #[arg(long, default_value = "main")]
         agent: String,
         #[arg(long, default_value = "interactive")]
         thread: String,
-        #[arg(long)]
+        #[arg(long, help = "Optional positive ceiling for tool rounds")]
         max_tool_rounds: Option<NonZeroU64>,
         #[arg(long, default_value_t = 8_192)]
         max_tokens: i64,
@@ -139,28 +227,60 @@ enum Command {
         timeout_seconds: u64,
         #[arg(long, default_value_t = 2)]
         provider_retries: u32,
-        #[arg(long)]
+        #[arg(
+            long,
+            env = "SPINE_MAX_CONTEXT_TOKENS",
+            hide_env_values = true,
+            help = "Provider context-window ceiling"
+        )]
         max_context_tokens: Option<usize>,
-        #[arg(long)]
+        #[arg(
+            long,
+            env = "SPINE_NLI_DIR",
+            hide_env_values = true,
+            help = "Optional local NLI snapshot directory"
+        )]
         nli_model_dir: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(
+            long,
+            conflicts_with = "nli_model_dir",
+            help = "Disable answer grounding explicitly"
+        )]
+        no_nli: bool,
+        #[arg(long, help = "Permit the model to request unverified memory writes")]
         allow_model_memory_writes: bool,
-        #[arg(long, default_value_t = 12)]
+        #[arg(long, help = "Skip the first-heart getting-to-know-you conversation")]
+        skip_onboarding: bool,
+        #[arg(
+            long,
+            default_value_t = 12,
+            help = "Conversation turns retained in the live provider context"
+        )]
         max_history_turns: usize,
-        #[arg(long, default_value_t = 64_000)]
+        #[arg(
+            long,
+            default_value_t = 64_000,
+            help = "Character budget retained in the live provider context"
+        )]
         max_history_chars: usize,
     },
+    /// Execute one non-interactive harness task.
     HarnessRun {
         path: PathBuf,
-        #[arg(long)]
-        passphrase: String,
+        #[arg(long, help = "Heart passphrase (prefer the environment or prompt)")]
+        passphrase: Option<String>,
         #[arg(long)]
         model_dir: PathBuf,
-        #[arg(long, default_value = "http://127.0.0.1:9001")]
+        #[arg(
+            long,
+            env = "SPINE_LLM_URL",
+            hide_env_values = true,
+            default_value = "http://127.0.0.1:8080"
+        )]
         server_url: String,
-        #[arg(long)]
+        #[arg(long, env = "SPINE_LLM_API_KEY", hide = true, hide_env_values = true)]
         api_key: Option<String>,
-        #[arg(long)]
+        #[arg(long, env = "SPINE_LLM_MODEL", hide_env_values = true)]
         server_model: Option<String>,
         #[arg(long, default_value = "main")]
         agent: String,
@@ -176,7 +296,7 @@ enum Command {
         timeout_seconds: u64,
         #[arg(long, default_value_t = 2)]
         provider_retries: u32,
-        #[arg(long)]
+        #[arg(long, env = "SPINE_MAX_CONTEXT_TOKENS", hide_env_values = true)]
         max_context_tokens: Option<usize>,
         task: String,
     },
@@ -187,11 +307,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     match cli.command {
         Command::Create { path, passphrase } => {
+            let passphrase = resolve_heart_passphrase(passphrase, true)?;
             let created = SpineHeart::create(HeartConfig::new(&path), &passphrase)?;
             println!("created {}", created.heart.path().display());
             println!("recovery phrase: {}", created.recovery_phrase.expose());
         }
         Command::Stats { path, passphrase } => {
+            let passphrase = resolve_heart_passphrase(passphrase, false)?;
             let heart =
                 SpineHeart::open(HeartConfig::new(&path), KeySource::Passphrase(passphrase))?;
             let stats = heart.stats()?;
@@ -205,6 +327,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             passphrase,
             label,
         } => {
+            let passphrase = resolve_heart_passphrase(passphrase, false)?;
             let heart =
                 SpineHeart::open(HeartConfig::new(&path), KeySource::Passphrase(passphrase))?;
             println!("{}", heart.snapshot(label)?);
@@ -215,6 +338,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             model_dir,
             thymos_channels,
         } => {
+            let passphrase = resolve_heart_passphrase(passphrase, false)?;
             let heart =
                 SpineHeart::open(HeartConfig::new(&path), KeySource::Passphrase(passphrase))?;
             let encoder = MiniLmEncoder::load(MiniLmAssets::from_directory(model_dir), 256)?;
@@ -233,6 +357,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             thread,
             text,
         } => {
+            let passphrase = resolve_heart_passphrase(passphrase, false)?;
             let heart =
                 SpineHeart::open(HeartConfig::new(&path), KeySource::Passphrase(passphrase))?;
             let encoder = MiniLmEncoder::load(MiniLmAssets::from_directory(model_dir), 256)?;
@@ -260,6 +385,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_events_per_node,
             query,
         } => {
+            let passphrase = resolve_heart_passphrase(passphrase, false)?;
             let heart =
                 SpineHeart::open(HeartConfig::new(&path), KeySource::Passphrase(passphrase))?;
             let encoder = MiniLmEncoder::load(MiniLmAssets::from_directory(model_dir), 256)?;
@@ -321,6 +447,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             dataset,
             embedding_batch_size,
         } => {
+            let passphrase = resolve_heart_passphrase(passphrase, false)?;
             let heart =
                 SpineHeart::open(HeartConfig::new(&path), KeySource::Passphrase(passphrase))?;
             let stats = heart.stats()?;
@@ -426,8 +553,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             web_server: enable_web_server,
             web_host,
             web_port,
+            allow_remote_web,
             passphrase,
             model_dir,
+            llama_model,
+            llama_server_bin,
+            gpu_layers,
             server_url,
             api_key,
             server_model,
@@ -440,29 +571,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             provider_retries,
             max_context_tokens,
             nli_model_dir,
+            no_nli,
             allow_model_memory_writes,
+            skip_onboarding,
             max_history_turns,
             max_history_chars,
         } => {
             let heart_target = ChatHeartTarget::resolve(path, incognito_mode)?;
             let path = &heart_target.path;
+            let model_dir = resolve_required_model_directory(model_dir)?;
+            let nli_model_dir = if no_nli {
+                None
+            } else {
+                resolve_optional_nli_directory(nli_model_dir)?
+            };
             let passphrase = if incognito_mode {
                 ephemeral_passphrase()?
             } else {
-                passphrase
-                    .or_else(|| std::env::var("SPINE_HEART_PASSPHRASE").ok())
-                    .filter(|value| !value.is_empty())
-                    .ok_or("set SPINE_HEART_PASSPHRASE or pass --passphrase")?
+                resolve_heart_passphrase(passphrase, !path.exists())?
             };
             let encoder = Arc::new(MiniLmEncoder::load(
                 MiniLmAssets::from_directory(model_dir),
                 256,
             )?);
-            let heart = if path.exists() {
-                SpineHeart::open(
-                    HeartConfig::new(path),
-                    KeySource::Passphrase(passphrase.clone()),
-                )?
+            let (heart, created_new_heart) = if path.exists() {
+                (
+                    SpineHeart::open(
+                        HeartConfig::new(path),
+                        KeySource::Passphrase(passphrase.clone()),
+                    )?,
+                    false,
+                )
             } else {
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent)?;
@@ -479,21 +618,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("created new encrypted heart: {}", path.display());
                     println!("recovery phrase: {}", created.recovery_phrase.expose());
                 }
-                created.heart
+                (created.heart, true)
             };
             let heart = Arc::new(heart);
+            let heart_was_empty = heart.stats()?.events == 0;
             let agent_id = AgentId::new(agent)?;
             let thread_id = ThreadId::new(thread)?;
+            let resolved_api_key = api_key.filter(|value| !value.is_empty()).or_else(|| {
+                std::env::var("SPINE_LLM_API_KEY")
+                    .ok()
+                    .filter(|value| !value.is_empty())
+            });
+            let mut managed_server = match (llama_server_bin, llama_model) {
+                (Some(binary), Some(model)) => Some(ManagedLlamaServer::start(
+                    &binary,
+                    &model,
+                    &server_url,
+                    gpu_layers,
+                    max_context_tokens.unwrap_or(115_968),
+                    resolved_api_key.as_deref(),
+                    path.with_extension("llama-server.log"),
+                )?),
+                (None, None) => None,
+                _ => {
+                    return Err("--llama-model and --llama-server-bin must be used together".into());
+                }
+            };
             let mut provider_config = LlamaCppConfig::new(server_url);
-            provider_config.api_key = api_key.or_else(|| std::env::var("SPINE_LLM_API_KEY").ok());
+            provider_config.api_key = resolved_api_key;
             provider_config.model = server_model;
             provider_config.max_tokens = max_tokens;
             provider_config.temperature = temperature;
             provider_config.timeout = Duration::from_secs(timeout_seconds);
             provider_config.maximum_retries = provider_retries;
             provider_config.max_context_tokens = max_context_tokens;
-            let provider = Arc::new(LlamaCppProvider::new(provider_config)?);
-            provider.health().await?;
+            let provider = LlamaCppProvider::new(provider_config)?;
+            if let Some(server) = managed_server.as_mut() {
+                wait_for_managed_server(&provider, server, Duration::from_secs(120)).await?;
+            } else {
+                provider.health().await?;
+            }
+            report_provider_settings(&provider);
+            let provider = Arc::new(provider);
             let grounding = nli_model_dir
                 .map(grounding::GroundingGate::load)
                 .transpose()?;
@@ -525,7 +691,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cognitive_config.thymos_channels,
             )?;
             let harness = Harness::new(
-                provider,
+                provider.clone(),
                 registry,
                 HarnessConfig {
                     max_tool_rounds,
@@ -538,14 +704,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let web_server = if enable_web_server {
                 Some(
                     web_server::start(
-                        &web_host,
-                        web_port,
-                        line_sender.clone(),
-                        if incognito_mode {
-                            "temporary incognito heart".into()
-                        } else {
-                            path.display().to_string()
+                        web_server::WebBind {
+                            host: &web_host,
+                            port: web_port,
+                            allow_remote: allow_remote_web,
                         },
+                        line_sender.clone(),
+                        web_heart_label(path, incognito_mode),
                         incognito_mode,
                         grounding.is_some(),
                         harness.registry().len(),
@@ -612,110 +777,403 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             });
 
-            println!(
-                "Spine ready: Rust heart={} events={} tools={} grounding={} (/tasks, /stop, /interrupt, /resume, /quit)",
-                path.display(),
-                heart.stats()?.events,
-                harness.registry().len(),
-                if grounding.is_some() {
-                    "NLI"
+            let onboarding_state = onboarding::OnboardingState::inspect(&heart.events_canonical()?);
+            let should_onboard =
+                created_new_heart || heart_was_empty || onboarding_state.in_progress();
+            let mut interaction_profile = onboarding_state.profile.clone();
+            let mut quit_after_onboarding = false;
+            if should_onboard {
+                if skip_onboarding {
+                    onboarding::record_skipped(
+                        &heart,
+                        encoder.as_ref(),
+                        &agent_id,
+                        &thread_id,
+                        "first conversation skipped by operator flag",
+                    )?;
+                    let message = "No problem—we can learn how to work together as we go.";
+                    println!("spine> {message}");
+                    if let Some(web) = &web_ui {
+                        web.finish_onboarding(message, true);
+                    }
                 } else {
-                    "disabled"
-                },
+                    let result = run_first_conversation(
+                        provider.as_ref(),
+                        &heart,
+                        encoder.as_ref(),
+                        &agent_id,
+                        &thread_id,
+                        onboarding_state,
+                        &mut line_receiver,
+                        web_ui.as_ref(),
+                        status.as_ref(),
+                    )
+                    .await?;
+                    interaction_profile = result.profile.or(interaction_profile);
+                    quit_after_onboarding = result.quit;
+                }
+            }
+            let partner_system_prompt = format!(
+                "{PARTNER_SYSTEM_PROMPT}{}",
+                onboarding::profile_context(interaction_profile.as_ref())
             );
+
+            if !quit_after_onboarding {
+                println!(
+                    "Spine ready: Rust heart={} events={} tools={} grounding={} (/tasks, /stop, /interrupt, /resume, /quit)",
+                    path.display(),
+                    heart.stats()?.events,
+                    harness.registry().len(),
+                    if grounding.is_some() {
+                        "NLI"
+                    } else {
+                        "disabled"
+                    },
+                );
+            }
             let mut history = Vec::<Message>::new();
             let mut checkpoint = None::<HarnessCheckpoint>;
             let mut completed_turns = 0_u64;
-            loop {
-                print!("you> ");
-                io::stdout().flush()?;
-                let Some(line) = line_receiver.recv().await else {
-                    println!();
-                    break;
-                };
-                let task = line?;
-                let task = task.trim();
-                if matches!(task, "/quit" | "/exit") {
-                    break;
-                }
-                if task.is_empty() {
-                    continue;
-                }
-                if task == "/tasks" {
-                    let tasks = running_tasks.format();
-                    println!("{tasks}");
-                    if let Some(web) = &web_ui {
-                        web.notice(tasks);
-                    }
-                    continue;
-                }
-                if let Some(task_id) = task.strip_prefix("/cancel-task ") {
-                    let result = running_tasks.cancel(task_id.trim());
-                    println!("{result}");
-                    if let Some(web) = &web_ui {
-                        web.notice(result);
-                    }
-                    continue;
-                }
-                let is_resume = task == "/resume";
-                if is_resume && checkpoint.is_none() {
-                    println!("[no resumable checkpoint]");
-                    if let Some(web) = &web_ui {
-                        web.notice("No resumable checkpoint");
-                        web.complete("", false, false);
-                    }
-                    continue;
-                }
-                if !is_resume {
-                    if let Some(web) = &web_ui {
-                        web.begin_turn(task);
-                    }
-                    status.begin("Checking memory");
-                    let recalled = if heart.stats()?.events == 0 {
-                        "[]".into()
-                    } else {
-                        cognition_tools::recall_context(&heart, &encoder, task, 5)?
+            if !quit_after_onboarding {
+                loop {
+                    print!("you> ");
+                    io::stdout().flush()?;
+                    let Some(line) = line_receiver.recv().await else {
+                        println!();
+                        break;
                     };
-                    let recalled_count = serde_json::from_str::<Vec<serde_json::Value>>(&recalled)
-                        .map_or(0, |items| items.len());
-                    let retrieval_stats = [
-                        (recalled_count as f32 / 10.0).min(1.0),
-                        if recalled_count == 0 { 1.0 } else { 0.0 },
-                        0.0,
-                        0.0,
-                    ];
-                    let task_embedding = encoder.encode(task)?;
-                    let triangle_context =
-                        cognition_tools::rehydrate_triangle_context(&heart, &task_embedding)?;
-                    let risk = heart.predict_risk(&agent_id, &task_embedding, &retrieval_stats)?;
-                    let user_commit = commit_text(
-                        &heart,
-                        &encoder,
-                        &agent_id,
-                        &thread_id,
-                        ParticipantRole::User,
-                        EventKind::Message,
-                        task,
-                        None,
-                    )?;
-                    let feeling = heart.feel(&agent_id, &task_embedding)?.map_or_else(
-                        || "unavailable".into(),
-                        |value| {
-                            serde_json::to_string(&value).unwrap_or_else(|_| "unavailable".into())
-                        },
-                    );
-                    let system_prompt = format!(
-                        "{PARTNER_SYSTEM_PROMPT}\n\nCurrent Thymos proprioception: {feeling}\nHost risk estimate for this memory region: {risk:.3}. At higher risk, deepen recall and avoid unsupported certainty.\n\nAutomatically recalled canonical evidence for this turn (it may be irrelevant; verify before using):\n{recalled}\n\nBudgeted triangle-context rehydration:\n{triangle_context}\n\nRunning/recent host tasks:\n{}",
-                        running_tasks.format()
-                    );
-                    let persist_start = history.len() + 2;
-                    let mut turn_leaves = vec![ContextLeaf {
-                        node_id: user_commit.1.node_id,
-                        chronology: user_commit.0.event.body.device_sequence,
-                    }];
-                    let run = Box::pin(harness.run_with_history(system_prompt, &history, task))
-                        as std::pin::Pin<Box<dyn Future<Output = _>>>;
-                    status.show("Thinking");
+                    let task = line?;
+                    let task = task.trim();
+                    if matches!(task, "/quit" | "/exit") {
+                        break;
+                    }
+                    if task.is_empty() {
+                        continue;
+                    }
+                    if task == "/tasks" {
+                        let tasks = running_tasks.format();
+                        println!("{tasks}");
+                        if let Some(web) = &web_ui {
+                            web.notice(tasks);
+                        }
+                        continue;
+                    }
+                    if let Some(task_id) = task.strip_prefix("/cancel-task ") {
+                        let result = running_tasks.cancel(task_id.trim());
+                        println!("{result}");
+                        if let Some(web) = &web_ui {
+                            web.notice(result);
+                        }
+                        continue;
+                    }
+                    let is_resume = task == "/resume";
+                    if is_resume && checkpoint.is_none() {
+                        println!("[no resumable checkpoint]");
+                        if let Some(web) = &web_ui {
+                            web.notice("No resumable checkpoint");
+                            web.complete("", false, false);
+                        }
+                        continue;
+                    }
+                    if !is_resume {
+                        if let Some(web) = &web_ui {
+                            web.begin_turn(task);
+                        }
+                        status.begin("Checking memory");
+                        let recalled = if heart.stats()?.events == 0 {
+                            "[]".into()
+                        } else {
+                            cognition_tools::recall_context(&heart, encoder.as_ref(), task, 5)?
+                        };
+                        let recalled_count =
+                            serde_json::from_str::<Vec<serde_json::Value>>(&recalled)
+                                .map_or(0, |items| items.len());
+                        let retrieval_stats = [
+                            (recalled_count as f32 / 10.0).min(1.0),
+                            if recalled_count == 0 { 1.0 } else { 0.0 },
+                            0.0,
+                            0.0,
+                        ];
+                        let task_embedding = encoder.encode(task)?;
+                        let triangle_context =
+                            cognition_tools::rehydrate_triangle_context(&heart, &task_embedding)?;
+                        let risk =
+                            heart.predict_risk(&agent_id, &task_embedding, &retrieval_stats)?;
+                        let user_commit = commit_text(
+                            &heart,
+                            &encoder,
+                            &agent_id,
+                            &thread_id,
+                            ParticipantRole::User,
+                            EventKind::Message,
+                            task,
+                            None,
+                        )?;
+                        let feeling = heart.feel(&agent_id, &task_embedding)?.map_or_else(
+                            || "unavailable".into(),
+                            |value| {
+                                serde_json::to_string(&value)
+                                    .unwrap_or_else(|_| "unavailable".into())
+                            },
+                        );
+                        let system_prompt = format!(
+                            "{partner_system_prompt}\n\nCurrent Thymos proprioception: {feeling}\nHost risk estimate for this memory region: {risk:.3}. At higher risk, deepen recall and avoid unsupported certainty.\n\nAutomatically recalled canonical evidence for this turn (it may be irrelevant; verify before using):\n{recalled}\n\nBudgeted triangle-context rehydration:\n{triangle_context}\n\nRunning/recent host tasks:\n{}",
+                            running_tasks.format()
+                        );
+                        let persist_start = history.len() + 2;
+                        let mut turn_leaves = vec![ContextLeaf {
+                            node_id: user_commit.1.node_id,
+                            chronology: user_commit.0.event.body.device_sequence,
+                        }];
+                        let run = Box::pin(harness.run_with_history(system_prompt, &history, task))
+                            as std::pin::Pin<Box<dyn Future<Output = _>>>;
+                        status.show("Thinking");
+                        let controlled = run_with_operator_controls(
+                            &harness,
+                            run,
+                            &mut line_receiver,
+                            status.as_ref(),
+                        )
+                        .await;
+                        let outcome = match controlled.outcome {
+                            Ok(outcome) => outcome,
+                            Err(error) => {
+                                commit_control_text(
+                                    &heart,
+                                    &encoder,
+                                    &agent_id,
+                                    &thread_id,
+                                    &format!("active turn failed: {error}"),
+                                    "provider_or_harness_error",
+                                )?;
+                                status.end();
+                                if let Some(web) = &web_ui {
+                                    web.fail(&error.to_string());
+                                }
+                                eprintln!("[turn failed: {error}]");
+                                if controlled.quit_after {
+                                    break;
+                                }
+                                continue;
+                            }
+                        };
+                        let Some(mut outcome) = outcome else {
+                            commit_control_text(
+                                &heart,
+                                &encoder,
+                                &agent_id,
+                                &thread_id,
+                                "operator interrupted the active turn",
+                                "interrupted",
+                            )?;
+                            status.end();
+                            if let Some(web) = &web_ui {
+                                web.complete("", true, checkpoint.is_some());
+                            }
+                            println!("[active turn interrupted]");
+                            if controlled.quit_after {
+                                break;
+                            }
+                            continue;
+                        };
+                        turn_leaves.extend(persist_harness_messages(
+                            &heart,
+                            &encoder,
+                            &agent_id,
+                            &thread_id,
+                            &outcome.messages[persist_start.min(outcome.messages.len())..],
+                        )?);
+                        let mut quit_after = controlled.quit_after;
+                        if let Some(gate) = &grounding
+                            && !outcome.response.trim().is_empty()
+                        {
+                            status.show("Verifying answer");
+                            if let Some(web) = &web_ui {
+                                web.activity("Verifying answer");
+                            }
+                            let evidence = grounding::evidence_from_recall_and_messages(
+                                &recalled,
+                                &outcome.messages,
+                            );
+                            let decision = gate.verify(&outcome.response, &evidence);
+                            if let Err(error) = &decision {
+                                commit_control_text(
+                                    &heart,
+                                    &encoder,
+                                    &agent_id,
+                                    &thread_id,
+                                    &format!("grounding verification failed: {error}"),
+                                    "grounding_verifier_error",
+                                )?;
+                                status.show("Verifier unavailable; using answer");
+                                if let Some(web) = &web_ui {
+                                    web.notice("Grounding verifier unavailable; using answer");
+                                }
+                            }
+                            if let Ok(decision) = decision {
+                                let tension = (0.6 * (1.0 - decision.report.coverage)
+                                    + 0.4 * decision.report.contradiction)
+                                    .clamp(0.0, 1.0);
+                                heart.update_risk(
+                                    &agent_id,
+                                    &task_embedding,
+                                    &retrieval_stats,
+                                    tension,
+                                )?;
+                                if decision.needs_repair {
+                                    status.show("Repairing answer");
+                                    if let Some(web) = &web_ui {
+                                        web.activity("Repairing answer");
+                                    }
+                                    let repair_history = outcome.messages[1..].to_vec();
+                                    let repair_start = repair_history.len() + 2;
+                                    let repair_task = format!(
+                                        "[HOST GROUNDING REPAIR] The draft's factual coverage was {:.3} and contradiction risk was {:.3}. Re-check the supplied evidence and tool results. Use more recall/tools if needed, correct unsupported claims, and abstain explicitly where evidence remains insufficient. Return the corrected final answer.",
+                                        decision.report.coverage, decision.report.contradiction
+                                    );
+                                    let repair = Box::pin(harness.run_with_history(
+                                        partner_system_prompt.clone(),
+                                        &repair_history,
+                                        repair_task,
+                                    ))
+                                        as std::pin::Pin<Box<dyn Future<Output = _>>>;
+                                    let repaired = run_with_operator_controls(
+                                        &harness,
+                                        repair,
+                                        &mut line_receiver,
+                                        status.as_ref(),
+                                    )
+                                    .await;
+                                    quit_after |= repaired.quit_after;
+                                    match repaired.outcome {
+                                        Ok(Some(mut repaired_outcome)) => {
+                                            let repaired_evidence =
+                                                grounding::evidence_from_recall_and_messages(
+                                                    &recalled,
+                                                    &repaired_outcome.messages,
+                                                );
+                                            let still_unverified = gate
+                                                .verify(
+                                                    &repaired_outcome.response,
+                                                    &repaired_evidence,
+                                                )
+                                                .map_or(true, |decision| decision.needs_repair);
+                                            if still_unverified {
+                                                grounding::append_terminal_caveat(
+                                                    &mut repaired_outcome,
+                                                );
+                                                status
+                                                    .show("Answer caveated after grounding repair");
+                                                if let Some(web) = &web_ui {
+                                                    web.notice(concat!(
+                                                    "Some claims remained unverified after repair; ",
+                                                    "a terminal caveat was added"
+                                                ));
+                                                }
+                                            }
+                                            turn_leaves.extend(persist_harness_messages(
+                                                &heart,
+                                                &encoder,
+                                                &agent_id,
+                                                &thread_id,
+                                                &repaired_outcome.messages[repair_start
+                                                    .min(repaired_outcome.messages.len())..],
+                                            )?);
+                                            outcome = repaired_outcome;
+                                        }
+                                        Ok(None) => {
+                                            commit_control_text(
+                                                &heart,
+                                                &encoder,
+                                                &agent_id,
+                                                &thread_id,
+                                                "operator interrupted the grounding repair",
+                                                "interrupted",
+                                            )?;
+                                            status.show("Repair interrupted; using draft");
+                                            if let Some(web) = &web_ui {
+                                                web.notice("Repair interrupted; using draft");
+                                            }
+                                        }
+                                        Err(error) => {
+                                            commit_control_text(
+                                                &heart,
+                                                &encoder,
+                                                &agent_id,
+                                                &thread_id,
+                                                &format!("grounding repair failed: {error}"),
+                                                "grounding_repair_error",
+                                            )?;
+                                            status.show("Repair unavailable; using draft");
+                                            if let Some(web) = &web_ui {
+                                                web.notice("Repair unavailable; using draft");
+                                            }
+                                        }
+                                    }
+                                } else if decision.claim_count == 0 {
+                                    status.show("Answer ready");
+                                } else {
+                                    status.show("Answer verified");
+                                }
+                            }
+                        }
+                        if !turn_leaves.is_empty() {
+                            status.show("Saving context");
+                            if let Some(web) = &web_ui {
+                                web.activity("Saving context");
+                            }
+                            heart.compact_context(turn_leaves, 6)?;
+                        }
+                        completed_turns = completed_turns.saturating_add(1);
+                        if completed_turns.is_multiple_of(10) {
+                            status.show("Maintaining memory");
+                            if let Some(web) = &web_ui {
+                                web.activity("Maintaining memory");
+                            }
+                            heart.maintain_cognition(4)?;
+                        }
+                        checkpoint_from_outcome(
+                            &heart,
+                            &encoder,
+                            &agent_id,
+                            &thread_id,
+                            &outcome,
+                            &mut checkpoint,
+                        )?;
+                        history.push(Message::new(MessageRole::User, task));
+                        status.end();
+                        if let Some(web) = &web_ui {
+                            web.capture_messages(&outcome.messages);
+                            web.complete(
+                                &outcome.response,
+                                outcome.stopped_gracefully,
+                                outcome.checkpoint.is_some(),
+                            );
+                        }
+                        finish_visible_turn(
+                            &outcome,
+                            &mut history,
+                            max_history_turns,
+                            max_history_chars,
+                        );
+                        if quit_after {
+                            break;
+                        }
+                        continue;
+                    }
+                    let persist_start;
+                    let run = if is_resume {
+                        let resumable = checkpoint.take().expect("checkpoint exists");
+                        persist_start = resumable.messages.len() + 1;
+                        Box::pin(harness.resume(resumable))
+                            as std::pin::Pin<Box<dyn Future<Output = _>>>
+                    } else {
+                        unreachable!("new turns are handled above")
+                    };
+                    if let Some(web) = &web_ui {
+                        web.begin_resume();
+                    }
+                    status.begin("Resuming");
                     let controlled = run_with_operator_controls(
                         &harness,
                         run,
@@ -731,21 +1189,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 &encoder,
                                 &agent_id,
                                 &thread_id,
-                                &format!("active turn failed: {error}"),
+                                &format!("resumed turn failed: {error}"),
                                 "provider_or_harness_error",
                             )?;
                             status.end();
                             if let Some(web) = &web_ui {
                                 web.fail(&error.to_string());
                             }
-                            eprintln!("[turn failed: {error}]");
+                            eprintln!("[resumed turn failed: {error}]");
                             if controlled.quit_after {
                                 break;
                             }
                             continue;
                         }
                     };
-                    let Some(mut outcome) = outcome else {
+                    let Some(outcome) = outcome else {
                         commit_control_text(
                             &heart,
                             &encoder,
@@ -764,116 +1222,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         continue;
                     };
-                    turn_leaves.extend(persist_harness_messages(
+                    let leaves = persist_harness_messages(
                         &heart,
                         &encoder,
                         &agent_id,
                         &thread_id,
                         &outcome.messages[persist_start.min(outcome.messages.len())..],
-                    )?);
-                    let mut quit_after = controlled.quit_after;
-                    if let Some(gate) = &grounding
-                        && !outcome.response.trim().is_empty()
-                    {
-                        status.show("Verifying answer");
-                        if let Some(web) = &web_ui {
-                            web.activity("Verifying answer");
-                        }
-                        let evidence = grounding::evidence_from_recall_and_messages(
-                            &recalled,
-                            &outcome.messages,
-                        );
-                        let decision = gate.verify(&outcome.response, &evidence)?;
-                        let tension = (0.6 * (1.0 - decision.report.coverage)
-                            + 0.4 * decision.report.contradiction)
-                            .clamp(0.0, 1.0);
-                        heart.update_risk(&agent_id, &task_embedding, &retrieval_stats, tension)?;
-                        if decision.needs_repair {
-                            status.show("Repairing answer");
-                            if let Some(web) = &web_ui {
-                                web.activity("Repairing answer");
-                            }
-                            let repair_history = outcome.messages[1..].to_vec();
-                            let repair_start = repair_history.len() + 2;
-                            let repair_task = format!(
-                                "[HOST GROUNDING REPAIR] The draft's factual coverage was {:.3} and contradiction risk was {:.3}. Re-check the supplied evidence and tool results. Use more recall/tools if needed, correct unsupported claims, and abstain explicitly where evidence remains insufficient. Return the corrected final answer.",
-                                decision.report.coverage, decision.report.contradiction
-                            );
-                            let repair = Box::pin(harness.run_with_history(
-                                PARTNER_SYSTEM_PROMPT,
-                                &repair_history,
-                                repair_task,
-                            ))
-                                as std::pin::Pin<Box<dyn Future<Output = _>>>;
-                            let repaired = run_with_operator_controls(
-                                &harness,
-                                repair,
-                                &mut line_receiver,
-                                status.as_ref(),
-                            )
-                            .await;
-                            quit_after |= repaired.quit_after;
-                            match repaired.outcome {
-                                Ok(Some(repaired_outcome)) => {
-                                    turn_leaves.extend(persist_harness_messages(
-                                        &heart,
-                                        &encoder,
-                                        &agent_id,
-                                        &thread_id,
-                                        &repaired_outcome.messages
-                                            [repair_start.min(repaired_outcome.messages.len())..],
-                                    )?);
-                                    outcome = repaired_outcome;
-                                }
-                                Ok(None) => {
-                                    commit_control_text(
-                                        &heart,
-                                        &encoder,
-                                        &agent_id,
-                                        &thread_id,
-                                        "operator interrupted the grounding repair",
-                                        "interrupted",
-                                    )?;
-                                    status.show("Repair interrupted; using draft");
-                                    if let Some(web) = &web_ui {
-                                        web.notice("Repair interrupted; using draft");
-                                    }
-                                }
-                                Err(error) => {
-                                    commit_control_text(
-                                        &heart,
-                                        &encoder,
-                                        &agent_id,
-                                        &thread_id,
-                                        &format!("grounding repair failed: {error}"),
-                                        "grounding_repair_error",
-                                    )?;
-                                    status.show("Repair unavailable; using draft");
-                                    if let Some(web) = &web_ui {
-                                        web.notice("Repair unavailable; using draft");
-                                    }
-                                }
-                            }
-                        } else if decision.claim_count == 0 {
-                            status.show("Answer ready");
-                        } else {
-                            status.show("Answer verified");
-                        }
-                    }
-                    if !turn_leaves.is_empty() {
+                    )?;
+                    if !leaves.is_empty() {
                         status.show("Saving context");
-                        if let Some(web) = &web_ui {
-                            web.activity("Saving context");
-                        }
-                        heart.compact_context(turn_leaves, 6)?;
-                    }
-                    completed_turns = completed_turns.saturating_add(1);
-                    if completed_turns.is_multiple_of(10) {
-                        status.show("Maintaining memory");
-                        if let Some(web) = &web_ui {
-                            web.activity("Maintaining memory");
-                        }
-                        heart.maintain_cognition(4)?;
+                        heart.compact_context(leaves, 6)?;
                     }
                     checkpoint_from_outcome(
                         &heart,
@@ -883,7 +1241,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &outcome,
                         &mut checkpoint,
                     )?;
-                    history.push(Message::new(MessageRole::User, task));
                     status.end();
                     if let Some(web) = &web_ui {
                         web.capture_messages(&outcome.messages);
@@ -899,99 +1256,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         max_history_turns,
                         max_history_chars,
                     );
-                    if quit_after {
-                        break;
-                    }
-                    continue;
-                }
-                let persist_start;
-                let run = if is_resume {
-                    let resumable = checkpoint.take().expect("checkpoint exists");
-                    persist_start = resumable.messages.len() + 1;
-                    Box::pin(harness.resume(resumable))
-                        as std::pin::Pin<Box<dyn Future<Output = _>>>
-                } else {
-                    unreachable!("new turns are handled above")
-                };
-                if let Some(web) = &web_ui {
-                    web.begin_resume();
-                }
-                status.begin("Resuming");
-                let controlled =
-                    run_with_operator_controls(&harness, run, &mut line_receiver, status.as_ref())
-                        .await;
-                let outcome = match controlled.outcome {
-                    Ok(outcome) => outcome,
-                    Err(error) => {
-                        commit_control_text(
-                            &heart,
-                            &encoder,
-                            &agent_id,
-                            &thread_id,
-                            &format!("resumed turn failed: {error}"),
-                            "provider_or_harness_error",
-                        )?;
-                        status.end();
-                        if let Some(web) = &web_ui {
-                            web.fail(&error.to_string());
-                        }
-                        eprintln!("[resumed turn failed: {error}]");
-                        if controlled.quit_after {
-                            break;
-                        }
-                        continue;
-                    }
-                };
-                let Some(outcome) = outcome else {
-                    commit_control_text(
-                        &heart,
-                        &encoder,
-                        &agent_id,
-                        &thread_id,
-                        "operator interrupted the active turn",
-                        "interrupted",
-                    )?;
-                    status.end();
-                    if let Some(web) = &web_ui {
-                        web.complete("", true, checkpoint.is_some());
-                    }
-                    println!("[active turn interrupted]");
                     if controlled.quit_after {
                         break;
                     }
-                    continue;
-                };
-                let leaves = persist_harness_messages(
-                    &heart,
-                    &encoder,
-                    &agent_id,
-                    &thread_id,
-                    &outcome.messages[persist_start.min(outcome.messages.len())..],
-                )?;
-                if !leaves.is_empty() {
-                    status.show("Saving context");
-                    heart.compact_context(leaves, 6)?;
-                }
-                checkpoint_from_outcome(
-                    &heart,
-                    &encoder,
-                    &agent_id,
-                    &thread_id,
-                    &outcome,
-                    &mut checkpoint,
-                )?;
-                status.end();
-                if let Some(web) = &web_ui {
-                    web.capture_messages(&outcome.messages);
-                    web.complete(
-                        &outcome.response,
-                        outcome.stopped_gracefully,
-                        outcome.checkpoint.is_some(),
-                    );
-                }
-                finish_visible_turn(&outcome, &mut history, max_history_turns, max_history_chars);
-                if controlled.quit_after {
-                    break;
                 }
             }
             event_task.abort();
@@ -1022,6 +1289,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_context_tokens,
             task,
         } => {
+            let passphrase = resolve_heart_passphrase(passphrase, false)?;
             let heart = Arc::new(SpineHeart::open(
                 HeartConfig::new(&path),
                 KeySource::Passphrase(passphrase),
@@ -1033,7 +1301,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let agent_id = AgentId::new(agent)?;
             let thread_id = ThreadId::new(thread)?;
             let mut provider_config = LlamaCppConfig::new(server_url);
-            provider_config.api_key = api_key.or_else(|| std::env::var("SPINE_LLM_API_KEY").ok());
+            provider_config.api_key = api_key.filter(|value| !value.is_empty()).or_else(|| {
+                std::env::var("SPINE_LLM_API_KEY")
+                    .ok()
+                    .filter(|value| !value.is_empty())
+            });
             provider_config.model = server_model;
             provider_config.max_tokens = max_tokens;
             provider_config.temperature = temperature;
@@ -1042,6 +1314,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             provider_config.max_context_tokens = max_context_tokens;
             let provider = Arc::new(LlamaCppProvider::new(provider_config)?);
             provider.health().await?;
+            report_provider_settings(&provider);
+            let onboarding_state = onboarding::OnboardingState::inspect(&heart.events_canonical()?);
+            let partner_system_prompt = format!(
+                "You are a long-running Spine partner operating against an encrypted heart. Use the supplied heart tools whenever the task requests stored facts or store state. Treat tool output as authoritative, do not fabricate results, and give a concise final answer after completing the requested checks.{}",
+                onboarding::profile_context(onboarding_state.profile.as_ref())
+            );
 
             let mut registry = ToolRegistry::default();
             cognition_tools::register_cognition_tools(
@@ -1089,12 +1367,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &task,
                 None,
             )?;
-            let outcome = harness
-                .run(
-                    "You are a long-running Spine partner operating against an encrypted heart. Use the supplied heart tools whenever the task requests stored facts or store state. Treat tool output as authoritative, do not fabricate results, and give a concise final answer after completing the requested checks.",
-                    &task,
-                )
-                .await?;
+            let outcome = harness.run(partner_system_prompt, &task).await?;
             persist_harness_messages(
                 &heart,
                 &encoder,
@@ -1118,9 +1391,346 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 const PARTNER_SYSTEM_PROMPT: &str = "You are Spine, a long-running partner backed by an encrypted portable heart. Preserve continuity with the supplied conversation history. Use heart_recall or fact tools whenever a request may depend on older conversations or stored facts. Use action tools to complete requested work, treat tool output as authoritative, never fabricate tool results or memories, and continue testing until the requested outcome is genuinely handled. Destructive actions remain host-gated. Give a clear final response after completing any needed tool calls.";
 
+struct ManagedLlamaServer {
+    child: std::process::Child,
+    log_path: PathBuf,
+}
+
+impl ManagedLlamaServer {
+    #[allow(clippy::too_many_arguments)]
+    fn start(
+        binary: &std::path::Path,
+        model: &std::path::Path,
+        server_url: &str,
+        gpu_layers: i32,
+        context_tokens: usize,
+        api_key: Option<&str>,
+        log_path: PathBuf,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        if !binary.is_file() {
+            return Err(format!("llama-server binary not found: {}", binary.display()).into());
+        }
+        if !model.is_file() {
+            return Err(format!("GGUF model not found: {}", model.display()).into());
+        }
+        let endpoint = reqwest::Url::parse(server_url)?;
+        let host = endpoint
+            .host_str()
+            .ok_or("managed llama-server URL requires a host")?;
+        let port = endpoint
+            .port_or_known_default()
+            .ok_or("managed llama-server URL requires a port")?;
+        if let Some(parent) = log_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)?;
+        let error_log = log.try_clone()?;
+        let mut command = std::process::Command::new(binary);
+        command.args(llama_server_args(
+            model,
+            host,
+            port,
+            gpu_layers,
+            context_tokens,
+        ));
+        command
+            .env_remove("SPINE_HEART_PASSPHRASE")
+            .env_remove("SPINE_LLM_API_KEY");
+        if let Some(api_key) = api_key.filter(|value| !value.is_empty()) {
+            command.env("LLAMA_API_KEY", api_key);
+        }
+        let child = command
+            .stdout(std::process::Stdio::from(log))
+            .stderr(std::process::Stdio::from(error_log))
+            .spawn()?;
+        println!(
+            "starting managed llama-server model={} log={}",
+            model.display(),
+            log_path.display()
+        );
+        Ok(Self { child, log_path })
+    }
+}
+
+impl Drop for ManagedLlamaServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn llama_server_args(
+    model: &std::path::Path,
+    host: &str,
+    port: u16,
+    gpu_layers: i32,
+    context_tokens: usize,
+) -> Vec<std::ffi::OsString> {
+    vec![
+        "-m".into(),
+        model.as_os_str().to_owned(),
+        "-ngl".into(),
+        gpu_layers.to_string().into(),
+        "--host".into(),
+        host.into(),
+        "--port".into(),
+        port.to_string().into(),
+        "-c".into(),
+        context_tokens.max(256).to_string().into(),
+        "--jinja".into(),
+        "--tools".into(),
+        "all".into(),
+    ]
+}
+
+async fn wait_for_managed_server(
+    provider: &LlamaCppProvider,
+    server: &mut ManagedLlamaServer,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if provider.health().await.is_ok() {
+            println!("managed llama-server ready");
+            return Ok(());
+        }
+        if let Some(status) = server.child.try_wait()? {
+            return Err(format!(
+                "llama-server exited with {status}; inspect {}",
+                server.log_path.display()
+            )
+            .into());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "llama-server did not become ready; inspect {}",
+                server.log_path.display()
+            )
+            .into());
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+fn report_provider_settings(provider: &LlamaCppProvider) {
+    let model = provider.model().map(|model| {
+        let model = model
+            .rsplit('/')
+            .next()
+            .unwrap_or(model)
+            .rsplit('\\')
+            .next()
+            .unwrap_or(model);
+        model
+            .chars()
+            .filter(|character| !character.is_control())
+            .take(120)
+            .collect::<String>()
+    });
+    match (model.as_deref(), provider.context_tokens()) {
+        (Some(model), Some(tokens)) => {
+            println!("provider: model={model} context={tokens} tokens")
+        }
+        (Some(model), None) => println!("provider: model={model} context=not advertised"),
+        (None, Some(tokens)) => println!("provider: model=server-default context={tokens} tokens"),
+        (None, None) => println!("provider: model=server-default context=not advertised"),
+    }
+    if provider
+        .context_tokens()
+        .is_some_and(|tokens| tokens < 8_192)
+    {
+        eprintln!(
+            "warning: the provider's runtime context is below 8192 tokens; onboarding can fit, but full tool turns may exhaust it (16384 or more recommended)"
+        );
+    }
+}
+
 struct ChatHeartTarget {
     path: PathBuf,
     _temporary: Option<tempfile::TempDir>,
+}
+
+fn web_heart_label(path: &std::path::Path, incognito: bool) -> String {
+    if incognito {
+        return "temporary incognito heart".into();
+    }
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "persistent heart".into())
+}
+
+fn resolve_heart_passphrase(provided: Option<String>, creating: bool) -> io::Result<String> {
+    if let Some(value) = provided.filter(|value| !value.is_empty()).or_else(|| {
+        std::env::var("SPINE_HEART_PASSPHRASE")
+            .ok()
+            .filter(|value| !value.is_empty())
+    }) {
+        return Ok(value);
+    }
+    if !io::stdin().is_terminal() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "set SPINE_HEART_PASSPHRASE or run from a terminal to enter it securely",
+        ));
+    }
+    let prompt = if creating {
+        "Choose heart passphrase: "
+    } else {
+        "Heart passphrase: "
+    };
+    let value = rpassword::prompt_password(prompt)?;
+    if value.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "heart passphrase cannot be empty",
+        ));
+    }
+    if creating {
+        let confirmation = rpassword::prompt_password("Confirm heart passphrase: ")?;
+        if value != confirmation {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "heart passphrases did not match",
+            ));
+        }
+    }
+    Ok(value)
+}
+
+fn default_heart_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("SPINE_HEART_PATH").filter(|value| !value.is_empty()) {
+        return Some(expand_home(PathBuf::from(path)));
+    }
+    if cfg!(target_os = "windows") {
+        if let Some(local) = std::env::var_os("LOCALAPPDATA")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+        {
+            return Some(local.join("Spine/default.spine"));
+        }
+        return user_home_directory().map(|home| home.join("AppData/Local/Spine/default.spine"));
+    }
+    if cfg!(target_os = "macos") {
+        return user_home_directory()
+            .map(|home| home.join("Library/Application Support/Spine/default.spine"));
+    }
+    if let Some(data) = std::env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(data).join("spine/default.spine"));
+    }
+    user_home_directory().map(|home| home.join(".local/share/spine/default.spine"))
+}
+
+fn user_home_directory() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn expand_home(path: PathBuf) -> PathBuf {
+    let value = path.to_string_lossy();
+    if value == "~" {
+        return user_home_directory().unwrap_or(path);
+    }
+    if let Some(suffix) = value.strip_prefix("~/")
+        && let Some(home) = user_home_directory()
+    {
+        return home.join(suffix);
+    }
+    path
+}
+
+fn resolve_required_model_directory(explicit: Option<PathBuf>) -> io::Result<PathBuf> {
+    let configured = explicit.or_else(|| {
+        std::env::var_os("SPINE_MINILM_DIR")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    });
+    if let Some(path) = configured {
+        return validate_model_directory(expand_home(path), "MiniLM");
+    }
+    cached_model_directories("models--sentence-transformers--all-MiniLM-L6-v2")
+        .into_iter()
+        .find(|path| model_assets_present(path))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "MiniLM assets not found; pass --model-dir or set SPINE_MINILM_DIR",
+            )
+        })
+}
+
+fn resolve_optional_nli_directory(explicit: Option<PathBuf>) -> io::Result<Option<PathBuf>> {
+    let configured = explicit.or_else(|| {
+        std::env::var_os("SPINE_NLI_DIR")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    });
+    if let Some(path) = configured {
+        return validate_model_directory(expand_home(path), "NLI").map(Some);
+    }
+    Ok(
+        cached_model_directories("models--cross-encoder--nli-MiniLM2-L6-H768")
+            .into_iter()
+            .find(|path| model_assets_present(path)),
+    )
+}
+
+fn validate_model_directory(path: PathBuf, label: &str) -> io::Result<PathBuf> {
+    if model_assets_present(&path) {
+        Ok(path)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "{label} model directory {} must contain config.json, tokenizer.json, and model.safetensors",
+                path.display()
+            ),
+        ))
+    }
+}
+
+fn model_assets_present(path: &std::path::Path) -> bool {
+    ["config.json", "tokenizer.json", "model.safetensors"]
+        .into_iter()
+        .all(|name| path.join(name).is_file())
+}
+
+fn cached_model_directories(repository_cache_name: &str) -> Vec<PathBuf> {
+    let mut hubs = Vec::new();
+    if let Some(path) = std::env::var_os("HF_HUB_CACHE").filter(|value| !value.is_empty()) {
+        hubs.push(expand_home(PathBuf::from(path)));
+    }
+    if let Some(path) = std::env::var_os("HF_HOME").filter(|value| !value.is_empty()) {
+        hubs.push(expand_home(PathBuf::from(path)).join("hub"));
+    }
+    if let Some(path) = std::env::var_os("XDG_CACHE_HOME").filter(|value| !value.is_empty()) {
+        hubs.push(PathBuf::from(path).join("huggingface/hub"));
+    }
+    if let Some(home) = user_home_directory() {
+        hubs.push(home.join(".cache/huggingface/hub"));
+    }
+    let mut seen_hubs = BTreeSet::new();
+    hubs.retain(|path| seen_hubs.insert(path.clone()));
+
+    let mut candidates = Vec::new();
+    for hub in hubs {
+        let snapshots = hub.join(repository_cache_name).join("snapshots");
+        if let Ok(entries) = std::fs::read_dir(snapshots) {
+            let mut cached = entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir())
+                .collect::<Vec<_>>();
+            cached.sort();
+            cached.reverse();
+            candidates.extend(cached);
+        }
+    }
+    candidates
 }
 
 impl ChatHeartTarget {
@@ -1135,14 +1745,14 @@ impl ChatHeartTarget {
                 _temporary: Some(temporary),
             });
         }
-        let path = path.ok_or_else(|| {
+        let path = path.or_else(default_heart_path).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "a heart path is required outside incognito mode",
+                "persistent chat requires a heart path or a platform home/data directory",
             )
         })?;
         Ok(Self {
-            path,
+            path: expand_home(path),
             _temporary: None,
         })
     }
@@ -1152,6 +1762,170 @@ fn ephemeral_passphrase() -> Result<String, getrandom::Error> {
     let mut random = [0_u8; 32];
     getrandom::fill(&mut random)?;
     Ok(hex::encode(random))
+}
+
+struct FirstConversationResult {
+    profile: Option<onboarding::InteractionProfile>,
+    quit: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_first_conversation(
+    provider: &dyn spine_runtime::ModelProvider,
+    heart: &SpineHeart,
+    encoder: &dyn SemanticEncoder,
+    agent_id: &AgentId,
+    thread_id: &ThreadId,
+    state: onboarding::OnboardingState,
+    lines: &mut tokio::sync::mpsc::UnboundedReceiver<io::Result<String>>,
+    web: Option<&web_server::WebUi>,
+    status: &TerminalStatus,
+) -> Result<FirstConversationResult, Box<dyn std::error::Error>> {
+    let waiting_for_answer = state.waiting_for_answer();
+    let mut transcript = state.transcript;
+    let mut answer_count = state.answers;
+    let mut pending_question = waiting_for_answer.then(|| {
+        transcript
+            .last()
+            .expect("waiting question exists")
+            .content
+            .clone()
+    });
+
+    loop {
+        let question = if let Some(question) = pending_question.take() {
+            question
+        } else {
+            status.begin("Getting acquainted");
+            if let Some(web) = web {
+                web.begin_onboarding_model_turn();
+            }
+            let turn = match onboarding::generate_turn(provider, &transcript, answer_count).await {
+                Ok(turn) => turn,
+                Err(error) => {
+                    status.end();
+                    onboarding::record_pending(
+                        heart,
+                        encoder,
+                        agent_id,
+                        thread_id,
+                        &format!("first conversation paused after provider error: {error}"),
+                    )?;
+                    eprintln!(
+                        "[first conversation paused: {error}; we can learn each other while working]"
+                    );
+                    if let Some(web) = web {
+                        web.pause_onboarding(
+                            "The first conversation is paused; you can start working normally.",
+                        );
+                    }
+                    return Ok(FirstConversationResult {
+                        profile: None,
+                        quit: false,
+                    });
+                }
+            };
+            status.end();
+            if turn.complete {
+                let profile = turn
+                    .profile
+                    .ok_or("completed first conversation did not include a profile")?;
+                onboarding::record_profile_and_closing(
+                    heart,
+                    encoder,
+                    agent_id,
+                    thread_id,
+                    &profile,
+                    &turn.reply,
+                )?;
+                println!("spine> {}", turn.reply);
+                if let Some(web) = web {
+                    web.finish_onboarding(&turn.reply, true);
+                }
+                return Ok(FirstConversationResult {
+                    profile: Some(profile),
+                    quit: false,
+                });
+            }
+            onboarding::record_question(heart, encoder, agent_id, thread_id, &turn.reply)?;
+            transcript.push(Message::new(MessageRole::Assistant, &turn.reply));
+            turn.reply
+        };
+
+        status.end();
+        println!("spine> {question}");
+        if let Some(web) = web {
+            web.finish_onboarding(&question, false);
+        }
+
+        loop {
+            print!("you> ");
+            io::stdout().flush()?;
+            let Some(line) = lines.recv().await else {
+                println!();
+                if let Some(web) = web {
+                    web.pause_onboarding("First conversation paused until the next launch.");
+                }
+                return Ok(FirstConversationResult {
+                    profile: None,
+                    quit: true,
+                });
+            };
+            let line = match line {
+                Ok(line) => line,
+                Err(error) => {
+                    eprintln!("[operator input error: {error}]");
+                    continue;
+                }
+            };
+            let answer = line.trim();
+            if answer.is_empty() {
+                continue;
+            }
+            if matches!(answer, "/quit" | "/exit") {
+                if let Some(web) = web {
+                    web.pause_onboarding("First conversation paused until the next launch.");
+                }
+                return Ok(FirstConversationResult {
+                    profile: None,
+                    quit: true,
+                });
+            }
+            if answer.eq_ignore_ascii_case("/skip") || answer.eq_ignore_ascii_case("skip") {
+                onboarding::record_skipped(
+                    heart,
+                    encoder,
+                    agent_id,
+                    thread_id,
+                    "person chose to learn each other naturally while working",
+                )?;
+                let message = "Absolutely—we can learn each other naturally while we work.";
+                println!("spine> {message}");
+                if let Some(web) = web {
+                    web.finish_onboarding(message, true);
+                }
+                return Ok(FirstConversationResult {
+                    profile: None,
+                    quit: false,
+                });
+            }
+            if answer == "/tasks" {
+                let message = "No tasks are running yet; reply naturally, or type /skip.";
+                println!("[{message}]");
+                if let Some(web) = web {
+                    web.notice(message);
+                }
+                continue;
+            }
+            if let Some(web) = web {
+                web.begin_onboarding_answer(answer);
+            }
+            onboarding::record_answer(heart, encoder, agent_id, thread_id, answer)?;
+            transcript.push(Message::new(MessageRole::User, answer));
+            answer_count = answer_count.saturating_add(1);
+            break;
+        }
+    }
 }
 
 struct TerminalStatus {
@@ -1523,8 +2297,129 @@ mod cli_tests {
     }
 
     #[test]
-    fn persistent_chat_still_requires_a_heart_path() {
-        assert!(Cli::try_parse_from(["spine", "chat", "--model-dir", "models"]).is_err());
+    fn persistent_chat_accepts_the_documented_default_heart_path() {
+        let cli = Cli::try_parse_from(["spine", "chat"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Chat {
+                path: None,
+                incognito_mode: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn first_conversation_has_an_explicit_automation_escape_hatch() {
+        let cli = Cli::try_parse_from(["spine", "chat", "--skip-onboarding"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Chat {
+                skip_onboarding: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn web_mode_uses_portable_local_defaults() {
+        let cli = Cli::try_parse_from(["spine", "chat", "--web"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Chat {
+                web_server: true,
+                web_host,
+                web_port: 8_088,
+                allow_remote_web: false,
+                server_url,
+                ..
+            } if web_host == "127.0.0.1" && server_url == "http://127.0.0.1:8080"
+        ));
+        assert!(Cli::try_parse_from(["spine", "chat", "--allow-remote-web"]).is_err());
+    }
+
+    #[test]
+    fn maintenance_commands_can_prompt_for_the_passphrase() {
+        let cli = Cli::try_parse_from(["spine", "stats", "heart.spine"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Stats {
+                passphrase: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn browser_state_does_not_expose_the_heart_directory() {
+        let label = web_heart_label(
+            std::path::Path::new("/private/developer/location/default.spine"),
+            false,
+        );
+        assert_eq!(label, "default.spine");
+        assert!(!label.contains("developer"));
+    }
+
+    #[test]
+    fn managed_server_options_are_explicitly_paired() {
+        assert!(
+            Cli::try_parse_from([
+                "spine",
+                "chat",
+                "heart.spine",
+                "--model-dir",
+                "models",
+                "--llama-model",
+                "model.gguf",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn managed_server_arguments_enable_jinja_tools_and_context() {
+        let arguments = llama_server_args(
+            std::path::Path::new("model.gguf"),
+            "127.0.0.1",
+            9123,
+            -1,
+            32_768,
+        )
+        .into_iter()
+        .map(|value| value.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+        assert_eq!(
+            arguments[arguments.iter().position(|item| item == "--port").unwrap() + 1],
+            "9123"
+        );
+        assert_eq!(
+            arguments[arguments.iter().position(|item| item == "-c").unwrap() + 1],
+            "32768"
+        );
+        assert!(arguments.iter().any(|item| item == "--jinja"));
+        assert!(arguments.windows(2).any(|pair| pair == ["--tools", "all"]));
+        assert!(!arguments.iter().any(|item| item == "secret"));
+    }
+
+    #[test]
+    fn explicit_minilm_directory_is_validated_without_python() {
+        let temporary = tempfile::tempdir().unwrap();
+        for name in ["config.json", "tokenizer.json", "model.safetensors"] {
+            std::fs::write(temporary.path().join(name), b"").unwrap();
+        }
+        assert_eq!(
+            resolve_required_model_directory(Some(temporary.path().to_owned())).unwrap(),
+            temporary.path()
+        );
+    }
+
+    #[test]
+    fn invalid_explicit_model_directory_is_not_silently_replaced() {
+        let temporary = tempfile::tempdir().unwrap();
+        let error =
+            resolve_required_model_directory(Some(temporary.path().to_owned())).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("model.safetensors"));
     }
 
     #[test]

@@ -5,17 +5,20 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Long-running provider and tool harness for Spine"
+publish = false
 
 [dependencies]
 async-trait.workspace = true
 blake3.workspace = true
 reqwest.workspace = true
+regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-spine-heart = { path = "../spine-heart" }
+spine-heart = { version = "0.1.0", path = "../spine-heart" }
 thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+axum.workspace = true
 proptest = "1.9.0"
 tempfile = "3.23.0"

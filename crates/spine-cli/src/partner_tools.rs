@@ -16,7 +16,6 @@ use spine_heart::{
     AgentId, Content, EventKind, InteractionInput, ParticipantRole, Provenance, SemanticEncoder,
     SpineHeart, ThreadId,
 };
-use spine_models::MiniLmEncoder;
 use spine_runtime::{
     RuntimeError, Tool, ToolCall, ToolCategory, ToolContext, ToolRegistry, ToolResult, ToolRisk,
     ToolSpec,
@@ -26,14 +25,16 @@ use walkdir::WalkDir;
 
 const MAX_FILE_READ_CHARS: usize = 50_000;
 const MAX_WEB_CHARS: usize = 12_000;
+const MAX_WEB_BODY_BYTES: usize = 2 * 1024 * 1024;
 
-pub(crate) fn register_action_tools(
+pub(crate) fn register_action_tools<E: SemanticEncoder + 'static>(
     registry: &mut ToolRegistry,
     heart: Arc<SpineHeart>,
-    encoder: Arc<MiniLmEncoder>,
+    encoder: Arc<E>,
     cwd: PathBuf,
     audit_path: PathBuf,
 ) -> spine_runtime::Result<Arc<RunningTaskManager>> {
+    let encoder: Arc<dyn SemanticEncoder> = encoder;
     registry.register(FileReadTool { cwd: cwd.clone() })?;
     registry.register(FileWriteTool { cwd: cwd.clone() })?;
     registry.register(FileListTool { cwd: cwd.clone() })?;
@@ -328,6 +329,12 @@ impl Tool for FileSearchTool {
             return Ok(ToolResult::failure("pattern is required"));
         };
         let root = resolve(&self.cwd, string_arg(call, "path").unwrap_or("."));
+        if !root.exists() {
+            return Ok(ToolResult::failure(format!(
+                "search root not found: {}",
+                root.display()
+            )));
+        }
         let maximum = call
             .arguments
             .get("max_results")
@@ -573,6 +580,16 @@ impl ShellTool {
             "> /dev/sd",
             "dd if=",
             ":(){",
+            "remove-item",
+            "clear-disk",
+            "format-volume",
+            "initialize-disk",
+            "remove-partition",
+            "stop-computer",
+            "restart-computer",
+            "diskpart",
+            "del /",
+            "erase /",
         ]
         .iter()
         .any(|needle| command.contains(needle))
@@ -600,17 +617,41 @@ impl ShellTool {
         }
     }
 
-    async fn run_command(&self, command: &str, duration: Duration, unlimited: bool) -> ToolResult {
-        let started = Instant::now();
-        let child = match Command::new("bash")
-            .arg("-lc")
-            .arg(command)
+    fn shell_process(&self, command: &str) -> Command {
+        #[cfg(target_os = "windows")]
+        let mut process = {
+            let mut process = Command::new("powershell.exe");
+            process
+                .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+                .arg(command);
+            process
+        };
+        #[cfg(not(target_os = "windows"))]
+        let mut process = {
+            let shell = if Path::new("/bin/bash").is_file() {
+                "/bin/bash"
+            } else if Path::new("/bin/sh").is_file() {
+                "/bin/sh"
+            } else {
+                "sh"
+            };
+            let mut process = Command::new(shell);
+            process.arg("-lc").arg(command);
+            process
+        };
+        process
             .current_dir(&self.cwd)
+            .env_remove("SPINE_HEART_PASSPHRASE")
+            .env_remove("SPINE_LLM_API_KEY")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-        {
+            .kill_on_drop(true);
+        process
+    }
+
+    async fn run_command(&self, command: &str, duration: Duration, unlimited: bool) -> ToolResult {
+        let started = Instant::now();
+        let child = match self.shell_process(command).spawn() {
             Ok(child) => child,
             Err(error) => return ToolResult::failure(error.to_string()),
         };
@@ -735,7 +776,7 @@ impl Tool for ShellTool {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct WebPage {
     url: String,
     title: String,
@@ -750,6 +791,7 @@ struct BrowserState {
 
 struct WebBrowser {
     client: reqwest::Client,
+    search_endpoint: reqwest::Url,
     state: Mutex<BrowserState>,
 }
 
@@ -760,6 +802,8 @@ impl WebBrowser {
                 .user_agent("Spine/0.1 text browser")
                 .timeout(Duration::from_secs(30))
                 .build()?,
+            search_endpoint: reqwest::Url::parse("https://html.duckduckgo.com/html/")
+                .expect("static search URL is valid"),
             state: Mutex::new(BrowserState {
                 history: Vec::new(),
                 cursor: None,
@@ -773,7 +817,7 @@ impl WebBrowser {
         } else {
             format!("https://{value}")
         };
-        let response = self
+        let mut response = self
             .client
             .get(&url)
             .send()
@@ -781,7 +825,20 @@ impl WebBrowser {
             .map_err(|error| error.to_string())?;
         let status = response.status();
         let final_url = response.url().to_string();
-        let body = response.text().await.map_err(|error| error.to_string())?;
+        if !status.is_success() {
+            return Err(format!("HTTP {status} for {final_url}"));
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
+            if body.len().saturating_add(chunk.len()) > MAX_WEB_BODY_BYTES {
+                return Err(format!(
+                    "response body exceeds {} bytes for {final_url}",
+                    MAX_WEB_BODY_BYTES
+                ));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let body = String::from_utf8_lossy(&body);
         let title_re = Regex::new(r"(?is)<title[^>]*>(.*?)</title>").expect("valid regex");
         let link_re =
             Regex::new(r#"(?is)<a[^>]+href=["']([^"']+)["'][^>]*>(.*?)</a>"#).expect("valid regex");
@@ -946,8 +1003,7 @@ impl Tool for WebSearchTool {
         let Some(query) = string_arg(call, "query") else {
             return Ok(ToolResult::failure("query is required"));
         };
-        let mut url = reqwest::Url::parse("https://html.duckduckgo.com/html/")
-            .expect("static search URL is valid");
+        let mut url = self.browser.search_endpoint.clone();
         url.query_pairs_mut().append_pair("q", query);
         Ok(match self.browser.fetch(url.as_str(), true).await {
             Ok(page) => ToolResult::success(page_text(&page)),
@@ -1021,7 +1077,7 @@ fn empty_spec(name: &str, description: &str) -> ToolSpec {
 #[derive(Clone)]
 struct DocumentIngestTool {
     heart: Arc<SpineHeart>,
-    encoder: Arc<MiniLmEncoder>,
+    encoder: Arc<dyn SemanticEncoder>,
     cwd: PathBuf,
     running_tasks: Arc<RunningTaskManager>,
 }
@@ -1042,7 +1098,7 @@ impl DocumentIngestTool {
                     "maintain":{"type":"boolean"},
                     "max_file_mb":{"type":"number","minimum":0.001,"maximum":1024},
                     "extensions":{"type":"array","items":{"type":"string"}},
-                    "chunk_words":{"type":"integer","minimum":10,"maximum":10000},
+                    "chunk_words":{"type":"integer","minimum":40,"maximum":10000},
                     "overlap_words":{"type":"integer","minimum":0,"maximum":5000}
                 },
                 "required":["paths"],
@@ -1056,7 +1112,14 @@ impl DocumentIngestTool {
             .arguments
             .get("paths")
             .and_then(|value| value.as_array())
-            .map(|values| values.iter().filter_map(|value| value.as_str()).collect())
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .collect()
+            })
             .unwrap_or_default();
         if paths.is_empty() {
             return Ok(ToolResult::failure(
@@ -1089,7 +1152,7 @@ impl DocumentIngestTool {
             .get("chunk_words")
             .and_then(|value| value.as_u64())
             .unwrap_or(250)
-            .clamp(10, 10_000) as usize;
+            .clamp(40, 10_000) as usize;
         let overlap = call
             .arguments
             .get("overlap_words")
@@ -1116,7 +1179,7 @@ impl DocumentIngestTool {
             Ok(files) => files,
             Err(error) => return Ok(ToolResult::failure(error)),
         };
-        let known_hashes: BTreeSet<String> = if force {
+        let mut seen_hashes: BTreeSet<String> = if force {
             BTreeSet::new()
         } else {
             self.heart
@@ -1163,7 +1226,7 @@ impl DocumentIngestTool {
                 .enumerate()
             {
                 let hash = blake3::hash(chunk.as_bytes()).to_hex().to_string();
-                if known_hashes.contains(&hash) {
+                if !seen_hashes.insert(hash.clone()) {
                     skipped += 1;
                     continue;
                 }
@@ -1290,6 +1353,10 @@ fn discover_files(
 ) -> Result<Vec<PathBuf>, String> {
     let mut files = BTreeSet::new();
     for value in values {
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
         let resolved = resolve(cwd, value);
         if value.contains(['*', '?', '[']) {
             let pattern = resolved.to_string_lossy();
@@ -1368,12 +1435,47 @@ fn chunk_words_preserving(text: &str, target: usize, overlap: usize) -> Vec<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Router, response::Html, routing::get};
 
     #[test]
     fn destructive_shell_calls_are_classified_dynamically() {
         assert!(ShellTool::destructive("rm -rf /tmp/example"));
         assert!(ShellTool::destructive("git reset --hard HEAD~1"));
+        assert!(ShellTool::destructive(
+            "Remove-Item -Recurse -Force C:\\example"
+        ));
+        assert!(ShellTool::destructive("Clear-Disk -Number 1"));
         assert!(!ShellTool::destructive("rg -n hello ."));
+    }
+
+    #[test]
+    fn shell_children_do_not_inherit_spine_secrets() {
+        let tool = ShellTool {
+            cwd: std::env::current_dir().expect("cwd"),
+            audit_path: std::env::temp_dir().join("unused-shell-audit.jsonl"),
+            default_timeout: Duration::from_secs(1),
+            running_tasks: Arc::new(RunningTaskManager::default()),
+        };
+        let process = tool.shell_process("true");
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            process.as_std().get_program(),
+            std::ffi::OsStr::new("powershell.exe")
+        );
+        #[cfg(not(target_os = "windows"))]
+        assert!(
+            ["/bin/bash", "/bin/sh", "sh"]
+                .into_iter()
+                .any(|shell| process.as_std().get_program() == std::ffi::OsStr::new(shell))
+        );
+        let environment = process.as_std().get_envs().collect::<Vec<_>>();
+        for secret in ["SPINE_HEART_PASSPHRASE", "SPINE_LLM_API_KEY"] {
+            assert!(
+                environment.iter().any(|(name, value)| {
+                    *name == std::ffi::OsStr::new(secret) && value.is_none()
+                })
+            );
+        }
     }
 
     #[test]
@@ -1382,6 +1484,15 @@ mod tests {
         assert_eq!(chunks, ["one two three four ", "three four five six"]);
         let source = "  one\n two\tthree  four ";
         assert_eq!(chunk_words_preserving(source, 2, 0).concat(), source);
+    }
+
+    #[test]
+    fn empty_document_path_does_not_expand_to_the_working_directory() {
+        let temporary = tempfile::tempdir().unwrap();
+        fs::write(temporary.path().join("should-not-be-found.txt"), "payload").unwrap();
+        let files =
+            discover_files(temporary.path(), &["", "   "], true, &default_extensions()).unwrap();
+        assert!(files.is_empty());
     }
 
     #[tokio::test]
@@ -1395,10 +1506,14 @@ mod tests {
             default_timeout: Duration::from_secs(2),
             running_tasks: Arc::clone(&manager),
         };
+        #[cfg(target_os = "windows")]
+        let command = "Start-Sleep -Milliseconds 50; Write-Output survived";
+        #[cfg(not(target_os = "windows"))]
+        let command = "sleep 0.05; echo survived";
         let call = ToolCall {
             id: "test".into(),
             name: "shell".into(),
-            arguments: serde_json::json!({"command": "sleep 0.05; echo survived"}),
+            arguments: serde_json::json!({"command": command}),
         };
         let outer = tokio::spawn(async move { tool.execute(&call, &ToolContext::default()).await });
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1408,5 +1523,55 @@ mod tests {
         assert!(status.contains("status=completed"), "{status}");
         assert!(status.contains("survived"), "{status}");
         let _ = fs::remove_file(audit);
+    }
+
+    #[tokio::test]
+    async fn web_search_uses_the_browser_pipeline_and_large_pages_fail_boundedly() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route(
+                "/search",
+                get(|| async {
+                    Html(
+                        "<html><title>Search Results</title><body>deterministic result</body></html>"
+                            .to_owned(),
+                    )
+                }),
+            )
+            .route(
+                "/large",
+                get(|| async { Html("x".repeat(MAX_WEB_BODY_BYTES + 1)) }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut browser = WebBrowser::new().unwrap();
+        browser.search_endpoint = reqwest::Url::parse(&format!("http://{address}/search")).unwrap();
+        let browser = Arc::new(browser);
+        let search = WebSearchTool {
+            browser: Arc::clone(&browser),
+        }
+        .execute(
+            &ToolCall {
+                id: "search".into(),
+                name: "web_search".into(),
+                arguments: serde_json::json!({"query":"spine tools"}),
+            },
+            &ToolContext::default(),
+        )
+        .await
+        .unwrap();
+        assert!(search.success, "{:?}", search.error);
+        assert!(search.output.contains("Search Results"));
+        assert!(search.output.contains("deterministic result"));
+
+        let oversized = browser
+            .fetch(&format!("http://{address}/large"), false)
+            .await
+            .unwrap_err();
+        assert!(oversized.contains("response body exceeds"), "{oversized}");
+        server.abort();
     }
 }

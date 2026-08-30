@@ -13,9 +13,11 @@ fuzz_target!(|data: &[u8]| {
     let first = extractor.extract(&text);
     let second = extractor.extract(&text);
     assert_eq!(first, second);
-    assert!(first
-        .iter()
-        .all(|claim| claim.excerpt.chars().count() <= 120));
+    assert!(
+        first
+            .iter()
+            .all(|claim| claim.excerpt.chars().count() <= 120)
+    );
     for (index, claim) in first.iter().enumerate() {
         assert!(!first[..index].contains(claim));
     }

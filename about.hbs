@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Spine third-party licenses</title>
+  <style>
+    body { font: 15px/1.45 system-ui, sans-serif; margin: 2rem auto; max-width: 72rem; padding: 0 1rem; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border-bottom: 1px solid #bbb; padding: .45rem; text-align: left; }
+    pre { border: 1px solid #bbb; overflow: auto; padding: 1rem; white-space: pre-wrap; }
+    @media (prefers-color-scheme: dark) { body { background: #171717; color: #eee; } a { color: #8ecbff; } }
+  </style>
+</head>
+<body>
+  <h1>Spine third-party licenses</h1>
+  <p>This file lists the Rust crates incorporated into the Spine executable and the license texts selected for distribution.</p>
+  <table>
+    <thead><tr><th>Package</th><th>Version</th><th>License</th></tr></thead>
+    <tbody>
+    {{#each crates}}
+      <tr>
+        <td><a href="{{#if package.repository}}{{package.repository}}{{else}}https://crates.io/crates/{{package.name}}{{/if}}">{{package.name}}</a></td>
+        <td>{{package.version}}</td>
+        <td>{{license}}</td>
+      </tr>
+    {{/each}}
+    </tbody>
+  </table>
+  <h2>License texts and notices</h2>
+  {{#each licenses}}
+    <section>
+      <h3 id="{{id}}-{{@index}}">{{name}}</h3>
+      <strong>Used by:</strong>
+      <ul>
+      {{#each used_by}}
+        <li><a href="{{#if crate.repository}}{{crate.repository}}{{else}}https://crates.io/crates/{{crate.name}}{{/if}}">{{crate.name}} {{crate.version}}</a></li>
+      {{/each}}
+      </ul>
+      <pre>{{text}}</pre>
+    </section>
+  {{/each}}
+</body>
+</html>

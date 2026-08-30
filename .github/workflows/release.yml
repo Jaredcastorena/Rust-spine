@@ -1,0 +1,152 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: Release privacy preflight
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.98.0
+      - run: bash scripts/check-release-hygiene.sh
+      - run: cargo install --features cli cargo-about --version 0.9.2 --locked
+      - run: bash scripts/check-third-party-licenses.sh
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: preflight
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    env:
+      TARGET: ${{ matrix.target }}
+      PACKAGE: spine-${{ github.ref_name }}-${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.98.0
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Remap Unix builder paths
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          printf 'RUSTFLAGS=--remap-path-prefix=%s=/src/rust-spine --remap-path-prefix=%s=/src/dependencies\n' \
+            "$GITHUB_WORKSPACE" "$HOME" >> "$GITHUB_ENV"
+
+      - name: Remap Windows builder paths
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $flags = "--remap-path-prefix=$env:GITHUB_WORKSPACE=/src/rust-spine --remap-path-prefix=$env:USERPROFILE=/src/dependencies"
+          "RUSTFLAGS=$flags" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Test native CLI and web surface
+        run: cargo test --locked --bin spine --target ${{ matrix.target }}
+
+      - run: cargo build --release --locked --bin spine --target ${{ matrix.target }}
+
+      - name: Check Unix binary for builder paths
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if strings "target/$TARGET/release/spine" | grep -F -e "$GITHUB_WORKSPACE" -e "$HOME"; then
+            echo "release binary contains a private builder path" >&2
+            exit 1
+          fi
+
+      - name: Check Windows binary for builder paths
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $binary = [System.IO.File]::ReadAllBytes("target/$env:TARGET/release/spine.exe")
+          $text = [System.Text.Encoding]::ASCII.GetString($binary)
+          if ($text.Contains($env:GITHUB_WORKSPACE) -or $text.Contains($env:USERPROFILE)) {
+            throw "release binary contains a private builder path"
+          }
+
+      - name: Smoke-test Unix binary
+        if: runner.os != 'Windows'
+        run: target/${{ matrix.target }}/release/spine --version
+
+      - name: Smoke-test Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: target/${{ matrix.target }}/release/spine.exe --version
+
+      - name: Package Unix binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "dist/$PACKAGE"
+          cp "target/$TARGET/release/spine" "dist/$PACKAGE/spine"
+          cp README.md LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.md THIRD_PARTY_LICENSES.html "dist/$PACKAGE/"
+          tar -C dist -czf "dist/$PACKAGE.tar.gz" "$PACKAGE"
+          (cd dist && shasum -a 256 "$PACKAGE.tar.gz" > "$PACKAGE.tar.gz.sha256")
+          rm -rf "dist/$PACKAGE"
+
+      - name: Package Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force "dist/$env:PACKAGE" | Out-Null
+          Copy-Item "target/$env:TARGET/release/spine.exe" "dist/$env:PACKAGE/spine.exe"
+          Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE, THIRD_PARTY_NOTICES.md, THIRD_PARTY_LICENSES.html "dist/$env:PACKAGE/"
+          Compress-Archive -Path "dist/$env:PACKAGE/*" -DestinationPath "dist/$env:PACKAGE.zip"
+          $hash = (Get-FileHash "dist/$env:PACKAGE.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $env:PACKAGE.zip" | Set-Content "dist/$env:PACKAGE.zip.sha256"
+          Remove-Item -Recurse -Force "dist/$env:PACKAGE"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME" dist/*
+          --verify-tag
+          --generate-notes
+          --title "Spine $GITHUB_REF_NAME"

@@ -7,9 +7,9 @@ use std::{
 use async_trait::async_trait;
 use spine_heart::{AgentId, ThymosConfig};
 use spine_runtime::{
-    CompletionRequest, Harness, HarnessConfig, MessageRole, ModelProvider, ModelTurn, Result,
-    SubagentHarnessFactory, Tool, ToolCall, ToolCategory, ToolContext, ToolRegistry, ToolResult,
-    ToolRisk, ToolSpec,
+    CompletionRequest, Harness, HarnessCheckpoint, HarnessConfig, HostPlan, Message, MessageRole,
+    ModelProvider, ModelTurn, Result, SubagentHarnessFactory, Tool, ToolCall, ToolCategory,
+    ToolContext, ToolRegistry, ToolResult, ToolRisk, ToolSpec,
 };
 
 struct ScriptedProvider {
@@ -169,6 +169,94 @@ async fn guidance_is_injected_after_one_completed_call_and_stale_batch_is_skippe
     assert!(requests[1].messages.iter().any(|message| {
         message.role == MessageRole::User && message.content.contains("skip item two")
     }));
+    assert!(requests[1].messages.iter().any(|message| {
+        message.role == MessageRole::Tool
+            && message.tool_call_id.as_deref() == Some("call-2")
+            && message.content.contains("skipped")
+    }));
+}
+
+#[tokio::test]
+async fn a_tool_free_work_promise_is_not_accepted_as_the_final_answer() {
+    let executed = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        answer("That explains the first issue. I will inspect the failing test next."),
+        tool_turn(vec![call(1)]),
+        answer("The failing test is now inspected and the task is complete."),
+    ]));
+    let harness = Harness::new(
+        provider.clone(),
+        registry(Arc::clone(&executed)),
+        HarnessConfig::default(),
+    )
+    .unwrap();
+
+    let result = harness.run("system", "inspect the failure").await.unwrap();
+
+    assert_eq!(&*executed.lock().unwrap(), &["1"]);
+    assert_eq!(result.completed_tool_calls, 1);
+    let requests = provider.requests.lock().unwrap();
+    assert!(requests[1].messages.iter().any(|message| {
+        message.role == MessageRole::User && message.content.contains("NEED PLAN")
+    }));
+}
+
+#[tokio::test]
+async fn repeated_empty_model_turns_return_visible_retry_guidance() {
+    let executed = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        ModelTurn::default(),
+        ModelTurn::default(),
+    ]));
+    let harness = Harness::new(
+        provider.clone(),
+        registry(executed),
+        HarnessConfig::default(),
+    )
+    .unwrap();
+
+    let result = harness.run("system", "answer this").await.unwrap();
+
+    assert!(result.response.contains("repeated empty responses"));
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].messages.iter().any(|message| {
+        message.role == MessageRole::User && message.content.contains("HOST EMPTY TURN")
+    }));
+}
+
+#[tokio::test]
+async fn host_plan_advances_one_step_per_evidenced_tool_round() {
+    let executed = Arc::new(Mutex::new(Vec::new()));
+    let first = ModelTurn {
+        content: "```plan\n1. Inspect the first item\n2. Inspect the second item\n```".into(),
+        tool_calls: vec![call(1)],
+        ..ModelTurn::default()
+    };
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        first,
+        tool_turn(vec![call(2)]),
+        answer("Both planned checks completed."),
+    ]));
+    let harness = Harness::new(
+        provider.clone(),
+        registry(Arc::clone(&executed)),
+        HarnessConfig::default(),
+    )
+    .unwrap();
+
+    let result = harness.run("system", "inspect both items").await.unwrap();
+
+    assert_eq!(&*executed.lock().unwrap(), &["1", "2"]);
+    let plan = result.host_plan.expect("installed host plan");
+    assert!(plan.done());
+    assert_eq!(plan.cursor, 2);
+    let requests = provider.requests.lock().unwrap();
+    assert!(requests[1].messages.iter().any(|message| {
+        message.role == MessageRole::User
+            && message.content.contains("Do only step 2/2")
+            && message.content.contains("Inspect the second item")
+    }));
 }
 
 #[tokio::test]
@@ -193,6 +281,53 @@ async fn graceful_stop_waits_for_boundary_and_returns_resumable_checkpoint() {
     let requests = provider.requests.lock().unwrap();
     assert!(!requests[1].allow_tool_calls);
     assert!(requests[1].tools.is_empty());
+}
+
+#[tokio::test]
+async fn resume_restores_and_prompts_the_open_host_plan_step() {
+    let executed = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        tool_turn(vec![call(2)]),
+        answer("The resumed plan is complete."),
+    ]));
+    let harness = Harness::new(
+        provider.clone(),
+        registry(Arc::clone(&executed)),
+        HarnessConfig::default(),
+    )
+    .unwrap();
+    let mut plan = HostPlan::new(
+        "inspect",
+        vec![
+            "Inspect the first item".into(),
+            "Inspect the second item".into(),
+        ],
+    )
+    .unwrap();
+    plan.mark_current_done("tools");
+    let checkpoint = HarnessCheckpoint {
+        schema: 1,
+        harness_id: "old-harness".into(),
+        messages: vec![
+            Message::new(MessageRole::System, "system"),
+            Message::new(MessageRole::User, "inspect"),
+        ],
+        completed_tool_calls: 1,
+        completed_tool_rounds: 1,
+        pending_task: "inspect".into(),
+        host_plan: Some(plan),
+    };
+
+    let result = harness.resume(checkpoint).await.unwrap();
+
+    assert_eq!(&*executed.lock().unwrap(), &["2"]);
+    assert!(result.host_plan.unwrap().done());
+    let requests = provider.requests.lock().unwrap();
+    assert!(requests[0].messages.iter().any(|message| {
+        message.role == MessageRole::User
+            && message.content.contains("Do only step 2/2")
+            && message.content.contains("Inspect the second item")
+    }));
 }
 
 #[test]

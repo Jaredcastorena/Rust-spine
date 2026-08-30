@@ -9,17 +9,17 @@ use spine_heart::{
     AgentId, Content, Embedding, EventKind, FactAggregation, FactValue, InteractionInput,
     ParticipantRole, Provenance, RehydrateBudget, SemanticEncoder, SpineHeart, ThreadId,
 };
-use spine_models::MiniLmEncoder;
 use spine_runtime::{
     Tool, ToolCall, ToolCategory, ToolContext, ToolRegistry, ToolResult, ToolRisk, ToolSpec,
 };
 
-pub fn register_cognition_tools(
+pub fn register_cognition_tools<E: SemanticEncoder + 'static>(
     registry: &mut ToolRegistry,
     heart: Arc<SpineHeart>,
-    encoder: Arc<MiniLmEncoder>,
+    encoder: Arc<E>,
     allow_model_memory_writes: bool,
 ) -> spine_runtime::Result<()> {
+    let encoder: Arc<dyn SemanticEncoder> = encoder;
     for name in ["heart_stats", "memory_stats"] {
         registry.register(MemoryStatsTool {
             name,
@@ -55,7 +55,7 @@ pub fn register_cognition_tools(
 
 struct SaveMemoryTool {
     heart: Arc<SpineHeart>,
-    encoder: Arc<MiniLmEncoder>,
+    encoder: Arc<dyn SemanticEncoder>,
 }
 
 #[async_trait]
@@ -117,7 +117,7 @@ impl Tool for SaveMemoryTool {
 
 pub fn recall_context(
     heart: &SpineHeart,
-    encoder: &MiniLmEncoder,
+    encoder: &dyn SemanticEncoder,
     query: &str,
     top_k: usize,
 ) -> spine_runtime::Result<String> {
@@ -245,7 +245,7 @@ impl Tool for MemoryStatsTool {
 struct MemoryRecallTool {
     name: &'static str,
     heart: Arc<SpineHeart>,
-    encoder: Arc<MiniLmEncoder>,
+    encoder: Arc<dyn SemanticEncoder>,
 }
 
 #[async_trait]
@@ -287,7 +287,7 @@ impl Tool for MemoryRecallTool {
             .clamp(1, 16) as usize;
         Ok(ToolResult::success(hybrid_recall_json(
             &self.heart,
-            &self.encoder,
+            self.encoder.as_ref(),
             query,
             top_k,
         )?))
@@ -296,7 +296,7 @@ impl Tool for MemoryRecallTool {
 
 fn hybrid_recall_json(
     heart: &SpineHeart,
-    encoder: &MiniLmEncoder,
+    encoder: &dyn SemanticEncoder,
     query: &str,
     top_k: usize,
 ) -> spine_runtime::Result<String> {
@@ -395,7 +395,7 @@ fn lexical_events(
 
 struct FeelTool {
     heart: Arc<SpineHeart>,
-    encoder: Arc<MiniLmEncoder>,
+    encoder: Arc<dyn SemanticEncoder>,
 }
 
 #[async_trait]

@@ -11,15 +11,21 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use crate::{
-    CompletionRequest, Message, MessageRole, ModelProvider, Result, RuntimeError, TokenUsage,
-    ToolCall, ToolContext, ToolRegistry, ToolResult, ToolRisk,
+    CompletionRequest, HostPlan, Message, MessageRole, ModelProvider, Result, RuntimeError,
+    TokenUsage, ToolCall, ToolCategory, ToolContext, ToolRegistry, ToolResult, ToolRisk,
+    parse_plan_steps, promised_more_work,
 };
+
+const PLAN_GUIDANCE_MARKER: &str = "[HOST PLAN CONTRACT]";
+const MAX_EMPTY_MODEL_RETRIES: u64 = 1;
 
 #[derive(Clone, Debug)]
 pub struct HarnessConfig {
     pub max_tool_rounds: Option<NonZeroU64>,
     pub max_tool_result_chars: usize,
     pub allow_destructive_tools: bool,
+    pub enforce_host_plans: bool,
+    pub max_empty_plan_continuations: u64,
 }
 
 impl Default for HarnessConfig {
@@ -28,6 +34,8 @@ impl Default for HarnessConfig {
             max_tool_rounds: None,
             max_tool_result_chars: 16_384,
             allow_destructive_tools: false,
+            enforce_host_plans: true,
+            max_empty_plan_continuations: 8,
         }
     }
 }
@@ -94,6 +102,8 @@ pub struct HarnessCheckpoint {
     pub completed_tool_calls: u64,
     pub completed_tool_rounds: u64,
     pub pending_task: String,
+    #[serde(default)]
+    pub host_plan: Option<HostPlan>,
 }
 
 impl HarnessCheckpoint {
@@ -150,6 +160,7 @@ pub struct RunOutcome {
     pub completed_tool_rounds: u64,
     pub usage: TokenUsage,
     pub messages: Vec<Message>,
+    pub host_plan: Option<HostPlan>,
 }
 
 pub struct Harness {
@@ -168,9 +179,11 @@ impl Harness {
         registry: ToolRegistry,
         config: HarnessConfig,
     ) -> Result<Self> {
-        if config.max_tool_result_chars == 0 {
+        if config.max_tool_result_chars == 0
+            || (config.enforce_host_plans && config.max_empty_plan_continuations == 0)
+        {
             return Err(RuntimeError::InvalidConfig(
-                "maximum tool result length must be positive".into(),
+                "tool result length and enabled plan continuation limit must be positive".into(),
             ));
         }
         static NEXT_HARNESS: AtomicU64 = AtomicU64::new(1);
@@ -222,6 +235,7 @@ impl Harness {
             task,
             0,
             0,
+            None,
         )
         .await
     }
@@ -237,7 +251,7 @@ impl Harness {
         messages.push(Message::new(MessageRole::System, system));
         messages.extend_from_slice(history);
         messages.push(Message::new(MessageRole::User, task.clone()));
-        self.run_messages(messages, task, 0, 0).await
+        self.run_messages(messages, task, 0, 0, None).await
     }
 
     pub async fn resume(&self, checkpoint: HarnessCheckpoint) -> Result<RunOutcome> {
@@ -251,11 +265,14 @@ impl Harness {
             MessageRole::User,
             "[RESUME FROM SAFE CHECKPOINT] Continue the open task from the retained tool results and obligations.",
         ));
+        let host_plan = checkpoint.host_plan;
+        self.append_open_plan_prompt(&mut messages, host_plan.as_ref());
         self.run_messages(
             messages,
             checkpoint.pending_task,
             checkpoint.completed_tool_calls,
             checkpoint.completed_tool_rounds,
+            host_plan,
         )
         .await
     }
@@ -266,8 +283,12 @@ impl Harness {
         task: String,
         mut completed_tool_calls: u64,
         mut completed_tool_rounds: u64,
+        mut host_plan: Option<HostPlan>,
     ) -> Result<RunOutcome> {
         let mut usage = TokenUsage::default();
+        let mut empty_plan_continuations = 0_u64;
+        let mut empty_model_retries = 0_u64;
+        self.ensure_plan_guidance(&mut messages);
         loop {
             let turn = self
                 .provider
@@ -280,25 +301,16 @@ impl Harness {
             usage.add(turn.usage);
             let _ = self.events.send(HarnessEvent::ModelTurnCompleted);
             if turn.tool_calls.is_empty() {
+                self.maybe_install_plan(&mut host_plan, &task, &turn.content);
                 let controls = self.controls.drain();
-                if controls.is_empty() {
-                    messages.push(Message::assistant(
-                        &turn.content,
-                        turn.reasoning,
-                        Vec::new(),
-                    ));
-                    return Ok(RunOutcome {
-                        response: turn.content,
-                        stopped_gracefully: false,
-                        checkpoint: None,
-                        completed_tool_calls,
-                        completed_tool_rounds,
-                        usage,
-                        messages,
-                    });
+                messages.push(Message::assistant(
+                    &turn.content,
+                    turn.reasoning,
+                    Vec::new(),
+                ));
+                if !controls.is_empty() {
+                    self.append_controls(&mut messages, &controls);
                 }
-                messages.push(Message::assistant(turn.content, turn.reasoning, Vec::new()));
-                self.append_controls(&mut messages, &controls);
                 if controls.stop {
                     return self
                         .finish_gracefully(
@@ -307,11 +319,96 @@ impl Harness {
                             completed_tool_calls,
                             completed_tool_rounds,
                             usage,
+                            host_plan,
                         )
                         .await;
                 }
-                continue;
+                if !controls.guidance.is_empty() {
+                    self.append_open_plan_prompt(&mut messages, host_plan.as_ref());
+                    continue;
+                }
+                if turn.content.trim().is_empty() {
+                    if empty_model_retries < MAX_EMPTY_MODEL_RETRIES {
+                        empty_model_retries = empty_model_retries.saturating_add(1);
+                        messages.push(Message::new(
+                            MessageRole::User,
+                            "[HOST EMPTY TURN] Return a concise answer now, or call the next necessary tool if work remains. Never return an empty message.",
+                        ));
+                        self.append_open_plan_prompt(&mut messages, host_plan.as_ref());
+                        continue;
+                    }
+                    let response = "The provider returned repeated empty responses. Completed tool results were retained; please retry the request.".to_owned();
+                    messages.push(Message::new(MessageRole::Assistant, &response));
+                    return Ok(RunOutcome {
+                        response,
+                        stopped_gracefully: false,
+                        checkpoint: None,
+                        completed_tool_calls,
+                        completed_tool_rounds,
+                        usage,
+                        messages,
+                        host_plan,
+                    });
+                }
+                empty_model_retries = 0;
+
+                if self.config.enforce_host_plans {
+                    if let Some(plan) = host_plan.as_mut().filter(|plan| !plan.done()) {
+                        let is_last = plan.cursor + 1 == plan.steps.len();
+                        if is_last
+                            && turn.content.trim().chars().count() >= 200
+                            && !promised_more_work(&turn.content)
+                        {
+                            plan.mark_current_done("writeup");
+                        }
+                    }
+                    if host_plan.as_ref().is_some_and(|plan| !plan.done()) {
+                        empty_plan_continuations = empty_plan_continuations.saturating_add(1);
+                        if empty_plan_continuations > self.config.max_empty_plan_continuations {
+                            messages.push(Message::new(
+                                MessageRole::User,
+                                "[HOST PLAN CEILING] No evidence was produced for the open step. Return a concise progress report and explicitly state what remains, without claiming that work already completed.",
+                            ));
+                            return self
+                                .finish_without_tools(
+                                    messages,
+                                    task,
+                                    false,
+                                    completed_tool_calls,
+                                    completed_tool_rounds,
+                                    usage,
+                                    host_plan,
+                                )
+                                .await;
+                        }
+                        self.append_open_plan_prompt(&mut messages, host_plan.as_ref());
+                        continue;
+                    }
+                    if host_plan.is_none() && promised_more_work(&turn.content) {
+                        empty_plan_continuations = empty_plan_continuations.saturating_add(1);
+                        if empty_plan_continuations <= self.config.max_empty_plan_continuations {
+                            messages.push(Message::new(
+                                MessageRole::User,
+                                "[HOST CONTINUATION: NEED PLAN] You promised more work but emitted no tools. Emit a ```plan block with 2-8 short steps, then call tools for step 1. Do not claim you will continue later.",
+                            ));
+                            continue;
+                        }
+                    }
+                }
+                return Ok(RunOutcome {
+                    response: turn.content,
+                    stopped_gracefully: false,
+                    checkpoint: None,
+                    completed_tool_calls,
+                    completed_tool_rounds,
+                    usage,
+                    messages,
+                    host_plan,
+                });
             }
+
+            empty_model_retries = 0;
+            self.maybe_install_plan(&mut host_plan, &task, &turn.content);
 
             if self
                 .config
@@ -331,19 +428,26 @@ impl Harness {
                         completed_tool_calls,
                         completed_tool_rounds,
                         usage,
+                        host_plan,
                     )
                     .await;
             }
 
             completed_tool_rounds = completed_tool_rounds.saturating_add(1);
+            let promised_more = promised_more_work(&turn.content);
             messages.push(Message::assistant(
                 turn.content,
                 turn.reasoning,
                 turn.tool_calls.clone(),
             ));
             let mut boundary_controls = None;
-            for call in turn.tool_calls {
-                let result = self.execute_tool(&call, &task).await;
+            let mut plan_evidence = false;
+            let calls = turn.tool_calls;
+            for (index, call) in calls.iter().enumerate() {
+                let result = self.execute_tool(call, &task).await;
+                plan_evidence |= self.registry.get(&call.name).is_some_and(|tool| {
+                    tool.spec().category != ToolCategory::Action || result.success
+                });
                 completed_tool_calls = completed_tool_calls.saturating_add(1);
                 messages.push(Message::tool(
                     &call.id,
@@ -351,10 +455,22 @@ impl Harness {
                 ));
                 let controls = self.controls.drain();
                 if !controls.is_empty() {
+                    for skipped in &calls[index + 1..] {
+                        messages.push(Message::tool(
+                            &skipped.id,
+                            "[skipped after an operator control at the completed-tool boundary]",
+                        ));
+                    }
                     self.append_controls(&mut messages, &controls);
                     boundary_controls = Some(controls);
                     break;
                 }
+            }
+            if plan_evidence
+                && !promised_more
+                && let Some(plan) = host_plan.as_mut().filter(|plan| !plan.done())
+            {
+                plan.mark_current_done("tools");
             }
             if boundary_controls
                 .as_ref()
@@ -367,10 +483,61 @@ impl Harness {
                         completed_tool_calls,
                         completed_tool_rounds,
                         usage,
+                        host_plan,
                     )
                     .await;
             }
+            self.append_open_plan_prompt(&mut messages, host_plan.as_ref());
         }
+    }
+
+    fn ensure_plan_guidance(&self, messages: &mut [Message]) {
+        if !self.config.enforce_host_plans {
+            return;
+        }
+        let Some(system) = messages
+            .iter_mut()
+            .find(|message| message.role == MessageRole::System)
+        else {
+            return;
+        };
+        if !system.content.contains(PLAN_GUIDANCE_MARKER) {
+            system.content.push_str(
+                "\n\n[HOST PLAN CONTRACT]\nIf the task needs multiple actions, include a ```plan block with 2-8 short numbered steps and call tools for the current step only. The host advances the cursor only after tool evidence. Never end a response by promising work for later; call the needed tool now.",
+            );
+        }
+    }
+
+    fn maybe_install_plan(&self, host_plan: &mut Option<HostPlan>, task: &str, response: &str) {
+        if !self.config.enforce_host_plans || host_plan.is_some() {
+            return;
+        }
+        let steps = parse_plan_steps(response);
+        if let Some(plan) = HostPlan::new(task.chars().take(200).collect::<String>(), steps) {
+            *host_plan = Some(plan);
+        }
+    }
+
+    fn append_open_plan_prompt(&self, messages: &mut Vec<Message>, host_plan: Option<&HostPlan>) {
+        if !self.config.enforce_host_plans {
+            return;
+        }
+        let Some(plan) = host_plan.filter(|plan| !plan.done()) else {
+            return;
+        };
+        let Some(step) = plan.current() else {
+            return;
+        };
+        messages.push(Message::new(
+            MessageRole::User,
+            format!(
+                "[HOST PLAN — CURRENT STEP]\n{}\nDo only step {}/{}: {}\nCall the needed tools now. Do not skip ahead or promise to continue later.",
+                plan.progress(),
+                plan.cursor + 1,
+                plan.steps.len(),
+                step.text
+            ),
+        ));
     }
 
     async fn execute_tool(&self, call: &ToolCall, task: &str) -> ToolResult {
@@ -435,6 +602,7 @@ impl Harness {
         completed_tool_calls: u64,
         completed_tool_rounds: u64,
         usage: TokenUsage,
+        host_plan: Option<HostPlan>,
     ) -> Result<RunOutcome> {
         self.finish_without_tools(
             messages,
@@ -443,10 +611,12 @@ impl Harness {
             completed_tool_calls,
             completed_tool_rounds,
             usage,
+            host_plan,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn finish_without_tools(
         &self,
         mut messages: Vec<Message>,
@@ -455,6 +625,7 @@ impl Harness {
         completed_tool_calls: u64,
         completed_tool_rounds: u64,
         mut usage: TokenUsage,
+        host_plan: Option<HostPlan>,
     ) -> Result<RunOutcome> {
         let turn = self
             .provider
@@ -479,6 +650,7 @@ impl Harness {
             completed_tool_calls,
             completed_tool_rounds,
             pending_task: task,
+            host_plan: host_plan.clone(),
         });
         Ok(RunOutcome {
             response,
@@ -488,6 +660,7 @@ impl Harness {
             completed_tool_rounds,
             usage,
             messages,
+            host_plan,
         })
     }
 }

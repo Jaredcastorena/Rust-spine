@@ -23,9 +23,8 @@ fuzz_target!(|data: &[u8]| {
     let mut leaves = Vec::new();
 
     for (index, chunk) in data.chunks(8).take(64).enumerate() {
-        let component = |offset: usize| {
-            f32::from(chunk.get(offset).copied().unwrap_or(128)) / 127.5 - 1.0
-        };
+        let component =
+            |offset: usize| f32::from(chunk.get(offset).copied().unwrap_or(128)) / 127.5 - 1.0;
         let vector = [component(0), component(1), component(2)];
         let mut event = [0_u8; 32];
         event[..8].copy_from_slice(&(index as u64).to_be_bytes());
@@ -33,7 +32,10 @@ fuzz_target!(|data: &[u8]| {
             event_id: EventId::from_bytes(event),
             vector: vector.to_vec(),
             time: f64::from(chunk.get(3).copied().unwrap_or_default()),
-            source: Some(format!("source-{}", chunk.get(4).copied().unwrap_or_default() % 4)),
+            source: Some(format!(
+                "source-{}",
+                chunk.get(4).copied().unwrap_or_default() % 4
+            )),
             metadata: BTreeMap::from([(
                 "token_count".into(),
                 (usize::from(chunk.get(5).copied().unwrap_or_default()) + 1).to_string(),
@@ -45,7 +47,9 @@ fuzz_target!(|data: &[u8]| {
             });
         }
         let eligibility = [component(4), component(5), component(6), component(7)];
-        thymos.update(&vector, &eligibility).expect("finite shaped update");
+        thymos
+            .update(&vector, &eligibility)
+            .expect("finite shaped update");
         let trajectory = thymos.step(&vector).expect("finite shaped trajectory");
         assert!(trajectory.surprise.is_finite());
         assert!(trajectory.speed.is_finite());

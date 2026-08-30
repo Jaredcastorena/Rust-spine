@@ -159,6 +159,59 @@ impl WebUi {
     pub fn notice(&self, message: impl Into<String>) {
         self.state.write().expect("web state poisoned").notice = Some(message.into());
     }
+
+    pub fn begin_onboarding_model_turn(&self) {
+        let mut state = self.state.write().expect("web state poisoned");
+        state.busy = true;
+        state.phase = "onboarding".into();
+        state.activity = "Getting acquainted".into();
+        state.notice = None;
+    }
+
+    pub fn begin_onboarding_answer(&self, text: &str) {
+        let mut state = self.state.write().expect("web state poisoned");
+        if !state.busy {
+            state.messages.push(WebMessage {
+                role: "user".into(),
+                content: text.into(),
+            });
+        }
+        state.busy = true;
+        state.phase = "onboarding".into();
+        state.activity = "Listening".into();
+        state.notice = None;
+    }
+
+    pub fn finish_onboarding(&self, response: &str, complete: bool) {
+        let mut state = self.state.write().expect("web state poisoned");
+        if !response.trim().is_empty() {
+            state.messages.push(WebMessage {
+                role: "assistant".into(),
+                content: response.into(),
+            });
+        }
+        state.busy = false;
+        state.phase = if complete { "idle" } else { "onboarding" }.into();
+        state.activity = if complete {
+            "Ready"
+        } else {
+            "Getting to know you"
+        }
+        .into();
+        state.notice = if complete {
+            None
+        } else {
+            Some("Reply naturally, or type /skip to start working now.".into())
+        };
+    }
+
+    pub fn pause_onboarding(&self, message: &str) {
+        let mut state = self.state.write().expect("web state poisoned");
+        state.busy = false;
+        state.phase = "idle".into();
+        state.activity = "Ready".into();
+        state.notice = Some(message.into());
+    }
 }
 
 pub struct WebServer {
@@ -198,20 +251,23 @@ struct ControlRequest {
     action: String,
 }
 
+pub struct WebBind<'a> {
+    pub host: &'a str,
+    pub port: u16,
+    pub allow_remote: bool,
+}
+
 pub async fn start(
-    host: &str,
-    port: u16,
+    bind: WebBind<'_>,
     input: UnboundedSender<io::Result<String>>,
     heart: String,
     incognito: bool,
     grounding: bool,
     tool_count: usize,
 ) -> Result<WebServer, Box<dyn std::error::Error>> {
-    let ip: IpAddr = host.parse()?;
-    if !ip.is_loopback() && !is_tailscale_ip(ip) {
-        return Err(
-            "--web-host must be loopback or a Tailscale IPv4 address in the managed address range".into(),
-        );
+    let ip: IpAddr = bind.host.parse()?;
+    if !ip.is_loopback() && !bind.allow_remote {
+        return Err("a non-loopback --web-host requires --allow-remote-web".into());
     }
     let mut bytes = [0_u8; 32];
     getrandom::fill(&mut bytes)?;
@@ -246,7 +302,7 @@ pub async fn start(
         .route("/api/guidance", post(api_guidance))
         .route("/api/control", post(api_control))
         .with_state(app_state);
-    let listener = tokio::net::TcpListener::bind((ip, port)).await?;
+    let listener = tokio::net::TcpListener::bind((ip, bind.port)).await?;
     let address = listener.local_addr()?;
     let url = format!("http://{address}");
     let access_url = format!("{url}/#{token}");
@@ -266,23 +322,23 @@ pub async fn start(
     })
 }
 
-fn is_tailscale_ip(ip: IpAddr) -> bool {
-    let IpAddr::V4(ip) = ip else {
-        return false;
-    };
-    let octets = ip.octets();
-    octets[0] == 100 && (64..=127).contains(&octets[1])
-}
-
 async fn index() -> Response {
     let mut response = Html(HTML).into_response();
     response.headers_mut().insert(
         header::CONTENT_SECURITY_POLICY,
-        "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; base-uri 'none'; frame-ancestors 'none'".parse().unwrap(),
+        "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; base-uri 'none'; object-src 'none'; form-action 'self'; frame-ancestors 'none'".parse().unwrap(),
     );
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    response.headers_mut().insert(
+        header::HeaderName::from_static("referrer-policy"),
+        "no-referrer".parse().unwrap(),
+    );
+    response.headers_mut().insert(
+        header::HeaderName::from_static("x-content-type-options"),
+        "nosniff".parse().unwrap(),
+    );
     response
 }
 
@@ -307,7 +363,12 @@ async fn api_state(State(state): State<AppState>, headers: HeaderMap) -> Respons
     if !authorized(&headers, &state) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    Json(state.ui.state.read().expect("web state poisoned").clone()).into_response()
+    let mut response =
+        Json(state.ui.state.read().expect("web state poisoned").clone()).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    response
 }
 
 async fn api_message(
@@ -327,9 +388,10 @@ async fn api_message(
         if snapshot.busy {
             return (StatusCode::CONFLICT, "a turn is already active").into_response();
         }
+        let onboarding = snapshot.phase == "onboarding";
         snapshot.busy = true;
-        snapshot.phase = "queued".into();
-        snapshot.activity = "Queued".into();
+        snapshot.phase = if onboarding { "onboarding" } else { "queued" }.into();
+        snapshot.activity = if onboarding { "Listening" } else { "Queued" }.into();
         snapshot.messages.push(WebMessage {
             role: "user".into(),
             content: message.into(),
@@ -412,39 +474,114 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn rejects_non_tailscale_remote_binding() {
+    async fn rejects_remote_binding_without_an_explicit_opt_in() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         assert!(
-            start("0.0.0.0", 0, tx, "test".into(), true, false, 1)
-                .await
-                .is_err()
+            start(
+                WebBind {
+                    host: "0.0.0.0",
+                    port: 0,
+                    allow_remote: false,
+                },
+                tx,
+                "test".into(),
+                true,
+                false,
+                1,
+            )
+            .await
+            .is_err()
         );
-    }
 
-    #[test]
-    fn accepts_only_loopback_and_tailscale_ranges() {
-        assert!(is_tailscale_ip(IpAddr::from([100, 64, 0, 1])));
-        assert!(is_tailscale_ip(IpAddr::from([100, 127, 255, 255])));
-        assert!(!is_tailscale_ip(IpAddr::from([100, 128, 0, 1])));
-        assert!(!is_tailscale_ip(IpAddr::from([192, 168, 1, 2])));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = start(
+            WebBind {
+                host: "0.0.0.0",
+                port: 0,
+                allow_remote: true,
+            },
+            tx,
+            "test".into(),
+            true,
+            false,
+            1,
+        )
+        .await
+        .unwrap();
+        assert!(server.access_url.starts_with("http://0.0.0.0:"));
+        server.shutdown().await;
     }
 
     #[tokio::test]
     async fn loopback_server_starts_on_an_ephemeral_port() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let server = start("127.0.0.1", 0, tx, "test".into(), true, false, 1)
-            .await
-            .unwrap();
+        let server = start(
+            WebBind {
+                host: "127.0.0.1",
+                port: 0,
+                allow_remote: false,
+            },
+            tx,
+            "test".into(),
+            true,
+            false,
+            1,
+        )
+        .await
+        .unwrap();
         assert!(server.access_url.starts_with("http://127.0.0.1:"));
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn onboarding_uses_the_same_browser_conversation_without_duplicate_answers() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = start(
+            WebBind {
+                host: "127.0.0.1",
+                port: 0,
+                allow_remote: false,
+            },
+            tx,
+            "test".into(),
+            false,
+            false,
+            1,
+        )
+        .await
+        .unwrap();
+        let ui = server.ui();
+        ui.begin_onboarding_model_turn();
+        ui.finish_onboarding("How do you like to work?", false);
+        ui.begin_onboarding_answer("Be direct.");
+        ui.begin_onboarding_answer("Be direct.");
+
+        let state = ui.state.read().unwrap().clone();
+        assert_eq!(state.phase, "onboarding");
+        assert!(state.busy);
+        assert_eq!(state.messages.len(), 2);
+        assert_eq!(state.messages[0].role, "assistant");
+        assert_eq!(state.messages[1].content, "Be direct.");
         server.shutdown().await;
     }
 
     #[tokio::test]
     async fn api_requires_page_token_and_forwards_messages() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let server = start("127.0.0.1", 0, tx, "test".into(), true, false, 1)
-            .await
-            .unwrap();
+        let server = start(
+            WebBind {
+                host: "127.0.0.1",
+                port: 0,
+                allow_remote: false,
+            },
+            tx,
+            "test".into(),
+            true,
+            false,
+            1,
+        )
+        .await
+        .unwrap();
         let base_url = server
             .access_url
             .split('#')
@@ -453,16 +590,33 @@ mod tests {
             .trim_end_matches('/');
         let client = reqwest::Client::new();
         let token = server.access_url.split('#').nth(1).unwrap();
-        let html = client
-            .get(base_url)
-            .send()
-            .await
-            .unwrap()
-            .text()
-            .await
-            .unwrap();
+        let html_response = client.get(base_url).send().await.unwrap();
+        assert_eq!(
+            html_response
+                .headers()
+                .get("referrer-policy")
+                .and_then(|value| value.to_str().ok()),
+            Some("no-referrer")
+        );
+        let html = html_response.text().await.unwrap();
         assert_eq!(token.len(), 64);
         assert!(!html.contains(token));
+        assert!(html.contains("/style.css"));
+        assert!(html.contains("/app.js"));
+        let css = client
+            .get(format!("{base_url}/style.css"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(css.status(), StatusCode::OK);
+        assert!(css.text().await.unwrap().contains("color-scheme:dark"));
+        let script = client
+            .get(format!("{base_url}/app.js"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(script.status(), StatusCode::OK);
+        assert!(script.text().await.unwrap().contains("x-spine-token"));
         assert_eq!(
             client
                 .get(format!("{base_url}/api/state"))
@@ -482,6 +636,19 @@ mod tests {
                 .unwrap()
                 .status(),
             StatusCode::ACCEPTED
+        );
+        let state = client
+            .get(format!("{base_url}/api/state"))
+            .header("x-spine-token", token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
         );
         assert_eq!(rx.recv().await.unwrap().unwrap(), "hello from browser");
         server.shutdown().await;

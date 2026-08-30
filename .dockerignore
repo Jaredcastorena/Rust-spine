@@ -1,0 +1,32 @@
+.git
+.github
+target
+dist
+fuzz
+Dockerfile
+.dockerignore
+README.md
+PROJECT_STATE.md
+scripts
+about.hbs
+about.toml
+
+# Local state, credentials, and model artifacts never enter the build context.
+.env
+.env.*
+*.spine
+*.spine.blobs
+*.spine.blobs/
+*.jsonl
+*.log
+*.gguf
+*.safetensors
+
+# Editor and operating-system noise.
+.idea
+.vscode
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
