@@ -40,7 +40,7 @@ serde_json = "1.0.145"
 sha2 = "0.11.0-rc.2"
 thiserror = "2.0.17"
 tempfile = "3.23.0"
-tokenizers = "0.22.2"
+tokenizers = "0.23.1"
 tokio = { version = "1.47.1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "signal", "time"] }
 uuid = { version = "1.18.1", features = ["v7", "serde"] }
 walkdir = "2.5.0"
