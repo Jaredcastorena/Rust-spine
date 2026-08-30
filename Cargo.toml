@@ -15,7 +15,7 @@ rust-version = "1.98"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-argon2 = "0.5.3"
+argon2 = "0.6.0"
 async-trait = "0.1.89"
 axum = "0.8"
 bip39 = { version = "2.2.2", features = ["rand", "zeroize"] }
