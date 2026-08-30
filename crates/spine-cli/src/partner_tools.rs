@@ -1518,8 +1518,17 @@ mod tests {
         let outer = tokio::spawn(async move { tool.execute(&call, &ToolContext::default()).await });
         tokio::time::sleep(Duration::from_millis(10)).await;
         outer.abort();
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let status = manager.format();
+        let status = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let status = manager.format();
+                if status.contains("status=completed") && status.contains("survived") {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("detached shell task did not finish: {}", manager.format()));
         assert!(status.contains("status=completed"), "{status}");
         assert!(status.contains("survived"), "{status}");
         let _ = fs::remove_file(audit);
