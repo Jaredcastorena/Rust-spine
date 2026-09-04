@@ -1481,8 +1481,6 @@ fn llama_server_args(
         "-c".into(),
         context_tokens.max(256).to_string().into(),
         "--jinja".into(),
-        "--tools".into(),
-        "all".into(),
     ]
 }
 
@@ -2377,7 +2375,7 @@ mod cli_tests {
     }
 
     #[test]
-    fn managed_server_arguments_enable_jinja_tools_and_context() {
+    fn managed_server_arguments_enable_jinja_and_context_without_server_tools() {
         let arguments = llama_server_args(
             std::path::Path::new("model.gguf"),
             "127.0.0.1",
@@ -2397,7 +2395,7 @@ mod cli_tests {
             "32768"
         );
         assert!(arguments.iter().any(|item| item == "--jinja"));
-        assert!(arguments.windows(2).any(|pair| pair == ["--tools", "all"]));
+        assert!(!arguments.iter().any(|item| item == "--tools"));
         assert!(!arguments.iter().any(|item| item == "secret"));
     }
 
