@@ -1533,7 +1533,9 @@ mod tests {
         .await
         .expect("shell task did not start");
         outer.abort();
-        let outer_error = outer.await.expect_err("outer shell call was not interrupted");
+        let outer_error = outer
+            .await
+            .expect_err("outer shell call was not interrupted");
         assert!(outer_error.is_cancelled(), "{outer_error}");
         let status = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
