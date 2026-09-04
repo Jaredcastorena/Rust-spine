@@ -1495,7 +1495,7 @@ mod tests {
         assert!(files.is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn interrupted_shell_call_keeps_host_task_alive() {
         let manager = Arc::new(RunningTaskManager::default());
         let audit =
@@ -1507,18 +1507,37 @@ mod tests {
             running_tasks: Arc::clone(&manager),
         };
         #[cfg(target_os = "windows")]
-        let command = "Start-Sleep -Milliseconds 50; Write-Output survived";
+        let command = "Start-Sleep -Milliseconds 500; Write-Output survived";
         #[cfg(not(target_os = "windows"))]
-        let command = "sleep 0.05; echo survived";
+        let command = "sleep 0.5; echo survived";
         let call = ToolCall {
             id: "test".into(),
             name: "shell".into(),
-            arguments: serde_json::json!({"command": command}),
+            arguments: serde_json::json!({"command": command, "timeout_s": 0}),
         };
         let outer = tokio::spawn(async move { tool.execute(&call, &ToolContext::default()).await });
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let worker_is_attached = manager
+                    .tasks
+                    .lock()
+                    .expect("running-task lock poisoned")
+                    .values()
+                    .any(|task| task.status == "running" && task.abort.is_some());
+                if worker_is_attached {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shell task did not start");
         outer.abort();
-        let status = tokio::time::timeout(Duration::from_secs(3), async {
+        let outer_error = outer
+            .await
+            .expect_err("outer shell call was not interrupted");
+        assert!(outer_error.is_cancelled(), "{outer_error}");
+        let status = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let status = manager.format();
                 if status.contains("status=completed") && status.contains("survived") {
