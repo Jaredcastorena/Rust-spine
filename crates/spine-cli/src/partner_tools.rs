@@ -1495,7 +1495,7 @@ mod tests {
         assert!(files.is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn interrupted_shell_call_keeps_host_task_alive() {
         let manager = Arc::new(RunningTaskManager::default());
         let audit =
@@ -1517,7 +1517,16 @@ mod tests {
         };
         let outer = tokio::spawn(async move { tool.execute(&call, &ToolContext::default()).await });
         tokio::time::timeout(Duration::from_secs(3), async {
-            while !manager.format().contains("status=running") {
+            loop {
+                let worker_is_attached = manager
+                    .tasks
+                    .lock()
+                    .expect("running-task lock poisoned")
+                    .values()
+                    .any(|task| task.status == "running" && task.abort.is_some());
+                if worker_is_attached {
+                    break;
+                }
                 tokio::task::yield_now().await;
             }
         })
