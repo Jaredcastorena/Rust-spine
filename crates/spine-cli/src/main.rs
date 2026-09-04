@@ -1678,17 +1678,47 @@ fn resolve_optional_nli_directory(explicit: Option<PathBuf>) -> io::Result<Optio
 }
 
 fn validate_model_directory(path: PathBuf, label: &str) -> io::Result<PathBuf> {
-    if model_assets_present(&path) {
-        Ok(path)
-    } else {
-        Err(io::Error::new(
+    let missing_assets_error = || {
+        io::Error::new(
             io::ErrorKind::NotFound,
             format!(
                 "{label} model directory {} must contain config.json, tokenizer.json, and model.safetensors",
                 path.display()
             ),
-        ))
+        )
+    };
+    for name in ["config.json", "tokenizer.json", "model.safetensors"] {
+        let asset = path.join(name);
+        match std::fs::metadata(&asset) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => return Err(missing_assets_error()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(missing_assets_error());
+            }
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "cannot read {label} model asset {}: {error}",
+                        asset.display()
+                    ),
+                ));
+            }
+        }
+        if let Err(error) = std::fs::File::open(&asset) {
+            if error.kind() == io::ErrorKind::NotFound {
+                return Err(missing_assets_error());
+            }
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot read {label} model asset {}: {error}",
+                    asset.display()
+                ),
+            ));
+        }
     }
+    Ok(path)
 }
 
 fn model_assets_present(path: &std::path::Path) -> bool {
@@ -2418,6 +2448,30 @@ mod cli_tests {
             resolve_required_model_directory(Some(temporary.path().to_owned())).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
         assert!(error.to_string().contains("model.safetensors"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_explicit_model_directory_preserves_permission_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let model = temporary.path().join("minilm");
+        std::fs::create_dir(&model).unwrap();
+        for name in ["config.json", "tokenizer.json", "model.safetensors"] {
+            std::fs::write(model.join(name), b"").unwrap();
+        }
+        std::fs::set_permissions(&model, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = resolve_required_model_directory(Some(model.clone()));
+        std::fs::set_permissions(&model, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if result.is_ok() {
+            // Privileged test runners can bypass Unix mode bits.
+            return;
+        }
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("config.json"));
     }
 
     #[test]

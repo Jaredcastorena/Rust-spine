@@ -269,6 +269,16 @@ line or replace each trailing `\` with PowerShell's backtick continuation.
    absolute path to the folder that directly contains the three files from
    step 2.
 
+   The container runs as UID and GID `10001`. On Linux, that user must be able
+   to traverse the mounted folder and read all three model files. If the folder
+   was created with restrictive permissions, fix only that folder and those
+   files before starting the container:
+
+   ```bash
+   chmod a+rx "/absolute/path/to/all-MiniLM-L6-v2"
+   chmod a+r "/absolute/path/to/all-MiniLM-L6-v2"/{config.json,tokenizer.json,model.safetensors}
+   ```
+
    Linux, with the model server from step 3 on the same machine:
 
    ```bash
@@ -299,10 +309,17 @@ cache mounts, and browser mode.
 
 The named `spine-data` volume retains the encrypted heart while the image and
 container remain disposable. The example mounts a standalone MiniLM directory
-containing real files. If you instead mount a normal Hugging Face cache, mount
-the complete `models--sentence-transformers--all-MiniLM-L6-v2` directory that
-contains both `blobs/` and `snapshots/`; mounting only a `snapshots/<hash>`
-directory breaks its relative symlinks into `blobs/`.
+containing real files. To use a normal Hugging Face cache instead, omit
+`-e SPINE_MINILM_DIR=/models/minilm` and replace the MiniLM mount with:
+
+```bash
+--mount "type=bind,src=/absolute/path/to/models--sentence-transformers--all-MiniLM-L6-v2,dst=/models/models--sentence-transformers--all-MiniLM-L6-v2,readonly"
+```
+
+Mount the complete repository directory containing both `blobs/` and
+`snapshots/`. Mounting only a `snapshots/<hash>` directory breaks its relative
+symlinks into `blobs/`. The image's `HF_HUB_CACHE=/models` setting discovers the
+mounted snapshot automatically.
 
 The heart stays under `/data`, while relative file paths and shell commands
 start at `/workspace`. This separation is organizational, not a security
