@@ -250,7 +250,15 @@ async fn filesystem_shell_browser_and_task_controls_work_together() {
     )
     .await;
     assert!(listed.success);
-    assert!(listed.output.contains("notes/example.md"));
+    let expected_listed_path = std::path::Path::new("notes")
+        .join("example.md")
+        .display()
+        .to_string();
+    assert!(
+        listed.output.contains(expected_listed_path.as_str()),
+        "unexpected file_list output: {}",
+        listed.output
+    );
 
     let searched = execute(
         &fixture.registry,
