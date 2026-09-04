@@ -81,8 +81,10 @@ jobs:
           $flags = "--remap-path-prefix=$env:GITHUB_WORKSPACE=/src/rust-spine --remap-path-prefix=$env:USERPROFILE=/src/dependencies"
           "RUSTFLAGS=$flags" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Test native CLI and web surface
-        run: cargo test --locked --bin spine --target ${{ matrix.target }}
+      # gemm-f16's unoptimized AArch64 build currently fails in inline assembly:
+      # https://github.com/sarah-quinones/gemm/issues/31
+      - name: Test release CLI and web surface
+        run: cargo test --release --locked --bin spine --target ${{ matrix.target }}
 
       - run: cargo build --release --locked --bin spine --target ${{ matrix.target }}
 
