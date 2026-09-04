@@ -564,13 +564,8 @@ spine chat --no-nli --model-dir "/absolute/path/to/all-MiniLM-L6-v2" --llama-ser
 
 Server output is written beside the heart. `--max-tool-rounds` is optional;
 tool rounds are unlimited by default. Omit `--model-dir` when Spine finds
-MiniLM automatically.
-
-**Managed-server security:** this mode currently starts llama.cpp with its
-built-in filesystem and shell tools enabled. Those server-side tools are
-separate from Spine's action audit and host gates. Keep the server on loopback,
-use only a trusted local model, and use the separate-server setup in step 3 if
-you do not want that additional tool surface.
+MiniLM automatically. Managed mode enables Jinja function calling without
+enabling llama.cpp's separate built-in host tools.
 
 ## Developer reference
 
