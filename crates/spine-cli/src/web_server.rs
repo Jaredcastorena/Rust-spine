@@ -77,7 +77,15 @@ impl WebUi {
         state.busy = true;
         state.phase = "running".into();
         state.activity = "Resuming".into();
+        state.checkpoint_available = false;
         state.notice = None;
+    }
+
+    pub fn set_checkpoint_available(&self, available: bool) {
+        self.state
+            .write()
+            .expect("web state poisoned")
+            .checkpoint_available = available;
     }
 
     pub fn activity(&self, text: &str) {

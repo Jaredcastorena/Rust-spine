@@ -11,9 +11,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use crate::{
-    CompletionRequest, HostPlan, Message, MessageRole, ModelProvider, Result, RuntimeError,
-    TokenUsage, ToolCall, ToolCategory, ToolContext, ToolRegistry, ToolResult, ToolRisk,
-    parse_plan_steps, promised_more_work,
+    CompletionRequest, HostPlan, Message, MessageRole, ModelProvider, PlanStepStatus, Result,
+    RuntimeError, TokenUsage, ToolCall, ToolCategory, ToolContext, ToolRegistry, ToolResult,
+    ToolRisk, parse_plan_steps, promised_more_work,
 };
 
 const PLAN_GUIDANCE_MARKER: &str = "[HOST PLAN CONTRACT]";
@@ -94,7 +94,8 @@ impl OperatorControls {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HarnessCheckpoint {
     pub schema: u32,
     pub harness_id: String,
@@ -107,13 +108,17 @@ pub struct HarnessCheckpoint {
 }
 
 impl HarnessCheckpoint {
+    pub const RECORD_TYPE: &'static str = "harness_checkpoint";
+    pub const OUTCOME: &'static str = "graceful_stop_checkpoint";
+
     pub fn to_interaction(
         &self,
         agent_id: spine_heart::AgentId,
         thread_id: spine_heart::ThreadId,
     ) -> Result<spine_heart::InteractionInput> {
+        self.validate()?;
         let mut metadata = std::collections::BTreeMap::new();
-        metadata.insert("record_type".into(), "harness_checkpoint".into());
+        metadata.insert("record_type".into(), Self::RECORD_TYPE.into());
         metadata.insert("harness_id".into(), self.harness_id.clone());
         Ok(spine_heart::InteractionInput {
             agent_id,
@@ -128,9 +133,191 @@ impl HarnessCheckpoint {
             },
             tool: None,
             attachments: Vec::new(),
-            outcome: Some("graceful_stop_checkpoint".into()),
+            outcome: Some(Self::OUTCOME.into()),
         })
     }
+
+    pub fn from_interaction(interaction: &spine_heart::InteractionInput) -> Result<Self> {
+        if interaction.role != spine_heart::ParticipantRole::Operator
+            || interaction.kind != spine_heart::EventKind::Control
+            || interaction.outcome.as_deref() != Some(Self::OUTCOME)
+            || interaction
+                .provenance
+                .metadata
+                .get("record_type")
+                .map(String::as_str)
+                != Some(Self::RECORD_TYPE)
+            || interaction.tool.is_some()
+            || !interaction.attachments.is_empty()
+        {
+            return Err(invalid_checkpoint(
+                "persisted record does not have the checkpoint envelope",
+            ));
+        }
+        let spine_heart::Content::Inline(content) = &interaction.content else {
+            return Err(invalid_checkpoint("checkpoint content is not inline JSON"));
+        };
+        let checkpoint: Self = serde_json::from_str(content)
+            .map_err(|error| invalid_checkpoint(format!("invalid checkpoint JSON: {error}")))?;
+        checkpoint.validate()?;
+        if interaction
+            .provenance
+            .metadata
+            .get("harness_id")
+            .map(String::as_str)
+            != Some(checkpoint.harness_id.as_str())
+        {
+            return Err(invalid_checkpoint(
+                "checkpoint metadata does not match its payload",
+            ));
+        }
+        Ok(checkpoint)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.schema != 1 {
+            return Err(invalid_checkpoint("unsupported checkpoint schema"));
+        }
+        if self.harness_id.trim().is_empty()
+            || self.harness_id.trim() != self.harness_id
+            || self.harness_id.len() > 256
+        {
+            return Err(invalid_checkpoint(
+                "harness id must contain 1..=256 trimmed bytes",
+            ));
+        }
+        if self.pending_task.trim().is_empty() {
+            return Err(invalid_checkpoint("pending task is empty"));
+        }
+        if self.messages.len() < 3
+            || self.messages.first().map(|message| message.role) != Some(MessageRole::System)
+            || self.messages.last().map(|message| message.role) != Some(MessageRole::Assistant)
+        {
+            return Err(invalid_checkpoint(
+                "checkpoint transcript is not a complete system/user/assistant exchange",
+            ));
+        }
+
+        let mut outstanding_calls = std::collections::BTreeSet::new();
+        let mut tool_rounds = 0_u64;
+        let mut tool_results = 0_u64;
+        let mut saw_user = false;
+        for message in &self.messages {
+            if !outstanding_calls.is_empty() && message.role != MessageRole::Tool {
+                return Err(invalid_checkpoint(
+                    "assistant tool calls are missing adjacent tool results",
+                ));
+            }
+            match message.role {
+                MessageRole::System | MessageRole::User => {
+                    if message.role == MessageRole::User {
+                        saw_user = true;
+                    }
+                    if message.tool_call_id.is_some()
+                        || !message.tool_calls.is_empty()
+                        || message.reasoning.is_some()
+                    {
+                        return Err(invalid_checkpoint(
+                            "system or user message contains assistant/tool metadata",
+                        ));
+                    }
+                }
+                MessageRole::Assistant => {
+                    if message.tool_call_id.is_some() {
+                        return Err(invalid_checkpoint(
+                            "assistant message contains a tool result id",
+                        ));
+                    }
+                    if !message.tool_calls.is_empty() {
+                        tool_rounds = tool_rounds.saturating_add(1);
+                        for call in &message.tool_calls {
+                            if call.id.trim().is_empty()
+                                || call.name.trim().is_empty()
+                                || !outstanding_calls.insert(call.id.as_str())
+                            {
+                                return Err(invalid_checkpoint(
+                                    "assistant tool calls have empty or duplicate identities",
+                                ));
+                            }
+                        }
+                    }
+                }
+                MessageRole::Tool => {
+                    if message.reasoning.is_some() || !message.tool_calls.is_empty() {
+                        return Err(invalid_checkpoint(
+                            "tool result contains assistant metadata",
+                        ));
+                    }
+                    let Some(call_id) = message.tool_call_id.as_deref() else {
+                        return Err(invalid_checkpoint("tool result is missing its call id"));
+                    };
+                    if !outstanding_calls.remove(call_id) {
+                        return Err(invalid_checkpoint(
+                            "tool result does not match an outstanding assistant call",
+                        ));
+                    }
+                    tool_results = tool_results.saturating_add(1);
+                }
+            }
+        }
+        if !saw_user || !outstanding_calls.is_empty() {
+            return Err(invalid_checkpoint(
+                "checkpoint transcript has no user task or ends inside a tool batch",
+            ));
+        }
+        let final_message = self.messages.last().expect("length checked");
+        if final_message.content.trim().is_empty()
+            || !final_message.tool_calls.is_empty()
+            || final_message.tool_call_id.is_some()
+        {
+            return Err(invalid_checkpoint(
+                "checkpoint transcript does not end with a safe assistant summary",
+            ));
+        }
+        if self.completed_tool_rounds > tool_rounds
+            || self.completed_tool_calls > tool_results
+            || self.completed_tool_rounds > self.completed_tool_calls
+        {
+            return Err(invalid_checkpoint(
+                "checkpoint tool counters do not match its transcript",
+            ));
+        }
+        if let Some(plan) = &self.host_plan {
+            validate_checkpoint_plan(plan)?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_checkpoint_plan(plan: &HostPlan) -> Result<()> {
+    if plan.goal.trim().is_empty()
+        || !(2..=8).contains(&plan.steps.len())
+        || plan.cursor > plan.steps.len()
+    {
+        return Err(invalid_checkpoint("host plan shape is invalid"));
+    }
+    for (offset, step) in plan.steps.iter().enumerate() {
+        let expected_status = if offset < plan.cursor {
+            PlanStepStatus::Done
+        } else if offset == plan.cursor {
+            PlanStepStatus::Active
+        } else {
+            PlanStepStatus::Pending
+        };
+        if step.index != offset + 1
+            || step.text.trim().is_empty()
+            || step.text.chars().count() > 160
+            || step.status != expected_status
+            || (step.status == PlanStepStatus::Done) != !step.evidence.trim().is_empty()
+        {
+            return Err(invalid_checkpoint("host plan state is inconsistent"));
+        }
+    }
+    Ok(())
+}
+
+fn invalid_checkpoint(message: impl Into<String>) -> RuntimeError {
+    RuntimeError::InvalidConfig(format!("invalid harness checkpoint: {}", message.into()))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -255,11 +442,7 @@ impl Harness {
     }
 
     pub async fn resume(&self, checkpoint: HarnessCheckpoint) -> Result<RunOutcome> {
-        if checkpoint.schema != 1 {
-            return Err(RuntimeError::InvalidConfig(
-                "unsupported harness checkpoint schema".into(),
-            ));
-        }
+        checkpoint.validate()?;
         let mut messages = checkpoint.messages;
         messages.push(Message::new(
             MessageRole::User,

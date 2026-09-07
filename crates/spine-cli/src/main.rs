@@ -26,8 +26,9 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use spine_heart::{
-    AgentId, CognitiveConfig, Content, ContextLeaf, EventKind, HeartConfig, InteractionInput,
-    KeySource, ParticipantRole, Provenance, SemanticEncoder, SpineHeart, ThreadId, ToolExchange,
+    AgentId, CognitiveConfig, Content, ContextLeaf, EventId, EventKind, HeartConfig,
+    InteractionInput, KeySource, ParticipantRole, Provenance, SemanticEncoder, SignedEvent,
+    SpineHeart, ThreadId, ToolExchange,
 };
 use spine_models::{MiniLmAssets, MiniLmEncoder};
 use spine_runtime::{
@@ -826,6 +827,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 onboarding::profile_context(interaction_profile.as_ref())
             );
 
+            let restored_checkpoint =
+                discover_persisted_checkpoint(&heart.events_canonical()?, &agent_id, &thread_id);
+            let mut checkpoint = match restored_checkpoint {
+                CheckpointDiscovery::Available(resumable) => Some(resumable),
+                CheckpointDiscovery::None => None,
+                CheckpointDiscovery::Rejected(reason) => {
+                    eprintln!("[persisted checkpoint ignored: {reason}]");
+                    if let Some(web) = &web_ui {
+                        web.notice(format!("Persisted checkpoint ignored: {reason}"));
+                    }
+                    None
+                }
+            };
+            if let Some(web) = &web_ui {
+                web.set_checkpoint_available(checkpoint.is_some());
+            }
+
             if !quit_after_onboarding {
                 println!(
                     "Spine ready: Rust heart={} events={} tools={} grounding={} (/tasks, /stop, /interrupt, /resume, /quit)",
@@ -838,9 +856,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "disabled"
                     },
                 );
+                if checkpoint.is_some() {
+                    println!("[resumable checkpoint restored; use /resume to continue]");
+                }
             }
             let mut history = Vec::<Message>::new();
-            let mut checkpoint = None::<HarnessCheckpoint>;
             let mut completed_turns = 0_u64;
             if !quit_after_onboarding {
                 loop {
@@ -1172,8 +1192,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let persist_start;
                     let run = if is_resume {
                         let resumable = checkpoint.take().expect("checkpoint exists");
-                        persist_start = resumable.messages.len() + 1;
-                        Box::pin(harness.resume(resumable))
+                        persist_start = resumable.checkpoint.messages.len() + 1;
+                        if let Err(error) = mark_checkpoint_consumed(
+                            &heart,
+                            encoder.as_ref(),
+                            &agent_id,
+                            &thread_id,
+                            &resumable,
+                        ) {
+                            eprintln!("[checkpoint resume was not started: {error}]");
+                            if let Some(web) = &web_ui {
+                                web.complete("", false, true);
+                                web.notice(format!("Checkpoint resume was not started: {error}"));
+                            }
+                            checkpoint = Some(resumable);
+                            continue;
+                        }
+                        Box::pin(harness.resume(resumable.checkpoint))
                             as std::pin::Pin<Box<dyn Future<Output = _>>>
                     } else {
                         unreachable!("new turns are handled above")
@@ -2136,13 +2171,155 @@ fn finish_visible_turn(
     }
 }
 
+const CHECKPOINT_CONSUMED_RECORD_TYPE: &str = "harness_checkpoint_consumed";
+const CHECKPOINT_CONSUMED_OUTCOME: &str = "harness_checkpoint_consumed";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PersistedHarnessCheckpoint {
+    checkpoint: HarnessCheckpoint,
+    event_id: EventId,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum CheckpointDiscovery {
+    Available(PersistedHarnessCheckpoint),
+    None,
+    Rejected(String),
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointConsumption {
+    schema: u32,
+    checkpoint_event_id: String,
+}
+
+fn discover_persisted_checkpoint(
+    events: &[SignedEvent],
+    agent_id: &AgentId,
+    thread_id: &ThreadId,
+) -> CheckpointDiscovery {
+    let mut consumed = BTreeSet::new();
+    for event in events.iter().rev() {
+        let interaction = &event.body.interaction;
+        if &interaction.agent_id != agent_id || &interaction.thread_id != thread_id {
+            continue;
+        }
+        match interaction
+            .provenance
+            .metadata
+            .get("record_type")
+            .map(String::as_str)
+        {
+            Some(CHECKPOINT_CONSUMED_RECORD_TYPE) => {
+                let checkpoint_id = match consumed_checkpoint_id(interaction) {
+                    Ok(id) => id,
+                    Err(reason) => return CheckpointDiscovery::Rejected(reason),
+                };
+                consumed.insert(checkpoint_id);
+            }
+            Some(HarnessCheckpoint::RECORD_TYPE) => {
+                if consumed.contains(&event.id) {
+                    return CheckpointDiscovery::None;
+                }
+                return match HarnessCheckpoint::from_interaction(interaction) {
+                    Ok(checkpoint) => CheckpointDiscovery::Available(PersistedHarnessCheckpoint {
+                        checkpoint,
+                        event_id: event.id,
+                    }),
+                    Err(error) => CheckpointDiscovery::Rejected(format!(
+                        "checkpoint {} failed validation: {error}",
+                        event.id
+                    )),
+                };
+            }
+            _ => {}
+        }
+    }
+    CheckpointDiscovery::None
+}
+
+fn consumed_checkpoint_id(interaction: &InteractionInput) -> Result<EventId, String> {
+    if interaction.role != ParticipantRole::Operator
+        || interaction.kind != EventKind::Control
+        || interaction.outcome.as_deref() != Some(CHECKPOINT_CONSUMED_OUTCOME)
+        || interaction.tool.is_some()
+        || !interaction.attachments.is_empty()
+    {
+        return Err("checkpoint consumption record has an invalid envelope".into());
+    }
+    let metadata_id = interaction
+        .provenance
+        .metadata
+        .get("checkpoint_event_id")
+        .ok_or_else(|| "checkpoint consumption record is missing its event id".to_owned())?;
+    let Content::Inline(content) = &interaction.content else {
+        return Err("checkpoint consumption record is not inline JSON".into());
+    };
+    let record: CheckpointConsumption = serde_json::from_str(content)
+        .map_err(|error| format!("invalid checkpoint consumption JSON: {error}"))?;
+    if record.schema != 1 || record.checkpoint_event_id != *metadata_id {
+        return Err("checkpoint consumption metadata does not match its payload".into());
+    }
+    metadata_id
+        .parse()
+        .map_err(|_| "checkpoint consumption event id is invalid".into())
+}
+
+fn checkpoint_consumption_interaction(
+    resumable: &PersistedHarnessCheckpoint,
+    agent_id: AgentId,
+    thread_id: ThreadId,
+) -> spine_runtime::Result<InteractionInput> {
+    let checkpoint_event_id = resumable.event_id.to_string();
+    let record = CheckpointConsumption {
+        schema: 1,
+        checkpoint_event_id: checkpoint_event_id.clone(),
+    };
+    let mut metadata = BTreeMap::new();
+    metadata.insert("record_type".into(), CHECKPOINT_CONSUMED_RECORD_TYPE.into());
+    metadata.insert("checkpoint_event_id".into(), checkpoint_event_id);
+    Ok(InteractionInput {
+        agent_id,
+        thread_id,
+        role: ParticipantRole::Operator,
+        kind: EventKind::Control,
+        content: Content::Inline(serde_json::to_string(&record)?),
+        causal_parents: Vec::new(),
+        provenance: Provenance {
+            metadata,
+            ..Provenance::default()
+        },
+        tool: None,
+        attachments: Vec::new(),
+        outcome: Some(CHECKPOINT_CONSUMED_OUTCOME.into()),
+    })
+}
+
+fn mark_checkpoint_consumed(
+    heart: &SpineHeart,
+    encoder: &MiniLmEncoder,
+    agent_id: &AgentId,
+    thread_id: &ThreadId,
+    resumable: &PersistedHarnessCheckpoint,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let interaction =
+        checkpoint_consumption_interaction(resumable, agent_id.clone(), thread_id.clone())?;
+    let Content::Inline(text) = &interaction.content else {
+        unreachable!("checkpoint consumption records are always inline")
+    };
+    let embedding = encoder.encode(text)?;
+    heart.commit_embedded(interaction, embedding)?;
+    Ok(())
+}
+
 fn checkpoint_from_outcome(
     heart: &SpineHeart,
     encoder: &MiniLmEncoder,
     agent_id: &AgentId,
     thread_id: &ThreadId,
     outcome: &RunOutcome,
-    checkpoint: &mut Option<HarnessCheckpoint>,
+    checkpoint: &mut Option<PersistedHarnessCheckpoint>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(resumable) = outcome.checkpoint.clone() {
         let interaction = resumable.to_interaction(agent_id.clone(), thread_id.clone())?;
@@ -2150,8 +2327,11 @@ fn checkpoint_from_outcome(
             Content::Inline(text) => text.clone(),
             Content::ColdBlob(_) | Content::Redacted => String::new(),
         };
-        heart.commit_embedded(interaction, encoder.encode(&text)?)?;
-        *checkpoint = Some(resumable);
+        let (receipt, _) = heart.commit_embedded(interaction, encoder.encode(&text)?)?;
+        *checkpoint = Some(PersistedHarnessCheckpoint {
+            checkpoint: resumable,
+            event_id: receipt.event.id,
+        });
     }
     Ok(())
 }
@@ -2304,8 +2484,281 @@ fn persist_harness_messages(
 mod cli_tests {
     use super::*;
 
+    fn checkpoint(harness_id: &str, task: &str) -> HarnessCheckpoint {
+        HarnessCheckpoint {
+            schema: 1,
+            harness_id: harness_id.into(),
+            messages: vec![
+                Message::new(MessageRole::System, "system"),
+                Message::new(MessageRole::User, task),
+                Message::new(MessageRole::Assistant, "paused safely"),
+            ],
+            completed_tool_calls: 0,
+            completed_tool_rounds: 0,
+            pending_task: task.into(),
+            host_plan: None,
+        }
+    }
+
+    fn test_event(seed: u8, interaction: InteractionInput) -> SignedEvent {
+        SignedEvent {
+            id: EventId::from_bytes([seed; 32]),
+            body: spine_heart::EventBody {
+                schema: 1,
+                device_id: spine_heart::DeviceId::from_bytes([9; 32]),
+                authorization_epoch: 0,
+                device_sequence: u64::from(seed),
+                timestamp: spine_heart::HybridTimestamp {
+                    wall_millis: u64::from(seed),
+                    counter: 0,
+                },
+                interaction,
+            },
+            signer_public_key: [0; 32],
+            signature: Vec::new(),
+        }
+    }
+
+    fn ids() -> (AgentId, ThreadId) {
+        (
+            AgentId::new("main").unwrap(),
+            ThreadId::new("interactive").unwrap(),
+        )
+    }
+
+    fn ordinary_interaction(
+        agent_id: AgentId,
+        thread_id: ThreadId,
+        text: &str,
+    ) -> InteractionInput {
+        InteractionInput {
+            agent_id,
+            thread_id,
+            role: ParticipantRole::User,
+            kind: EventKind::Message,
+            content: Content::Inline(text.into()),
+            causal_parents: Vec::new(),
+            provenance: Provenance::default(),
+            tool: None,
+            attachments: Vec::new(),
+            outcome: None,
+        }
+    }
+
     fn incognito_args(flag: &str) -> Vec<&str> {
         vec!["spine", "chat", flag, "--model-dir", "models"]
+    }
+
+    #[test]
+    fn persisted_checkpoint_is_discovered_after_heart_reopen() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("checkpoint.spine");
+        let (agent_id, thread_id) = ids();
+        let created = SpineHeart::create(HeartConfig::new(&path), "secret").unwrap();
+        let checkpoint = checkpoint("harness-restart", "inspect the repository");
+        let receipt = created
+            .heart
+            .commit_interaction(
+                checkpoint
+                    .to_interaction(agent_id.clone(), thread_id.clone())
+                    .unwrap(),
+            )
+            .unwrap();
+        drop(created.heart);
+
+        let reopened = SpineHeart::open(
+            HeartConfig::new(path),
+            KeySource::Passphrase("secret".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            discover_persisted_checkpoint(
+                &reopened.events_canonical().unwrap(),
+                &agent_id,
+                &thread_id,
+            ),
+            CheckpointDiscovery::Available(PersistedHarnessCheckpoint {
+                checkpoint,
+                event_id: receipt.event.id,
+            })
+        );
+    }
+
+    #[test]
+    fn consumed_checkpoint_stays_unavailable_after_heart_reopen() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("consumed-checkpoint.spine");
+        let (agent_id, thread_id) = ids();
+        let created = SpineHeart::create(HeartConfig::new(&path), "secret").unwrap();
+        let checkpoint = checkpoint("harness-restart", "inspect the repository");
+        let receipt = created
+            .heart
+            .commit_interaction(
+                checkpoint
+                    .to_interaction(agent_id.clone(), thread_id.clone())
+                    .unwrap(),
+            )
+            .unwrap();
+        let persisted = PersistedHarnessCheckpoint {
+            checkpoint,
+            event_id: receipt.event.id,
+        };
+        created
+            .heart
+            .commit_interaction(
+                checkpoint_consumption_interaction(&persisted, agent_id.clone(), thread_id.clone())
+                    .unwrap(),
+            )
+            .unwrap();
+        drop(created.heart);
+
+        let reopened = SpineHeart::open(
+            HeartConfig::new(path),
+            KeySource::Passphrase("secret".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            discover_persisted_checkpoint(
+                &reopened.events_canonical().unwrap(),
+                &agent_id,
+                &thread_id,
+            ),
+            CheckpointDiscovery::None
+        );
+    }
+
+    #[test]
+    fn consumed_checkpoint_is_stale_but_a_newer_checkpoint_is_available() {
+        let (agent_id, thread_id) = ids();
+        let first = checkpoint("harness-one", "first task");
+        let first_event = test_event(
+            1,
+            first
+                .to_interaction(agent_id.clone(), thread_id.clone())
+                .unwrap(),
+        );
+        let persisted = PersistedHarnessCheckpoint {
+            checkpoint: first,
+            event_id: first_event.id,
+        };
+        let consumed = test_event(
+            2,
+            checkpoint_consumption_interaction(&persisted, agent_id.clone(), thread_id.clone())
+                .unwrap(),
+        );
+        assert_eq!(
+            discover_persisted_checkpoint(
+                &[first_event.clone(), consumed.clone()],
+                &agent_id,
+                &thread_id,
+            ),
+            CheckpointDiscovery::None
+        );
+
+        let second = checkpoint("harness-one", "second task");
+        let second_event = test_event(
+            3,
+            second
+                .to_interaction(agent_id.clone(), thread_id.clone())
+                .unwrap(),
+        );
+        assert_eq!(
+            discover_persisted_checkpoint(
+                &[first_event, consumed, second_event.clone()],
+                &agent_id,
+                &thread_id,
+            ),
+            CheckpointDiscovery::Available(PersistedHarnessCheckpoint {
+                checkpoint: second,
+                event_id: second_event.id,
+            })
+        );
+    }
+
+    #[test]
+    fn normal_later_events_do_not_invalidate_an_open_checkpoint() {
+        let (agent_id, thread_id) = ids();
+        let checkpoint = checkpoint("harness-open", "paused task");
+        let checkpoint_event = test_event(
+            1,
+            checkpoint
+                .to_interaction(agent_id.clone(), thread_id.clone())
+                .unwrap(),
+        );
+        let later = test_event(
+            2,
+            ordinary_interaction(agent_id.clone(), thread_id.clone(), "unrelated later turn"),
+        );
+        assert_eq!(
+            discover_persisted_checkpoint(
+                &[checkpoint_event.clone(), later],
+                &agent_id,
+                &thread_id,
+            ),
+            CheckpointDiscovery::Available(PersistedHarnessCheckpoint {
+                checkpoint,
+                event_id: checkpoint_event.id,
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_newest_checkpoint_and_consumption_records_fail_closed() {
+        let (agent_id, thread_id) = ids();
+        let valid = checkpoint("harness-valid", "valid task");
+        let valid_event = test_event(
+            1,
+            valid
+                .to_interaction(agent_id.clone(), thread_id.clone())
+                .unwrap(),
+        );
+        let mut malformed_checkpoint = checkpoint("harness-malformed", "new task")
+            .to_interaction(agent_id.clone(), thread_id.clone())
+            .unwrap();
+        malformed_checkpoint.content = Content::Inline("{not-json".into());
+        assert!(matches!(
+            discover_persisted_checkpoint(
+                &[valid_event.clone(), test_event(2, malformed_checkpoint)],
+                &agent_id,
+                &thread_id,
+            ),
+            CheckpointDiscovery::Rejected(_)
+        ));
+
+        let persisted = PersistedHarnessCheckpoint {
+            checkpoint: valid,
+            event_id: valid_event.id,
+        };
+        let mut malformed_consumption =
+            checkpoint_consumption_interaction(&persisted, agent_id.clone(), thread_id.clone())
+                .unwrap();
+        malformed_consumption.content = Content::Inline("{}".into());
+        assert!(matches!(
+            discover_persisted_checkpoint(
+                &[valid_event, test_event(3, malformed_consumption)],
+                &agent_id,
+                &thread_id,
+            ),
+            CheckpointDiscovery::Rejected(_)
+        ));
+    }
+
+    #[test]
+    fn checkpoint_discovery_is_scoped_to_the_selected_agent_and_thread() {
+        let (agent_id, thread_id) = ids();
+        let event = test_event(
+            1,
+            checkpoint("other", "other task")
+                .to_interaction(
+                    AgentId::new("other-agent").unwrap(),
+                    ThreadId::new("other-thread").unwrap(),
+                )
+                .unwrap(),
+        );
+        assert_eq!(
+            discover_persisted_checkpoint(&[event], &agent_id, &thread_id),
+            CheckpointDiscovery::None
+        );
     }
 
     #[test]

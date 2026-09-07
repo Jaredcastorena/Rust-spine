@@ -464,6 +464,11 @@ Terminal lines that arrive in one paste burst are submitted together as a
 single multi-line prompt or guidance message. Individually typed commands and
 guidance keep their normal one-line behavior.
 
+Graceful-stop checkpoints are stored in the encrypted heart. Reopening the
+same agent and thread restores the newest unconsumed checkpoint for `/resume`;
+once a resume begins, that exact checkpoint is durably marked consumed so it
+cannot be replayed after another restart.
+
 ### Browser interface
 
 Add `--web` to the normal chat command:

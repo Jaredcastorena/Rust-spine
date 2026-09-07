@@ -5,7 +5,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use spine_heart::{AgentId, ThymosConfig};
+use spine_heart::{AgentId, ThreadId, ThymosConfig};
 use spine_runtime::{
     CompletionRequest, Harness, HarnessCheckpoint, HarnessConfig, HostPlan, Message, MessageRole,
     ModelProvider, ModelTurn, Result, SubagentHarnessFactory, Tool, ToolCall, ToolCategory,
@@ -311,6 +311,9 @@ async fn resume_restores_and_prompts_the_open_host_plan_step() {
         messages: vec![
             Message::new(MessageRole::System, "system"),
             Message::new(MessageRole::User, "inspect"),
+            Message::assistant("", None, vec![call(1)]),
+            Message::tool("call-1", "one complete"),
+            Message::new(MessageRole::Assistant, "item two remains"),
         ],
         completed_tool_calls: 1,
         completed_tool_rounds: 1,
@@ -328,6 +331,72 @@ async fn resume_restores_and_prompts_the_open_host_plan_step() {
             && message.content.contains("Do only step 2/2")
             && message.content.contains("Inspect the second item")
     }));
+}
+
+#[test]
+fn checkpoint_interactions_round_trip_only_after_strict_validation() {
+    let checkpoint = HarnessCheckpoint {
+        schema: 1,
+        harness_id: "harness-test".into(),
+        messages: vec![
+            Message::new(MessageRole::System, "system"),
+            Message::new(MessageRole::User, "inspect"),
+            Message::new(MessageRole::Assistant, "paused safely"),
+        ],
+        completed_tool_calls: 0,
+        completed_tool_rounds: 0,
+        pending_task: "inspect".into(),
+        host_plan: None,
+    };
+    let mut interaction = checkpoint
+        .to_interaction(
+            AgentId::new("main").unwrap(),
+            ThreadId::new("interactive").unwrap(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        HarnessCheckpoint::from_interaction(&interaction).unwrap(),
+        checkpoint
+    );
+    interaction
+        .provenance
+        .metadata
+        .insert("harness_id".into(), "different".into());
+    assert!(HarnessCheckpoint::from_interaction(&interaction).is_err());
+}
+
+#[test]
+fn checkpoint_validation_rejects_unsafe_boundaries_and_impossible_counters() {
+    let mut checkpoint = HarnessCheckpoint {
+        schema: 1,
+        harness_id: "harness-test".into(),
+        messages: vec![
+            Message::new(MessageRole::System, "system"),
+            Message::new(MessageRole::User, "inspect"),
+            Message::new(MessageRole::Assistant, "paused safely"),
+        ],
+        completed_tool_calls: 0,
+        completed_tool_rounds: 0,
+        pending_task: "inspect".into(),
+        host_plan: None,
+    };
+    checkpoint.messages[2] = Message::assistant("", None, vec![call(1)]);
+    assert!(checkpoint.validate().is_err());
+
+    checkpoint.messages[2] = Message::new(MessageRole::Assistant, "paused safely");
+    checkpoint.completed_tool_calls = 1;
+    assert!(checkpoint.validate().is_err());
+
+    checkpoint.completed_tool_calls = 0;
+    checkpoint.schema = 2;
+    assert!(checkpoint.validate().is_err());
+
+    checkpoint.schema = 1;
+    let mut plan = HostPlan::new("inspect", vec!["one".into(), "two".into()]).unwrap();
+    plan.mark_current_done("");
+    checkpoint.host_plan = Some(plan);
+    assert!(checkpoint.validate().is_err());
 }
 
 #[test]

@@ -5,7 +5,7 @@
 - Standalone Rust workspace with no Python runtime imports.
 - One encrypted heart contains the signed canonical event log and its versioned cognitive projection.
 - The projection unifies DCMDb, per-agent Thymos, typed facts, learned risk, and context triangles.
-- Interactive chat registers the complete native cognition/action surface, persistent history, grounding repair, operator guidance, safe stopping, resumable checkpoints, host-tracked tasks, and curated temporary subagents.
+- Interactive chat registers the complete native cognition/action surface, persistent history, grounding repair, operator guidance, safe stopping, restart-persistent resumable checkpoints, host-tracked tasks, and curated temporary subagents.
 - Multi-step work uses a host-owned plan cursor. Tool-free promises trigger another turn, steps advance only after evidence, and open plans survive graceful-stop checkpoints.
 - Native OpenAI tool calls and the reference fenced-JSON/Laguna fallback forms share one bounded parser and execution path.
 - Tool rounds are unlimited by default and remain configurable with a positive ceiling.
@@ -49,7 +49,8 @@ Legacy Python DCMDb/Thymos state is not queried by the native runtime. Running t
 
 ## Accepted verification
 
-- `cargo test --workspace --locked`: 109 tests.
+- Individual parity lanes pass locked workspace tests; the combined test count
+  is recorded after integration verification.
 - Strict workspace Clippy with all targets and features.
 - Formatting checks across the workspace and standalone fuzz package.
 - Locked fuzz-target compilation.
