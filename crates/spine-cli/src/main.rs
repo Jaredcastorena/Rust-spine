@@ -213,6 +213,13 @@ enum Command {
             help = "Provider model name when the endpoint requires one"
         )]
         server_model: Option<String>,
+        #[arg(
+            long,
+            env = "SPINE_REASONING_EFFORT",
+            hide_env_values = true,
+            help = "Optional provider reasoning-effort value"
+        )]
+        reasoning_effort: Option<String>,
         #[arg(long, default_value = "main")]
         agent: String,
         #[arg(long, default_value = "interactive")]
@@ -282,6 +289,13 @@ enum Command {
         api_key: Option<String>,
         #[arg(long, env = "SPINE_LLM_MODEL", hide_env_values = true)]
         server_model: Option<String>,
+        #[arg(
+            long,
+            env = "SPINE_REASONING_EFFORT",
+            hide_env_values = true,
+            help = "Optional provider reasoning-effort value"
+        )]
+        reasoning_effort: Option<String>,
         #[arg(long, default_value = "main")]
         agent: String,
         #[arg(long, default_value = "harness")]
@@ -562,6 +576,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             server_url,
             api_key,
             server_model,
+            reasoning_effort,
             agent,
             thread,
             max_tool_rounds,
@@ -647,6 +662,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut provider_config = LlamaCppConfig::new(server_url);
             provider_config.api_key = resolved_api_key;
             provider_config.model = server_model;
+            provider_config.reasoning_effort = reasoning_effort;
             provider_config.max_tokens = max_tokens;
             provider_config.temperature = temperature;
             provider_config.timeout = Duration::from_secs(timeout_seconds);
@@ -1279,6 +1295,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             server_url,
             api_key,
             server_model,
+            reasoning_effort,
             agent,
             thread,
             max_tool_rounds,
@@ -1307,6 +1324,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .filter(|value| !value.is_empty())
             });
             provider_config.model = server_model;
+            provider_config.reasoning_effort = reasoning_effort;
             provider_config.max_tokens = max_tokens;
             provider_config.temperature = temperature;
             provider_config.timeout = Duration::from_secs(timeout_seconds);
@@ -2344,6 +2362,26 @@ mod cli_tests {
             cli.command,
             Command::Chat {
                 skip_onboarding: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn provider_reasoning_effort_is_optional_and_configurable() {
+        let cli = Cli::try_parse_from(["spine", "chat", "--reasoning-effort", "high"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Chat {
+                reasoning_effort: Some(value),
+                ..
+            } if value == "high"
+        ));
+        let cli = Cli::try_parse_from(["spine", "chat"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Chat {
+                reasoning_effort: None,
                 ..
             }
         ));

@@ -508,6 +508,7 @@ command-line names for each setting.
 | `SPINE_LLM_URL` | `--server-url` | Address of the OpenAI-compatible model server. |
 | `SPINE_LLM_MODEL` | `--server-model` | Model name, when the server cannot report it. |
 | `SPINE_LLM_API_KEY` | `--api-key` (hidden; environment preferred) | Model-server credential, when one is required. |
+| `SPINE_REASONING_EFFORT` | `--reasoning-effort` | Optional provider-specific reasoning effort; omitted by default for broad compatibility. |
 | `SPINE_MAX_CONTEXT_TOKENS` | `--max-context-tokens` | Context limit, when the server cannot report it. |
 | `SPINE_LLAMA_SERVER` | `--llama-server-bin` | Local `llama-server` executable for Spine to manage. |
 | `SPINE_LLAMA_MODEL` | `--llama-model` | Local GGUF model for that managed server. |
@@ -548,6 +549,10 @@ that information or you intentionally want an override.
 On a multi-model endpoint, set `SPINE_LLM_MODEL` explicitly. Otherwise Spine
 uses the model advertised by `/v1/models` (normally its first entry) before
 falling back to `/props`.
+
+Spine omits `reasoning_effort` unless `SPINE_REASONING_EFFORT` or
+`--reasoning-effort` is set, because that optional field is not accepted by
+every OpenAI-compatible provider.
 
 The runtime value matters more than the model's theoretical maximum. A model
 may support 262,144 tokens but report only 4,096 when the server allocated a 4K

@@ -9,7 +9,7 @@
 - Multi-step work uses a host-owned plan cursor. Tool-free promises trigger another turn, steps advance only after evidence, and open plans survive graceful-stop checkpoints.
 - Native OpenAI tool calls and the reference fenced-JSON/Laguna fallback forms share one bounded parser and execution path.
 - Tool rounds are unlimited by default and remain configurable with a positive ceiling.
-- The llama.cpp/OpenAI-compatible provider uses retry/backoff, explicit context budgeting, TCP keepalive, fresh request connections, and causal transport diagnostics.
+- The llama.cpp/OpenAI-compatible provider uses retry/backoff, explicit context budgeting, TCP keepalive, fresh request connections, causal transport diagnostics, and the standard JSON-string wire format for multi-round function arguments. Optional provider-specific reasoning effort is sent only when configured.
 - Provider startup combines `/props` and `/v1/models` discovery to adopt the
   active model ID and allocated context window; explicit operator settings take
   precedence, and tool schemas are included in the context budget. Compaction
@@ -49,7 +49,7 @@ Legacy Python DCMDb/Thymos state is not queried by the native runtime. Running t
 
 ## Accepted verification
 
-- `cargo test --workspace --locked`: 104 tests.
+- `cargo test --workspace --locked`: 109 tests.
 - Strict workspace Clippy with all targets and features.
 - Formatting checks across the workspace and standalone fuzz package.
 - Locked fuzz-target compilation.

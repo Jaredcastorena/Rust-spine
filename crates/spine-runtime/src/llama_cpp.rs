@@ -41,7 +41,7 @@ impl LlamaCppConfig {
             model: None,
             temperature: 0.2,
             max_tokens: 4_096,
-            reasoning_effort: Some("low".into()),
+            reasoning_effort: None,
             timeout: Duration::from_secs(7_200),
             maximum_retries: 2,
             max_context_tokens: None,
@@ -60,6 +60,10 @@ pub struct LlamaCppProvider {
 impl LlamaCppProvider {
     pub fn new(mut config: LlamaCppConfig) -> Result<Self> {
         config.base_url = config.base_url.trim_end_matches('/').to_owned();
+        config.reasoning_effort = config
+            .reasoning_effort
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
         if config.base_url.is_empty()
             || !config.temperature.is_finite()
             || config.temperature < 0.0
@@ -242,7 +246,7 @@ impl ModelProvider for LlamaCppProvider {
                                     "type": "function",
                                     "function": {
                                         "name": call.name,
-                                        "arguments": call.arguments,
+                                        "arguments": call.arguments.to_string(),
                                     }
                                 })
                             })
@@ -624,8 +628,50 @@ struct Usage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Message;
-    use axum::{Json, Router, routing::get};
+    use std::sync::{Arc, Mutex};
+
+    use crate::{Message, ToolCategory, ToolRisk, ToolSpec};
+    use axum::{
+        Json, Router,
+        extract::State,
+        routing::{get, post},
+    };
+
+    async fn capture_completion_request(
+        State(requests): State<Arc<Mutex<Vec<Value>>>>,
+        Json(request): Json<Value>,
+    ) -> Json<Value> {
+        requests.lock().expect("request capture lock").push(request);
+        Json(json!({
+            "choices": [{"message": {"content": "done", "tool_calls": []}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 1}
+        }))
+    }
+
+    async fn send_and_capture(request: CompletionRequest, reasoning_effort: Option<&str>) -> Value {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/v1/chat/completions", post(capture_completion_request))
+            .with_state(Arc::clone(&requests));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut config = LlamaCppConfig::new(format!("http://{address}"));
+        config.reasoning_effort = reasoning_effort.map(str::to_owned);
+        let provider = LlamaCppProvider::new(config).unwrap();
+        provider.complete(request).await.unwrap();
+
+        let request = requests
+            .lock()
+            .expect("request capture lock")
+            .first()
+            .cloned()
+            .expect("captured completion request");
+        server.abort();
+        request
+    }
 
     #[test]
     fn context_budget_keeps_system_and_latest_task() {
@@ -753,6 +799,121 @@ mod tests {
         assert_eq!(provider.model(), Some("active-model.gguf"));
         assert_eq!(provider.context_tokens(), Some(16_384));
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn request_serializes_tool_arguments_as_json_strings_and_omits_default_reasoning() {
+        let request = send_and_capture(
+            CompletionRequest {
+                messages: vec![
+                    Message::new(MessageRole::System, "system"),
+                    Message::new(MessageRole::User, "read the file"),
+                    Message::assistant(
+                        "",
+                        None,
+                        vec![ToolCall {
+                            id: "call-1".into(),
+                            name: "file_read".into(),
+                            arguments: json!({"path": "notes.txt", "line": 7}),
+                        }],
+                    ),
+                    Message::tool("call-1", "contents"),
+                ],
+                tools: vec![ToolSpec {
+                    name: "file_read".into(),
+                    description: "Read a file".into(),
+                    category: ToolCategory::Internal,
+                    risk: ToolRisk::ReadOnly,
+                    parameters: json!({
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": ["path"]
+                    }),
+                }],
+                allow_tool_calls: true,
+            },
+            None,
+        )
+        .await;
+
+        let arguments = request
+            .pointer("/messages/2/tool_calls/0/function/arguments")
+            .and_then(Value::as_str)
+            .expect("tool arguments use the OpenAI JSON-string wire format");
+        assert_eq!(
+            serde_json::from_str::<Value>(arguments).unwrap(),
+            json!({"path": "notes.txt", "line": 7})
+        );
+        assert_eq!(
+            request.pointer("/messages/2/role"),
+            Some(&json!("assistant"))
+        );
+        assert_eq!(
+            request.pointer("/messages/2/tool_calls/0/id"),
+            Some(&json!("call-1"))
+        );
+        assert_eq!(
+            request.pointer("/messages/2/tool_calls/0/type"),
+            Some(&json!("function"))
+        );
+        assert_eq!(
+            request.pointer("/messages/2/tool_calls/0/function/name"),
+            Some(&json!("file_read"))
+        );
+        assert_eq!(request.pointer("/messages/3/role"), Some(&json!("tool")));
+        assert_eq!(
+            request.pointer("/messages/3/tool_call_id"),
+            Some(&json!("call-1"))
+        );
+        assert_eq!(
+            request.pointer("/messages/3/content"),
+            Some(&json!("contents"))
+        );
+        assert!(request.get("reasoning_effort").is_none());
+    }
+
+    #[tokio::test]
+    async fn request_includes_reasoning_effort_only_when_explicitly_configured() {
+        let request = send_and_capture(
+            CompletionRequest {
+                messages: vec![Message::new(MessageRole::User, "hello")],
+                tools: Vec::new(),
+                allow_tool_calls: false,
+            },
+            Some("  high  "),
+        )
+        .await;
+        assert_eq!(request.get("reasoning_effort"), Some(&json!("high")));
+    }
+
+    #[test]
+    fn reasoning_effort_is_opt_in_and_blank_values_are_omitted() {
+        assert!(
+            LlamaCppProvider::new(LlamaCppConfig::new("http://localhost:8080"))
+                .unwrap()
+                .config
+                .reasoning_effort
+                .is_none()
+        );
+        let mut config = LlamaCppConfig::new("http://localhost:8080");
+        config.reasoning_effort = Some("  high  ".into());
+        assert_eq!(
+            LlamaCppProvider::new(config)
+                .unwrap()
+                .config
+                .reasoning_effort
+                .as_deref(),
+            Some("high")
+        );
+        let mut config = LlamaCppConfig::new("http://localhost:8080");
+        config.reasoning_effort = Some("  ".into());
+        assert!(
+            LlamaCppProvider::new(config)
+                .unwrap()
+                .config
+                .reasoning_effort
+                .is_none()
+        );
     }
 
     #[test]
