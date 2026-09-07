@@ -606,6 +606,13 @@ tool rounds are unlimited by default. Omit `--model-dir` when Spine finds
 MiniLM automatically. Managed mode enables Jinja function calling without
 enabling llama.cpp's separate built-in host tools.
 
+After each user message is committed, the host uses its Thymos trajectory,
+recalled-memory tensions, and learned risk to widen automatic recall, cool the
+provider temperature, cap external actions, and raise the answer-grounding
+coverage requirement. A positive `--max-tool-rounds` ceiling can expand under
+risk; omitting it remains unlimited. Triangle-context rehydration keeps its
+fixed bounded topology.
+
 ## Developer reference
 
 ### What is in this repository

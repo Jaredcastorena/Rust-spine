@@ -6,9 +6,9 @@ use std::{
 
 use async_trait::async_trait;
 use spine_heart::{
-    AgentId, Content, Embedding, EventKind, Fact, FactAggregation, FactQueryAggregation,
+    AgentId, Content, Embedding, EventId, EventKind, Fact, FactAggregation, FactQueryAggregation,
     FactSlotType, FactValue, InteractionInput, ParticipantRole, Provenance, RehydrateBudget,
-    SemanticEncoder, SpineHeart, ThreadId,
+    RecallHit, SemanticEncoder, SpineHeart, ThreadId,
 };
 use spine_runtime::{
     Tool, ToolCall, ToolCategory, ToolContext, ToolRegistry, ToolResult, ToolRisk, ToolSpec,
@@ -116,13 +116,56 @@ impl Tool for SaveMemoryTool {
     }
 }
 
-pub fn recall_context(
+#[derive(Clone, Debug)]
+pub struct AutomaticRecall {
+    pub context: String,
+    pub hits: Vec<RecallHit>,
+}
+
+impl AutomaticRecall {
+    pub fn tension_count(&self) -> usize {
+        self.hits.iter().filter(|hit| hit.tensioned).count()
+    }
+
+    /// The four retrieval features persisted by Rust's risk-field projection.
+    pub fn risk_stats(&self) -> [f32; 4] {
+        if self.hits.is_empty() {
+            return [0.0; 4];
+        }
+        let count = self.hits.len() as f32;
+        let top_score = self
+            .hits
+            .iter()
+            .map(|hit| hit.score)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let mean_score = self.hits.iter().map(|hit| hit.score).sum::<f32>() / count;
+        let mean_confidence = self.hits.iter().map(|hit| hit.confidence).sum::<f32>() / count;
+        let tension_fraction = self.tension_count() as f32 / count;
+        [
+            top_score,
+            top_score - mean_score,
+            mean_confidence,
+            tension_fraction,
+        ]
+    }
+}
+
+/// Recall context for a just-committed user turn without recalling that turn as
+/// its own evidence. The returned node hits drive host modulation directly.
+pub fn automatic_recall_context(
     heart: &SpineHeart,
-    encoder: &dyn SemanticEncoder,
-    query: &str,
+    query: &Embedding,
+    lexical_query: &str,
     top_k: usize,
-) -> spine_runtime::Result<String> {
-    hybrid_recall_json(heart, encoder, query, top_k.clamp(1, 16))
+    excluded_event: EventId,
+) -> spine_runtime::Result<AutomaticRecall> {
+    hybrid_recall(
+        heart,
+        query,
+        lexical_query,
+        top_k.clamp(1, 16),
+        Some(excluded_event),
+    )
 }
 
 pub fn rehydrate_triangle_context(
@@ -302,11 +345,39 @@ fn hybrid_recall_json(
     top_k: usize,
 ) -> spine_runtime::Result<String> {
     let embedding = encoder.encode(query)?;
-    let dense = heart.recall_memories(&embedding, f64::MAX, top_k.saturating_mul(2), 6)?;
+    Ok(hybrid_recall(heart, &embedding, query, top_k, None)?.context)
+}
+
+fn hybrid_recall(
+    heart: &SpineHeart,
+    embedding: &Embedding,
+    query: &str,
+    top_k: usize,
+    excluded_event: Option<EventId>,
+) -> spine_runtime::Result<AutomaticRecall> {
+    let dense_limit = top_k
+        .saturating_mul(2)
+        .saturating_add(usize::from(excluded_event.is_some()));
+    let max_events_per_node = 6 + usize::from(excluded_event.is_some());
+    let dense = heart.recall_memories(embedding, f64::MAX, dense_limit, max_events_per_node)?;
+    let mut dense = dense
+        .into_iter()
+        .filter_map(|mut memory| {
+            memory
+                .events
+                .retain(|event| excluded_event.is_none_or(|excluded| event.id != excluded));
+            (!memory.events.is_empty()).then_some(memory)
+        })
+        .collect::<Vec<_>>();
+    let hits = dense
+        .iter()
+        .take(top_k)
+        .map(|memory| memory.hit.clone())
+        .collect();
 
     let mut results = Vec::new();
     let mut seen = BTreeSet::new();
-    for (score, event) in lexical_events(heart, query, top_k)? {
+    for (score, event) in lexical_events(heart, query, top_k, excluded_event.as_ref())? {
         if let Content::Inline(text) = event.body.interaction.content
             && seen.insert(event.id)
         {
@@ -320,7 +391,7 @@ fn hybrid_recall_json(
             }));
         }
     }
-    for memory in dense {
+    for memory in dense.drain(..) {
         for event in memory.events {
             if results.len() >= top_k.saturating_mul(3) {
                 break;
@@ -342,18 +413,25 @@ fn hybrid_recall_json(
         }
     }
     results.truncate(top_k.saturating_mul(2));
-    Ok(serde_json::to_string(&results)?)
+    Ok(AutomaticRecall {
+        context: serde_json::to_string(&results)?,
+        hits,
+    })
 }
 
 fn lexical_events(
     heart: &SpineHeart,
     query: &str,
     top_k: usize,
+    excluded_event: Option<&EventId>,
 ) -> spine_runtime::Result<Vec<(f32, spine_heart::SignedEvent)>> {
     let query_normalized = query.to_lowercase();
     let query_terms: BTreeSet<_> = terms(query).into_iter().collect();
     let mut scored = Vec::new();
     for event in heart.events_canonical()? {
+        if excluded_event.is_some_and(|excluded| event.id == *excluded) {
+            continue;
+        }
         let Content::Inline(text) = &event.body.interaction.content else {
             continue;
         };
@@ -819,5 +897,105 @@ mod tests {
     #[test]
     fn bounded_text_respects_unicode_characters() {
         assert_eq!(bounded_text("a🦀bc", 2), "a🦀\n[truncated]");
+    }
+
+    #[test]
+    fn automatic_recall_builds_python_compatible_risk_features() {
+        let recall = AutomaticRecall {
+            context: "[]".into(),
+            hits: vec![
+                RecallHit {
+                    node_id: spine_heart::NodeId::from_bytes([1; 32]),
+                    score: 0.9,
+                    semantic_score: 0.9,
+                    graph_score: 0.0,
+                    freshness: 0.0,
+                    confidence: 0.8,
+                    tensioned: true,
+                },
+                RecallHit {
+                    node_id: spine_heart::NodeId::from_bytes([2; 32]),
+                    score: 0.5,
+                    semantic_score: 0.5,
+                    graph_score: 0.0,
+                    freshness: 0.0,
+                    confidence: 0.6,
+                    tensioned: false,
+                },
+            ],
+        };
+        let stats = recall.risk_stats();
+        assert!((stats[0] - 0.9).abs() < f32::EPSILON);
+        assert!((stats[1] - 0.2).abs() < f32::EPSILON);
+        assert!((stats[2] - 0.7).abs() < f32::EPSILON);
+        assert!((stats[3] - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn automatic_recall_excludes_the_just_committed_event() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let created = SpineHeart::create(
+            spine_heart::HeartConfig::new(directory.path().join("recall.spine")),
+            "recall-test-passphrase",
+        )
+        .expect("create heart");
+        let manifest = spine_heart::ModelManifest {
+            schema: 1,
+            model_name: "fixed-test-encoder".into(),
+            artifact_hash: [1; 32],
+            tokenizer_hash: [2; 32],
+            dimension: 3,
+            normalized: true,
+            quantization: None,
+        };
+        created
+            .heart
+            .initialize_cognition(
+                spine_heart::CognitiveConfig::new(1, manifest, 2).expect("cognitive config"),
+            )
+            .expect("initialize cognition");
+        let agent = AgentId::new("main").expect("agent");
+        let thread = ThreadId::new("recall-test").expect("thread");
+        let embedding = Embedding::normalized(vec![1.0, 0.0, 0.0], 3).expect("embedding");
+        let interaction = |text: &str| InteractionInput {
+            agent_id: agent.clone(),
+            thread_id: thread.clone(),
+            role: ParticipantRole::User,
+            kind: EventKind::Message,
+            content: Content::Inline(text.into()),
+            causal_parents: Vec::new(),
+            provenance: Provenance::default(),
+            tool: None,
+            attachments: Vec::new(),
+            outcome: None,
+        };
+        created
+            .heart
+            .commit_embedded(interaction("older canonical evidence"), embedding.clone())
+            .expect("commit older event");
+        let (_, current) = created
+            .heart
+            .commit_embedded(
+                interaction("new prompt must not recall itself"),
+                embedding.clone(),
+            )
+            .expect("commit current event");
+
+        let recalled = automatic_recall_context(
+            &created.heart,
+            &embedding,
+            "new prompt must not recall itself",
+            5,
+            current.event_id,
+        )
+        .expect("automatic recall");
+
+        assert!(recalled.context.contains("older canonical evidence"));
+        assert!(
+            !recalled
+                .context
+                .contains("new prompt must not recall itself")
+        );
+        assert_eq!(recalled.hits.len(), 1);
     }
 }

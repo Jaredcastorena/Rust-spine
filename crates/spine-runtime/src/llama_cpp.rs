@@ -187,6 +187,12 @@ async fn discovery_json(
 #[async_trait]
 impl ModelProvider for LlamaCppProvider {
     async fn complete(&self, request: CompletionRequest) -> Result<ModelTurn> {
+        let temperature = request.temperature.unwrap_or(self.config.temperature);
+        if !temperature.is_finite() || temperature < 0.0 {
+            return Err(RuntimeError::InvalidConfig(
+                "completion-request temperature must be finite and nonnegative".into(),
+            ));
+        }
         let allow_tool_calls = request.allow_tool_calls;
         let allowed_tool_names = request
             .tools
@@ -261,7 +267,7 @@ impl ModelProvider for LlamaCppProvider {
             .collect();
         let mut payload = json!({
             "messages": messages,
-            "temperature": self.config.temperature,
+            "temperature": temperature,
             "max_tokens": completion_tokens,
             "stream": false,
         });
@@ -831,6 +837,7 @@ mod tests {
                     }),
                 }],
                 allow_tool_calls: true,
+                temperature: None,
             },
             None,
         )
@@ -879,6 +886,7 @@ mod tests {
                 messages: vec![Message::new(MessageRole::User, "hello")],
                 tools: Vec::new(),
                 allow_tool_calls: false,
+                temperature: None,
             },
             Some("  high  "),
         )
@@ -914,6 +922,53 @@ mod tests {
                 .reasoning_effort
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn completion_request_temperature_overrides_provider_default() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let captured = Arc::new(Mutex::new(None::<Value>));
+        let app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(
+                    |State(captured): State<Arc<Mutex<Option<Value>>>>,
+                     Json(payload): Json<Value>| async move {
+                        *captured.lock().unwrap() = Some(payload);
+                        Json(json!({
+                            "choices": [{"message": {
+                                "content": "ok",
+                                "reasoning_content": null,
+                                "tool_calls": []
+                            }}]
+                        }))
+                    },
+                ),
+            )
+            .with_state(Arc::clone(&captured));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let provider =
+            LlamaCppProvider::new(LlamaCppConfig::new(format!("http://{address}"))).unwrap();
+
+        let turn = provider
+            .complete(CompletionRequest {
+                messages: vec![Message::new(MessageRole::User, "hello")],
+                tools: Vec::new(),
+                allow_tool_calls: false,
+                temperature: Some(0.45),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(turn.content, "ok");
+        let temperature = captured.lock().unwrap().as_ref().unwrap()["temperature"]
+            .as_f64()
+            .expect("numeric temperature");
+        assert!((temperature - 0.45).abs() < 1e-6);
+        server.abort();
     }
 
     #[test]

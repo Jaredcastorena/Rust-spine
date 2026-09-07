@@ -1,6 +1,6 @@
 use std::{
     collections::VecDeque,
-    num::NonZeroU64,
+    num::{NonZeroU64, NonZeroUsize},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -38,6 +38,21 @@ impl Default for HarnessConfig {
             max_empty_plan_continuations: 8,
         }
     }
+}
+
+/// Per-run controls selected by host policy from committed cognitive state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct HarnessPolicy {
+    pub temperature: Option<f32>,
+    pub max_action_calls: Option<NonZeroUsize>,
+    pub max_tool_rounds: Option<NonZeroU64>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CompletedWork {
+    tool_calls: u64,
+    tool_rounds: u64,
+    action_calls: usize,
 }
 
 #[derive(Default)]
@@ -94,7 +109,7 @@ impl OperatorControls {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HarnessCheckpoint {
     pub schema: u32,
@@ -102,9 +117,13 @@ pub struct HarnessCheckpoint {
     pub messages: Vec<Message>,
     pub completed_tool_calls: u64,
     pub completed_tool_rounds: u64,
+    #[serde(default)]
+    pub completed_action_calls: usize,
     pub pending_task: String,
     #[serde(default)]
     pub host_plan: Option<HostPlan>,
+    #[serde(default)]
+    pub policy: HarnessPolicy,
 }
 
 impl HarnessCheckpoint {
@@ -420,9 +439,9 @@ impl Harness {
                 Message::new(MessageRole::User, task.clone()),
             ],
             task,
-            0,
-            0,
+            CompletedWork::default(),
             None,
+            HarnessPolicy::default(),
         )
         .await
     }
@@ -438,7 +457,30 @@ impl Harness {
         messages.push(Message::new(MessageRole::System, system));
         messages.extend_from_slice(history);
         messages.push(Message::new(MessageRole::User, task.clone()));
-        self.run_messages(messages, task, 0, 0, None).await
+        self.run_messages(
+            messages,
+            task,
+            CompletedWork::default(),
+            None,
+            HarnessPolicy::default(),
+        )
+        .await
+    }
+
+    pub async fn run_with_history_policy(
+        &self,
+        system: impl Into<String>,
+        history: &[Message],
+        task: impl Into<String>,
+        policy: HarnessPolicy,
+    ) -> Result<RunOutcome> {
+        let task = task.into();
+        let mut messages = Vec::with_capacity(history.len() + 2);
+        messages.push(Message::new(MessageRole::System, system));
+        messages.extend_from_slice(history);
+        messages.push(Message::new(MessageRole::User, task.clone()));
+        self.run_messages(messages, task, CompletedWork::default(), None, policy)
+            .await
     }
 
     pub async fn resume(&self, checkpoint: HarnessCheckpoint) -> Result<RunOutcome> {
@@ -449,13 +491,18 @@ impl Harness {
             "[RESUME FROM SAFE CHECKPOINT] Continue the open task from the retained tool results and obligations.",
         ));
         let host_plan = checkpoint.host_plan;
+        let policy = checkpoint.policy;
         self.append_open_plan_prompt(&mut messages, host_plan.as_ref());
         self.run_messages(
             messages,
             checkpoint.pending_task,
-            checkpoint.completed_tool_calls,
-            checkpoint.completed_tool_rounds,
+            CompletedWork {
+                tool_calls: checkpoint.completed_tool_calls,
+                tool_rounds: checkpoint.completed_tool_rounds,
+                action_calls: checkpoint.completed_action_calls,
+            },
             host_plan,
+            policy,
         )
         .await
     }
@@ -464,9 +511,9 @@ impl Harness {
         &self,
         mut messages: Vec<Message>,
         task: String,
-        mut completed_tool_calls: u64,
-        mut completed_tool_rounds: u64,
+        mut completed: CompletedWork,
         mut host_plan: Option<HostPlan>,
+        policy: HarnessPolicy,
     ) -> Result<RunOutcome> {
         let mut usage = TokenUsage::default();
         let mut empty_plan_continuations = 0_u64;
@@ -479,6 +526,7 @@ impl Harness {
                     messages: messages.clone(),
                     tools: self.registry.specs(),
                     allow_tool_calls: true,
+                    temperature: policy.temperature,
                 })
                 .await?;
             usage.add(turn.usage);
@@ -496,14 +544,7 @@ impl Harness {
                 }
                 if controls.stop {
                     return self
-                        .finish_gracefully(
-                            messages,
-                            task,
-                            completed_tool_calls,
-                            completed_tool_rounds,
-                            usage,
-                            host_plan,
-                        )
+                        .finish_gracefully(messages, task, completed, usage, host_plan, policy)
                         .await;
                 }
                 if !controls.guidance.is_empty() {
@@ -526,8 +567,8 @@ impl Harness {
                         response,
                         stopped_gracefully: false,
                         checkpoint: None,
-                        completed_tool_calls,
-                        completed_tool_rounds,
+                        completed_tool_calls: completed.tool_calls,
+                        completed_tool_rounds: completed.tool_rounds,
                         usage,
                         messages,
                         host_plan,
@@ -554,13 +595,7 @@ impl Harness {
                             ));
                             return self
                                 .finish_without_tools(
-                                    messages,
-                                    task,
-                                    false,
-                                    completed_tool_calls,
-                                    completed_tool_rounds,
-                                    usage,
-                                    host_plan,
+                                    messages, task, false, completed, usage, host_plan, policy,
                                 )
                                 .await;
                         }
@@ -582,8 +617,8 @@ impl Harness {
                     response: turn.content,
                     stopped_gracefully: false,
                     checkpoint: None,
-                    completed_tool_calls,
-                    completed_tool_rounds,
+                    completed_tool_calls: completed.tool_calls,
+                    completed_tool_rounds: completed.tool_rounds,
                     usage,
                     messages,
                     host_plan,
@@ -593,10 +628,10 @@ impl Harness {
             empty_model_retries = 0;
             self.maybe_install_plan(&mut host_plan, &task, &turn.content);
 
-            if self
-                .config
+            if policy
                 .max_tool_rounds
-                .is_some_and(|ceiling| completed_tool_rounds >= ceiling.get())
+                .or(self.config.max_tool_rounds)
+                .is_some_and(|ceiling| completed.tool_rounds >= ceiling.get())
             {
                 messages.push(Message::new(MessageRole::Assistant, turn.content));
                 messages.push(Message::new(
@@ -605,18 +640,12 @@ impl Harness {
                 ));
                 return self
                     .finish_without_tools(
-                        messages,
-                        task,
-                        false,
-                        completed_tool_calls,
-                        completed_tool_rounds,
-                        usage,
-                        host_plan,
+                        messages, task, false, completed, usage, host_plan, policy,
                     )
                     .await;
             }
 
-            completed_tool_rounds = completed_tool_rounds.saturating_add(1);
+            completed.tool_rounds = completed.tool_rounds.saturating_add(1);
             let promised_more = promised_more_work(&turn.content);
             messages.push(Message::assistant(
                 turn.content,
@@ -627,11 +656,31 @@ impl Harness {
             let mut plan_evidence = false;
             let calls = turn.tool_calls;
             for (index, call) in calls.iter().enumerate() {
+                let is_action = self.registry.get(&call.name).is_some_and(|tool| {
+                    matches!(
+                        tool.spec().category,
+                        ToolCategory::Action | ToolCategory::Both
+                    )
+                });
+                if is_action
+                    && policy
+                        .max_action_calls
+                        .is_some_and(|ceiling| completed.action_calls >= ceiling.get())
+                {
+                    messages.push(Message::tool(
+                        &call.id,
+                        "[skipped: host action budget for this run was reached]",
+                    ));
+                    continue;
+                }
+                if is_action {
+                    completed.action_calls = completed.action_calls.saturating_add(1);
+                }
                 let result = self.execute_tool(call, &task).await;
                 plan_evidence |= self.registry.get(&call.name).is_some_and(|tool| {
                     tool.spec().category != ToolCategory::Action || result.success
                 });
-                completed_tool_calls = completed_tool_calls.saturating_add(1);
+                completed.tool_calls = completed.tool_calls.saturating_add(1);
                 messages.push(Message::tool(
                     &call.id,
                     result.model_text(self.config.max_tool_result_chars),
@@ -660,14 +709,7 @@ impl Harness {
                 .is_some_and(|controls| controls.stop)
             {
                 return self
-                    .finish_gracefully(
-                        messages,
-                        task,
-                        completed_tool_calls,
-                        completed_tool_rounds,
-                        usage,
-                        host_plan,
-                    )
+                    .finish_gracefully(messages, task, completed, usage, host_plan, policy)
                     .await;
             }
             self.append_open_plan_prompt(&mut messages, host_plan.as_ref());
@@ -782,21 +824,13 @@ impl Harness {
         &self,
         messages: Vec<Message>,
         task: String,
-        completed_tool_calls: u64,
-        completed_tool_rounds: u64,
+        completed: CompletedWork,
         usage: TokenUsage,
         host_plan: Option<HostPlan>,
+        policy: HarnessPolicy,
     ) -> Result<RunOutcome> {
-        self.finish_without_tools(
-            messages,
-            task,
-            true,
-            completed_tool_calls,
-            completed_tool_rounds,
-            usage,
-            host_plan,
-        )
-        .await
+        self.finish_without_tools(messages, task, true, completed, usage, host_plan, policy)
+            .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -805,10 +839,10 @@ impl Harness {
         mut messages: Vec<Message>,
         task: String,
         stopped_gracefully: bool,
-        completed_tool_calls: u64,
-        completed_tool_rounds: u64,
+        completed: CompletedWork,
         mut usage: TokenUsage,
         host_plan: Option<HostPlan>,
+        policy: HarnessPolicy,
     ) -> Result<RunOutcome> {
         let turn = self
             .provider
@@ -816,6 +850,7 @@ impl Harness {
                 messages: messages.clone(),
                 tools: Vec::new(),
                 allow_tool_calls: false,
+                temperature: policy.temperature,
             })
             .await?;
         usage.add(turn.usage);
@@ -830,17 +865,19 @@ impl Harness {
             schema: 1,
             harness_id: self.id.clone(),
             messages: messages.clone(),
-            completed_tool_calls,
-            completed_tool_rounds,
+            completed_tool_calls: completed.tool_calls,
+            completed_tool_rounds: completed.tool_rounds,
+            completed_action_calls: completed.action_calls,
             pending_task: task,
             host_plan: host_plan.clone(),
+            policy,
         });
         Ok(RunOutcome {
             response,
             stopped_gracefully,
             checkpoint,
-            completed_tool_calls,
-            completed_tool_rounds,
+            completed_tool_calls: completed.tool_calls,
+            completed_tool_rounds: completed.tool_rounds,
             usage,
             messages,
             host_plan,

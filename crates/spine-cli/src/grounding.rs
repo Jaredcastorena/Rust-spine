@@ -55,17 +55,26 @@ impl GroundingGate {
         &self,
         response: &str,
         evidence: &[String],
+        coverage_threshold: f32,
     ) -> spine_heart::Result<GroundingDecision> {
         let claims = self.extractor.extract(response);
         let report = self.verifier.verify(&claims, evidence)?;
-        let needs_repair =
-            !claims.is_empty() && (report.coverage < 0.5 || report.contradiction >= 0.5);
+        let needs_repair = needs_repair(claims.len(), &report, coverage_threshold);
         Ok(GroundingDecision {
             claim_count: claims.len(),
             report,
             needs_repair,
         })
     }
+}
+
+fn needs_repair(claim_count: usize, report: &NliReport, coverage_threshold: f32) -> bool {
+    let coverage_threshold = if coverage_threshold.is_finite() {
+        coverage_threshold.clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+    claim_count > 0 && (report.coverage < coverage_threshold || report.contradiction >= 0.5)
 }
 
 pub fn evidence_from_recall_and_messages(
@@ -126,5 +135,33 @@ mod tests {
                 .response
                 .contains("could not verify every factual claim")
         );
+    }
+
+    #[test]
+    fn dynamic_coverage_threshold_controls_the_host_gate() {
+        let report = NliReport {
+            coverage: 0.7,
+            contradiction: 0.1,
+            ..NliReport::default()
+        };
+        assert!(!needs_repair(1, &report, 0.65));
+        assert!(needs_repair(1, &report, 0.8));
+        assert!(!needs_repair(0, &report, 1.0));
+    }
+
+    #[test]
+    fn contradiction_and_malformed_threshold_remain_safe() {
+        let contradiction = NliReport {
+            coverage: 1.0,
+            contradiction: 0.5,
+            ..NliReport::default()
+        };
+        assert!(needs_repair(1, &contradiction, 0.0));
+        let coverage = NliReport {
+            coverage: 0.49,
+            contradiction: 0.0,
+            ..NliReport::default()
+        };
+        assert!(needs_repair(1, &coverage, f32::NAN));
     }
 }

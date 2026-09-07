@@ -1,15 +1,15 @@
 use std::{
     collections::VecDeque,
-    num::NonZeroU64,
+    num::{NonZeroU64, NonZeroUsize},
     sync::{Arc, Mutex},
 };
 
 use async_trait::async_trait;
 use spine_heart::{AgentId, ThreadId, ThymosConfig};
 use spine_runtime::{
-    CompletionRequest, Harness, HarnessCheckpoint, HarnessConfig, HostPlan, Message, MessageRole,
-    ModelProvider, ModelTurn, Result, SubagentHarnessFactory, Tool, ToolCall, ToolCategory,
-    ToolContext, ToolRegistry, ToolResult, ToolRisk, ToolSpec,
+    CompletionRequest, Harness, HarnessCheckpoint, HarnessConfig, HarnessPolicy, HostPlan, Message,
+    MessageRole, ModelProvider, ModelTurn, Result, SubagentHarnessFactory, Tool, ToolCall,
+    ToolCategory, ToolContext, ToolRegistry, ToolResult, ToolRisk, ToolSpec,
 };
 
 struct ScriptedProvider {
@@ -97,6 +97,37 @@ fn registry(executed: Arc<Mutex<Vec<String>>>) -> ToolRegistry {
     registry
 }
 
+struct ActionProbe {
+    executed: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl Tool for ActionProbe {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "act".into(),
+            description: "perform one external action".into(),
+            category: ToolCategory::Action,
+            risk: ToolRisk::Mutating,
+            parameters: serde_json::json!({"type":"object"}),
+        }
+    }
+
+    async fn execute(&self, call: &ToolCall, _context: &ToolContext) -> Result<ToolResult> {
+        let item = call.arguments["item"].as_str().unwrap().to_owned();
+        self.executed.lock().unwrap().push(item.clone());
+        Ok(ToolResult::success(format!("acted on {item}")))
+    }
+}
+
+fn action_call(index: usize) -> ToolCall {
+    ToolCall {
+        id: format!("action-{index}"),
+        name: "act".into(),
+        arguments: serde_json::json!({"item": index.to_string()}),
+    }
+}
+
 #[tokio::test]
 async fn tool_rounds_are_unlimited_by_default() {
     let executed = Arc::new(Mutex::new(Vec::new()));
@@ -145,6 +176,86 @@ async fn positive_tool_ceiling_remains_configurable() {
     let result = harness.run("system", "inspect").await.unwrap();
     assert_eq!(&*executed.lock().unwrap(), &["1", "2"]);
     assert_eq!(result.response, "stopped at ceiling");
+}
+
+#[tokio::test]
+async fn per_run_policy_can_expand_a_positive_tool_ceiling() {
+    let executed = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        tool_turn(vec![call(1)]),
+        tool_turn(vec![call(2)]),
+        tool_turn(vec![call(3)]),
+        tool_turn(vec![call(4)]),
+        answer("stopped at expanded ceiling"),
+    ]));
+    let harness = Harness::new(
+        provider,
+        registry(Arc::clone(&executed)),
+        HarnessConfig {
+            max_tool_rounds: NonZeroU64::new(1),
+            ..HarnessConfig::default()
+        },
+    )
+    .unwrap();
+
+    let result = harness
+        .run_with_history_policy(
+            "system",
+            &[],
+            "inspect",
+            HarnessPolicy {
+                max_tool_rounds: NonZeroU64::new(3),
+                ..HarnessPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(&*executed.lock().unwrap(), &["1", "2", "3"]);
+    assert_eq!(result.completed_tool_rounds, 3);
+    assert_eq!(result.response, "stopped at expanded ceiling");
+}
+
+#[tokio::test]
+async fn per_run_policy_enforces_temperature_and_total_action_budget() {
+    let executed = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        tool_turn(vec![action_call(1)]),
+        tool_turn(vec![action_call(2)]),
+        answer("safe action complete"),
+    ]));
+    let mut registry = ToolRegistry::default();
+    registry
+        .register(ActionProbe {
+            executed: Arc::clone(&executed),
+        })
+        .unwrap();
+    let harness = Harness::new(provider.clone(), registry, HarnessConfig::default()).unwrap();
+    let policy = HarnessPolicy {
+        temperature: Some(0.45),
+        max_action_calls: NonZeroUsize::new(1),
+        max_tool_rounds: None,
+    };
+
+    let result = harness
+        .run_with_history_policy("system", &[], "act safely", policy)
+        .await
+        .unwrap();
+
+    assert_eq!(&*executed.lock().unwrap(), &["1"]);
+    assert_eq!(result.completed_tool_calls, 1);
+    assert!(result.messages.iter().any(|message| {
+        message.tool_call_id.as_deref() == Some("action-2")
+            && message.content.contains("host action budget")
+    }));
+    assert!(
+        provider
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| request.temperature == Some(0.45))
+    );
 }
 
 #[tokio::test]
@@ -317,8 +428,10 @@ async fn resume_restores_and_prompts_the_open_host_plan_step() {
         ],
         completed_tool_calls: 1,
         completed_tool_rounds: 1,
+        completed_action_calls: 0,
         pending_task: "inspect".into(),
         host_plan: Some(plan),
+        policy: spine_runtime::HarnessPolicy::default(),
     };
 
     let result = harness.resume(checkpoint).await.unwrap();
@@ -347,6 +460,8 @@ fn checkpoint_interactions_round_trip_only_after_strict_validation() {
         completed_tool_rounds: 0,
         pending_task: "inspect".into(),
         host_plan: None,
+        completed_action_calls: 0,
+        policy: spine_runtime::HarnessPolicy::default(),
     };
     let mut interaction = checkpoint
         .to_interaction(
@@ -380,6 +495,8 @@ fn checkpoint_validation_rejects_unsafe_boundaries_and_impossible_counters() {
         completed_tool_rounds: 0,
         pending_task: "inspect".into(),
         host_plan: None,
+        completed_action_calls: 0,
+        policy: spine_runtime::HarnessPolicy::default(),
     };
     checkpoint.messages[2] = Message::assistant("", None, vec![call(1)]);
     assert!(checkpoint.validate().is_err());

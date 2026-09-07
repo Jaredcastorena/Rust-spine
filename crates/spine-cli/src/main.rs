@@ -28,14 +28,15 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use spine_heart::{
-    AgentId, CognitiveConfig, Content, ContextLeaf, EventId, EventKind, HeartConfig,
+    AgentId, CognitiveConfig, Content, ContextLeaf, Embedding, EventId, EventKind, HeartConfig,
     InteractionInput, KeySource, ParticipantRole, Provenance, SemanticEncoder, SignedEvent,
     SpineHeart, ThreadId, ToolExchange,
 };
 use spine_models::{MiniLmAssets, MiniLmEncoder};
 use spine_runtime::{
-    Harness, HarnessCheckpoint, HarnessConfig, HarnessEvent, LlamaCppConfig, LlamaCppProvider,
-    Message, MessageRole, RunOutcome, ToolCall, ToolRegistry,
+    Harness, HarnessCheckpoint, HarnessConfig, HarnessEvent, HarnessPolicy, LlamaCppConfig,
+    LlamaCppProvider, Message, MessageRole, ModulationConfig, ModulationInput, RunOutcome,
+    ToolCall, ToolRegistry,
 };
 
 use resilience::{CircuitBreaker, ResilienceChannel};
@@ -982,35 +983,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             web.begin_turn(task);
                         }
                         status.begin("Checking memory");
-                        let recalled = if circuit_breaker
-                            .allow(ResilienceChannel::Dcmdb, Instant::now())
-                        {
-                            match cognition_tools::recall_context(&heart, encoder.as_ref(), task, 5)
-                            {
-                                Ok(recalled) => {
-                                    circuit_breaker.record_success(ResilienceChannel::Dcmdb);
-                                    recalled
-                                }
-                                Err(error) => {
-                                    circuit_breaker
-                                        .record_failure(ResilienceChannel::Dcmdb, Instant::now());
-                                    eprintln!("[memory recall unavailable: {error}]");
-                                    "[]".into()
-                                }
-                            }
-                        } else {
-                            eprintln!("[memory recall skipped: DCMDB circuit is open]");
-                            "[]".into()
-                        };
-                        let recalled_count =
-                            serde_json::from_str::<Vec<serde_json::Value>>(&recalled)
-                                .map_or(0, |items| items.len());
-                        let retrieval_stats = [
-                            (recalled_count as f32 / 10.0).min(1.0),
-                            if recalled_count == 0 { 1.0 } else { 0.0 },
-                            0.0,
-                            0.0,
-                        ];
                         let task_embedding = match encoder.encode(task) {
                             Ok(embedding) => embedding,
                             Err(error) => {
@@ -1047,24 +1019,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         } else {
                             "[]".into()
-                        };
-                        let risk_context = if circuit_breaker
-                            .allow(ResilienceChannel::Thymos, Instant::now())
-                        {
-                            match heart.predict_risk(&agent_id, &task_embedding, &retrieval_stats) {
-                                Ok(risk) => {
-                                    circuit_breaker.record_success(ResilienceChannel::Thymos);
-                                    format!("{risk:.3}")
-                                }
-                                Err(error) => {
-                                    circuit_breaker
-                                        .record_failure(ResilienceChannel::Thymos, Instant::now());
-                                    eprintln!("[host risk estimate unavailable: {error}]");
-                                    "unavailable; use conservative high-risk policy".into()
-                                }
-                            }
-                        } else {
-                            "unavailable; use conservative high-risk policy".into()
                         };
                         if !circuit_breaker.allow(ResilienceChannel::Dcmdb, Instant::now()) {
                             let notice = "memory circuit opened during recall; turn was not sent";
@@ -1105,32 +1059,86 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 continue;
                             }
                         };
-                        let feeling = if circuit_breaker
+                        let modulation_config = ModulationConfig::default();
+                        let preliminary_policy = modulation_config.compute(ModulationInput {
+                            surprise: user_commit.1.trajectory.surprise,
+                            valence: user_commit.1.feeling.valence,
+                            arousal: user_commit.1.feeling.arousal,
+                            risk: 0.0,
+                            tensions: 0,
+                            base_temperature: temperature,
+                            configured_tool_rounds: max_tool_rounds,
+                        });
+                        let mut automatic_recall = resilient_automatic_recall(
+                            &heart,
+                            &task_embedding,
+                            task,
+                            preliminary_policy.recall_top_k,
+                            user_commit.1.event_id,
+                            &mut circuit_breaker,
+                        );
+                        let risk_estimate = if circuit_breaker
                             .allow(ResilienceChannel::Thymos, Instant::now())
                         {
-                            match heart.feel(&agent_id, &task_embedding) {
-                                Ok(feeling) => {
+                            match heart.predict_risk(
+                                &agent_id,
+                                &task_embedding,
+                                &automatic_recall.risk_stats(),
+                            ) {
+                                Ok(risk) if risk.is_finite() => {
                                     circuit_breaker.record_success(ResilienceChannel::Thymos);
-                                    feeling.map_or_else(
-                                        || "unavailable".into(),
-                                        |value| {
-                                            serde_json::to_string(&value)
-                                                .unwrap_or_else(|_| "unavailable".into())
-                                        },
-                                    )
+                                    Some(risk)
                                 }
-                                Err(error) => {
+                                result => {
                                     circuit_breaker
                                         .record_failure(ResilienceChannel::Thymos, Instant::now());
-                                    eprintln!("[Thymos feeling unavailable: {error}]");
-                                    "unavailable".into()
+                                    eprintln!("[host risk estimate unavailable: {result:?}]");
+                                    None
                                 }
                             }
                         } else {
-                            "unavailable".into()
+                            None
+                        };
+                        let risk = risk_estimate.unwrap_or(1.0);
+                        let risk_context = risk_estimate.map_or_else(
+                            || "unavailable; conservative high-risk policy enforced".into(),
+                            |risk| format!("{risk:.3}"),
+                        );
+                        let policy = modulation_config.compute(ModulationInput {
+                            surprise: user_commit.1.trajectory.surprise,
+                            valence: user_commit.1.feeling.valence,
+                            arousal: user_commit.1.feeling.arousal,
+                            risk,
+                            tensions: automatic_recall.tension_count(),
+                            base_temperature: temperature,
+                            configured_tool_rounds: max_tool_rounds,
+                        });
+                        if policy.recall_top_k > preliminary_policy.recall_top_k {
+                            automatic_recall = resilient_automatic_recall(
+                                &heart,
+                                &task_embedding,
+                                task,
+                                policy.recall_top_k,
+                                user_commit.1.event_id,
+                                &mut circuit_breaker,
+                            );
+                        }
+                        let retrieval_stats = automatic_recall.risk_stats();
+                        let recalled = automatic_recall.context;
+                        let feeling = serde_json::to_string(&user_commit.1.feeling)
+                            .unwrap_or_else(|_| "unavailable".into());
+                        let harness_policy = HarnessPolicy {
+                            temperature: Some(policy.provider_temperature),
+                            max_action_calls: NonZeroUsize::new(policy.max_actions),
+                            max_tool_rounds: policy.max_tool_rounds,
                         };
                         let system_prompt = format!(
-                            "{partner_system_prompt}\n\nCurrent Thymos proprioception: {feeling}\nHost risk estimate for this memory region: {risk_context}. At higher or unavailable risk, deepen recall and avoid unsupported certainty.\n\nAutomatically recalled canonical evidence for this turn (it may be irrelevant; verify before using):\n{recalled}\n\nBudgeted triangle-context rehydration:\n{triangle_context}\n\nRunning/recent host tasks:\n{}",
+                            "{partner_system_prompt}\n\nCurrent committed Thymos proprioception: {feeling}\nCommitted trajectory surprise: {:.3}. Host risk estimate for this memory region: {risk_context}. Host policy is enforced at recall_k={}, temperature={:.3}, action_budget={}, and coverage_threshold={:.3}. At higher or unavailable risk, deepen recall and avoid unsupported certainty.\n\nAutomatically recalled canonical evidence for this turn (it may be irrelevant; verify before using):\n{recalled}\n\nBudgeted triangle-context rehydration:\n{triangle_context}\n\nRunning/recent host tasks:\n{}",
+                            user_commit.1.trajectory.surprise,
+                            policy.recall_top_k,
+                            policy.provider_temperature,
+                            policy.max_actions,
+                            policy.coverage_threshold,
                             running_tasks.format()
                         );
                         let persist_start = history.len() + 2;
@@ -1138,7 +1146,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             node_id: user_commit.1.node_id,
                             chronology: user_commit.0.event.body.device_sequence,
                         }];
-                        let run = Box::pin(harness.run_with_history(system_prompt, &history, task))
+                        let run = Box::pin(harness.run_with_history_policy(
+                            system_prompt,
+                            &history,
+                            task,
+                            harness_policy,
+                        ))
                             as std::pin::Pin<Box<dyn Future<Output = _>>>;
                         assert!(
                             circuit_breaker.allow(ResilienceChannel::Llm, Instant::now()),
@@ -1241,7 +1254,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 &recalled,
                                 &outcome.messages,
                             );
-                            let decision = gate.verify(&outcome.response, &evidence);
+                            let decision = gate.verify(
+                                &outcome.response,
+                                &evidence,
+                                policy.coverage_threshold,
+                            );
                             if let Err(error) = &decision {
                                 commit_control_text(
                                     &heart,
@@ -1295,10 +1312,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             .allow(ResilienceChannel::Llm, Instant::now()),
                                         "a successful draft leaves the LLM circuit available for repair"
                                     );
-                                    let repair = Box::pin(harness.run_with_history(
+                                    let repair = Box::pin(harness.run_with_history_policy(
                                         partner_system_prompt.clone(),
                                         &repair_history,
                                         repair_task,
+                                        harness_policy,
                                     ))
                                         as std::pin::Pin<Box<dyn Future<Output = _>>>;
                                     let repaired = run_with_operator_controls(
@@ -1321,6 +1339,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 .verify(
                                                     &repaired_outcome.response,
                                                     &repaired_evidence,
+                                                    policy.coverage_threshold,
                                                 )
                                                 .map_or(true, |decision| decision.needs_repair);
                                             if still_unverified {
@@ -1762,7 +1781,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?
             .with_agent_id(agent_id.clone());
 
-            commit_text(
+            let task_embedding = encoder.encode(&task)?;
+            let triangle_context =
+                cognition_tools::rehydrate_triangle_context(&heart, &task_embedding)?;
+            let user_commit = commit_text(
                 &heart,
                 &encoder,
                 &agent_id,
@@ -1772,7 +1794,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &task,
                 None,
             )?;
-            let outcome = harness.run(partner_system_prompt, &task).await?;
+            let modulation_config = ModulationConfig::default();
+            let preliminary_policy = modulation_config.compute(ModulationInput {
+                surprise: user_commit.1.trajectory.surprise,
+                valence: user_commit.1.feeling.valence,
+                arousal: user_commit.1.feeling.arousal,
+                risk: 0.0,
+                tensions: 0,
+                base_temperature: temperature,
+                configured_tool_rounds: max_tool_rounds,
+            });
+            let mut automatic_recall = cognition_tools::automatic_recall_context(
+                &heart,
+                &task_embedding,
+                &task,
+                preliminary_policy.recall_top_k,
+                user_commit.1.event_id,
+            )?;
+            let risk =
+                heart.predict_risk(&agent_id, &task_embedding, &automatic_recall.risk_stats())?;
+            let policy = modulation_config.compute(ModulationInput {
+                surprise: user_commit.1.trajectory.surprise,
+                valence: user_commit.1.feeling.valence,
+                arousal: user_commit.1.feeling.arousal,
+                risk,
+                tensions: automatic_recall.tension_count(),
+                base_temperature: temperature,
+                configured_tool_rounds: max_tool_rounds,
+            });
+            if policy.recall_top_k > preliminary_policy.recall_top_k {
+                automatic_recall = cognition_tools::automatic_recall_context(
+                    &heart,
+                    &task_embedding,
+                    &task,
+                    policy.recall_top_k,
+                    user_commit.1.event_id,
+                )?;
+            }
+            let system_prompt = format!(
+                "{partner_system_prompt}\n\nCurrent committed Thymos proprioception: {}\nCommitted trajectory surprise: {:.3}. Host risk estimate: {risk:.3}. Host policy is enforced at recall_k={}, temperature={:.3}, and action_budget={}.\n\nAutomatically recalled canonical evidence:\n{}\n\nBudgeted triangle-context rehydration:\n{triangle_context}",
+                serde_json::to_string(&user_commit.1.feeling)
+                    .unwrap_or_else(|_| "unavailable".into()),
+                user_commit.1.trajectory.surprise,
+                policy.recall_top_k,
+                policy.provider_temperature,
+                policy.max_actions,
+                automatic_recall.context,
+            );
+            let outcome = harness
+                .run_with_history_policy(
+                    system_prompt,
+                    &[],
+                    &task,
+                    HarnessPolicy {
+                        temperature: Some(policy.provider_temperature),
+                        max_action_calls: NonZeroUsize::new(policy.max_actions),
+                        max_tool_rounds: policy.max_tool_rounds,
+                    },
+                )
+                .await?;
             persist_harness_messages(
                 &heart,
                 &encoder,
@@ -2748,6 +2828,34 @@ fn commit_control_text(
         );
     }
     Ok(())
+}
+
+fn resilient_automatic_recall(
+    heart: &SpineHeart,
+    query: &Embedding,
+    task: &str,
+    top_k: usize,
+    excluded_event: EventId,
+    circuit_breaker: &mut CircuitBreaker,
+) -> cognition_tools::AutomaticRecall {
+    if circuit_breaker.allow(ResilienceChannel::Dcmdb, Instant::now()) {
+        match cognition_tools::automatic_recall_context(heart, query, task, top_k, excluded_event) {
+            Ok(recall) => {
+                circuit_breaker.record_success(ResilienceChannel::Dcmdb);
+                return recall;
+            }
+            Err(error) => {
+                circuit_breaker.record_failure(ResilienceChannel::Dcmdb, Instant::now());
+                eprintln!("[memory recall unavailable: {error}]");
+            }
+        }
+    } else {
+        eprintln!("[memory recall skipped: DCMDB circuit is open]");
+    }
+    cognition_tools::AutomaticRecall {
+        context: "[]".into(),
+        hits: Vec::new(),
+    }
 }
 
 fn catch_up_stale_cognition(
