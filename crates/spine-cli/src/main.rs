@@ -6,6 +6,7 @@ mod grounding;
 mod longmem;
 mod onboarding;
 mod partner_tools;
+mod terminal_input;
 #[cfg(test)]
 mod tool_smoke_tests;
 mod web_server;
@@ -13,14 +14,13 @@ mod web_server;
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
-    io::{self, BufRead, IsTerminal, Write},
+    io::{self, IsTerminal, Write},
     num::{NonZeroU64, NonZeroUsize},
     path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    thread,
     time::{Duration, Instant},
 };
 
@@ -783,15 +783,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             });
 
-            let stdin_sender = line_sender.clone();
-            thread::spawn(move || {
-                let stdin = io::stdin();
-                for line in stdin.lock().lines() {
-                    if stdin_sender.send(line).is_err() {
-                        break;
-                    }
-                }
-            });
+            terminal_input::spawn(line_sender.clone());
 
             let onboarding_state = onboarding::OnboardingState::inspect(&heart.events_canonical()?);
             let should_onboard =

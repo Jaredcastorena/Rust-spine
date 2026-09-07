@@ -460,6 +460,10 @@ identity, or demographic profiling.
 | `/tasks` | Shows work managed by the host. |
 | `/quit` | Exits at a safe boundary. |
 
+Terminal lines that arrive in one paste burst are submitted together as a
+single multi-line prompt or guidance message. Individually typed commands and
+guidance keep their normal one-line behavior.
+
 ### Browser interface
 
 Add `--web` to the normal chat command:
