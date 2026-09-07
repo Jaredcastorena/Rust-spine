@@ -501,7 +501,8 @@ async fn filesystem_shell_browser_and_task_controls_work_together() {
 #[tokio::test]
 async fn ingestion_and_cognition_tools_round_trip_real_heart_state() {
     let fixture = fixture(true, false);
-    let document = "I am 32 years old. I love cobalt hedgehogs.";
+    let document =
+        "I am 32 years old. I love cobalt hedgehogs. I attended 3 weddings. I attended 2 weddings.";
     fs::create_dir_all(fixture._directory.path().join("documents")).expect("document directory");
     let first_path = fixture._directory.path().join("documents/one.md");
     let second_path = fixture._directory.path().join("documents/two.md");
@@ -663,6 +664,21 @@ async fn ingestion_and_cognition_tools_round_trip_real_heart_state() {
     assert!(fact.success);
     assert!(fact.output.contains("profile.age"));
     assert!(fact.output.contains("32"));
+    let fact_json: Value = serde_json::from_str(&fact.output).expect("fact search JSON");
+    let age = &fact_json.as_array().expect("fact hits")[0];
+    assert_eq!(age["slot_type"], "state");
+    assert_eq!(age["source_role"], "user");
+    assert_eq!(age["time_source"], "inferred");
+    assert!(
+        age["fact_id"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+    assert!(
+        age["node_id"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
     let latest = execute(
         &fixture.registry,
         "fact_aggregate",
@@ -671,6 +687,17 @@ async fn ingestion_and_cognition_tools_round_trip_real_heart_state() {
     .await;
     assert!(latest.success);
     assert!(latest.output.contains("32"));
+
+    let counted = execute(
+        &fixture.registry,
+        "fact_aggregate",
+        json!({"slot_prefix":"attended.weddings","operation":"count"}),
+    )
+    .await;
+    assert!(counted.success);
+    let counted: Value = serde_json::from_str(&counted.output).expect("fact count JSON");
+    assert_eq!(counted["value"], 5);
+    assert_eq!(counted["evidence"].as_array().map(Vec::len), Some(2));
 
     let saved = execute(
         &fixture.registry,

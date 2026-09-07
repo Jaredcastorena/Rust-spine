@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, btree_map::Entry};
+use std::{
+    collections::{BTreeMap, btree_map::Entry},
+    sync::OnceLock,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -116,16 +119,55 @@ impl CognitiveState {
         if interaction.role == ParticipantRole::User
             && let Some(text) = Self::inline_text(event)
         {
-            let candidates = FactExtractor::new()?.extract(
+            let provenance = &interaction.provenance;
+            let event_time = provenance
+                .metadata
+                .get("event_time")
+                .or_else(|| provenance.metadata.get("date"))
+                .cloned();
+            let session_time = provenance
+                .metadata
+                .get("session_time")
+                .or_else(|| provenance.metadata.get("date"))
+                .cloned();
+            let arrival_order = provenance
+                .metadata
+                .get("session_index")
+                .and_then(|value| value.parse().ok())
+                .zip(
+                    provenance
+                        .metadata
+                        .get("chunk_index")
+                        .and_then(|value| value.parse().ok()),
+                )
+                .map_or(
+                    [
+                        event.body.timestamp.wall_millis,
+                        u64::from(event.body.timestamp.counter),
+                    ],
+                    |(session, chunk)| [session, chunk],
+                );
+            let mut candidates = fact_extractor()?.extract(
                 text,
-                None,
-                None,
+                event_time,
+                session_time,
                 event.body.timestamp.wall_millis,
-                [
-                    event.body.timestamp.wall_millis,
-                    u64::from(event.body.timestamp.counter),
-                ],
+                arrival_order,
             );
+            for candidate in &mut candidates {
+                for (key, value) in &provenance.metadata {
+                    candidate
+                        .metadata
+                        .entry(key.clone())
+                        .or_insert_with(|| value.clone());
+                }
+                if let Some(source_uri) = &provenance.source_uri {
+                    candidate
+                        .metadata
+                        .entry("source_uri".into())
+                        .or_insert_with(|| source_uri.clone());
+                }
+            }
             self.facts.add_candidates(event.id, node_id, candidates);
         }
 
@@ -216,4 +258,16 @@ impl CognitiveState {
             Content::ColdBlob(_) | Content::Redacted => None,
         }
     }
+}
+
+fn fact_extractor() -> Result<&'static FactExtractor> {
+    static EXTRACTOR: OnceLock<FactExtractor> = OnceLock::new();
+    if let Some(extractor) = EXTRACTOR.get() {
+        return Ok(extractor);
+    }
+    let extractor = FactExtractor::new()?;
+    let _ = EXTRACTOR.set(extractor);
+    Ok(EXTRACTOR
+        .get()
+        .expect("fact extractor was initialized or won a concurrent race"))
 }

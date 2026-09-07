@@ -255,3 +255,52 @@ fn embedded_batch_commits_every_event_and_projection_together() {
     );
     assert!(created.heart.cognition_is_current().unwrap());
 }
+
+#[test]
+fn projected_pair_facts_keep_dataset_provenance_and_exclude_assistant_claims() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("fact-provenance.spine");
+    let encoder = TinyEncoder::new();
+    let created = SpineHeart::create(HeartConfig::new(&path), "fact-pass").unwrap();
+    created
+        .heart
+        .initialize_cognition(CognitiveConfig::new(1, encoder.manifest.clone(), 2).unwrap())
+        .unwrap();
+    let text =
+        "[date: 2025/02/03] [user]: I attended 3 weddings.\n[assistant]: I attended 99 weddings.";
+    let mut input = interaction(text);
+    input.provenance = Provenance {
+        source_uri: Some("longmemeval://session/session-7".into()),
+        metadata: [
+            ("dataset".into(), "LongMemEval".into()),
+            ("session_id".into(), "session-7".into()),
+            ("session_index".into(), "7".into()),
+            ("chunk_index".into(), "4".into()),
+            ("session_time".into(), "2025/02/03".into()),
+        ]
+        .into_iter()
+        .collect(),
+        ..Provenance::default()
+    };
+    created
+        .heart
+        .commit_embedded(input, encoder.encode(text).unwrap())
+        .unwrap();
+
+    let state = created.heart.cognition().unwrap().unwrap();
+    let facts: Vec<_> = state.facts.facts().collect();
+    assert_eq!(facts.len(), 1);
+    let fact = facts[0];
+    assert_eq!(fact.value, spine_heart::FactValue::Integer(3));
+    assert_eq!(fact.event_time.as_deref(), Some("2025-02-03"));
+    assert_eq!(fact.session_time.as_deref(), Some("2025-02-03"));
+    assert_eq!(fact.arrival_order, [7, 4]);
+    assert_eq!(
+        fact.metadata.get("session_id").map(String::as_str),
+        Some("session-7")
+    );
+    assert_eq!(
+        fact.metadata.get("source_uri").map(String::as_str),
+        Some("longmemeval://session/session-7")
+    );
+}

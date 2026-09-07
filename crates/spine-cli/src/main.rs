@@ -519,7 +519,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut metadata = BTreeMap::new();
                 metadata.insert("dataset".into(), "LongMemEval".into());
                 metadata.insert("session_id".into(), chunk.session_id.clone());
-                metadata.insert("date".into(), chunk.date);
+                metadata.insert("session_index".into(), chunk.session_index.to_string());
+                metadata.insert("date".into(), chunk.date.clone());
+                metadata.insert("session_time".into(), chunk.date.replace('/', "-"));
                 metadata.insert("chunk_index".into(), chunk.chunk_index.to_string());
                 metadata.insert("has_answer".into(), chunk.has_answer.to_string());
                 let source_uri = format!("longmemeval://session/{}", chunk.session_id);

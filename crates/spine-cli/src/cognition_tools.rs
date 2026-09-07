@@ -6,8 +6,9 @@ use std::{
 
 use async_trait::async_trait;
 use spine_heart::{
-    AgentId, Content, Embedding, EventKind, FactAggregation, FactValue, InteractionInput,
-    ParticipantRole, Provenance, RehydrateBudget, SemanticEncoder, SpineHeart, ThreadId,
+    AgentId, Content, Embedding, EventKind, Fact, FactAggregation, FactSlotType, FactValue,
+    InteractionInput, ParticipantRole, Provenance, RehydrateBudget, SemanticEncoder, SpineHeart,
+    ThreadId,
 };
 use spine_runtime::{
     Tool, ToolCall, ToolCategory, ToolContext, ToolRegistry, ToolResult, ToolRisk, ToolSpec,
@@ -482,17 +483,9 @@ impl Tool for FactSearchTool {
             .search_facts(query, top_k, include)?
             .into_iter()
             .map(|hit| {
-                serde_json::json!({
-                    "score": hit.score,
-                    "entity": hit.fact.entity,
-                    "attribute": hit.fact.attribute,
-                    "value": fact_value(hit.fact.value),
-                    "slot": hit.fact.slot_key,
-                    "excerpt": hit.fact.excerpt,
-                    "event_time": hit.fact.event_time,
-                    "superseded": hit.fact.superseded_by.is_some(),
-                    "confidence": hit.fact.confidence,
-                })
+                let mut fact = fact_json(&hit.fact);
+                fact["score"] = serde_json::json!(hit.score);
+                fact
             })
             .collect();
         Ok(ToolResult::success(serde_json::to_string(&hits)?))
@@ -508,7 +501,7 @@ impl Tool for FactAggregateTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "fact_aggregate".into(),
-            description: "Sum, count, or select the latest fact for a slot prefix.".into(),
+            description: "Deterministically sum or count event facts, or select the latest fact, for a slot prefix. Results include evidence provenance.".into(),
             category: ToolCategory::Internal,
             risk: ToolRisk::ReadOnly,
             parameters: object_schema(
@@ -532,21 +525,50 @@ impl Tool for FactAggregateTool {
         let Some(operation) = call.arguments.get("operation").and_then(|v| v.as_str()) else {
             return Ok(ToolResult::failure("fact_aggregate requires operation"));
         };
-        let value = match self.heart.aggregate_facts(prefix, operation)? {
-            FactAggregation::Sum(value) => serde_json::json!({"operation": "sum", "value": value}),
+        let (aggregation, fact_evidence) = self
+            .heart
+            .aggregate_facts_with_evidence(prefix, operation)?;
+        let aggregable_evidence: Vec<_> = fact_evidence
+            .iter()
+            .filter(|fact| {
+                matches!(
+                    fact.slot_type,
+                    FactSlotType::EventAmount | FactSlotType::EventCount
+                )
+            })
+            .collect();
+        let evidence_total = aggregable_evidence.len();
+        let evidence: Vec<_> = aggregable_evidence
+            .into_iter()
+            .take(40)
+            .map(fact_json)
+            .collect();
+        let evidence_truncated = evidence_total.saturating_sub(evidence.len());
+        let value = match aggregation {
+            FactAggregation::Sum(value) => {
+                serde_json::json!({
+                    "operation": "sum",
+                    "value": value,
+                    "evidence": evidence,
+                    "evidence_total": evidence_total,
+                    "evidence_truncated": evidence_truncated,
+                })
+            }
             FactAggregation::Count(value) => {
-                serde_json::json!({"operation": "count", "value": value})
+                serde_json::json!({
+                    "operation": "count",
+                    "value": value,
+                    "evidence": evidence,
+                    "evidence_total": evidence_total,
+                    "evidence_truncated": evidence_truncated,
+                })
             }
             FactAggregation::Latest(fact) => match fact {
-                Some(fact) => serde_json::json!({
-                    "operation": "latest",
-                    "entity": fact.entity,
-                    "attribute": fact.attribute,
-                    "value": fact_value(fact.value),
-                    "slot": fact.slot_key,
-                    "excerpt": fact.excerpt,
-                    "event_time": fact.event_time,
-                }),
+                Some(fact) => {
+                    let mut value = fact_json(&fact);
+                    value["operation"] = serde_json::json!("latest");
+                    value
+                }
                 None => serde_json::json!({"operation": "latest", "value": null}),
             },
         };
@@ -609,12 +631,44 @@ fn object_schema(properties: serde_json::Value, required: &[&str]) -> serde_json
     schema
 }
 
-fn fact_value(value: FactValue) -> serde_json::Value {
+fn fact_value(value: &FactValue) -> serde_json::Value {
     match value {
-        FactValue::Text(value) => serde_json::Value::String(value),
+        FactValue::Text(value) => serde_json::Value::String(value.clone()),
         FactValue::Integer(value) => serde_json::json!(value),
         FactValue::Amount(value) => serde_json::json!(value),
     }
+}
+
+fn fact_json(fact: &Fact) -> serde_json::Value {
+    let slot_type = match fact.slot_type {
+        FactSlotType::State => "state",
+        FactSlotType::StateQuantity => "state.quantity",
+        FactSlotType::Frequency => "frequency",
+        FactSlotType::Event => "event",
+        FactSlotType::EventAmount => "event.amount",
+        FactSlotType::EventCount => "event.count",
+        FactSlotType::Preference => "preference",
+        FactSlotType::Entity => "entity",
+    };
+    serde_json::json!({
+        "fact_id": fact.id.to_string(),
+        "event_id": fact.event_id.to_string(),
+        "node_id": fact.node_id.to_string(),
+        "entity": fact.entity,
+        "attribute": fact.attribute,
+        "value": fact_value(&fact.value),
+        "slot_type": slot_type,
+        "slot": fact.slot_key,
+        "excerpt": fact.excerpt,
+        "event_time": fact.event_time,
+        "session_time": fact.session_time,
+        "session_id": fact.metadata.get("session_id"),
+        "time_source": format!("{:?}", fact.time_source).to_ascii_lowercase(),
+        "arrival_order": fact.arrival_order,
+        "source_role": fact.source_role,
+        "superseded": fact.superseded_by.is_some(),
+        "confidence": fact.confidence,
+    })
 }
 
 fn terms(text: &str) -> Vec<String> {

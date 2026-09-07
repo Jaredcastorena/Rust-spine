@@ -406,6 +406,17 @@ impl SpineHeart {
             .aggregate(slot_prefix, operation)
     }
 
+    pub fn aggregate_facts_with_evidence(
+        &self,
+        slot_prefix: &str,
+        operation: &str,
+    ) -> Result<(crate::FactAggregation, Vec<crate::Fact>)> {
+        let state = self.current_cognition()?;
+        let evidence = state.facts.active_for_slot_prefix(slot_prefix);
+        let aggregation = state.facts.aggregate(slot_prefix, operation)?;
+        Ok((aggregation, evidence))
+    }
+
     /// Run bounded DCMDb consolidation, pruning, and dream maintenance and persist the result.
     pub fn maintain_cognition(&self, maximum_rounds: usize) -> Result<crate::MaintenanceReport> {
         let mut state = self.current_cognition()?;
