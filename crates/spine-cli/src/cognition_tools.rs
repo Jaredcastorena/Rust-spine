@@ -6,9 +6,9 @@ use std::{
 
 use async_trait::async_trait;
 use spine_heart::{
-    AgentId, Content, Embedding, EventKind, Fact, FactAggregation, FactSlotType, FactValue,
-    InteractionInput, ParticipantRole, Provenance, RehydrateBudget, SemanticEncoder, SpineHeart,
-    ThreadId,
+    AgentId, Content, Embedding, EventKind, Fact, FactAggregation, FactQueryAggregation,
+    FactSlotType, FactValue, InteractionInput, ParticipantRole, Provenance, RehydrateBudget,
+    SemanticEncoder, SpineHeart, ThreadId,
 };
 use spine_runtime::{
     Tool, ToolCall, ToolCategory, ToolContext, ToolRegistry, ToolResult, ToolRisk, ToolSpec,
@@ -501,15 +501,26 @@ impl Tool for FactAggregateTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "fact_aggregate".into(),
-            description: "Deterministically sum or count event facts, or select the latest fact, for a slot prefix. Results include evidence provenance.".into(),
+            description: "Deterministically aggregate event facts with a natural-language query, or use the legacy slot_prefix plus operation interface. Natural queries route to sum/count/diff/max/min; the legacy operations remain sum/count/latest. Results include evidence provenance.".into(),
             category: ToolCategory::Internal,
             risk: ToolRisk::ReadOnly,
             parameters: object_schema(
                 serde_json::json!({
-                    "slot_prefix": {"type": "string"},
-                    "operation": {"type": "string", "enum": ["sum", "count", "latest"]}
+                    "query": {
+                        "type": "string",
+                        "description": "Natural-language aggregation query; provide this alone"
+                    },
+                    "slot_prefix": {
+                        "type": "string",
+                        "description": "Legacy explicit route; requires operation and cannot be combined with query"
+                    },
+                    "operation": {
+                        "type": "string",
+                        "enum": ["sum", "count", "latest"],
+                        "description": "Legacy explicit route; requires slot_prefix and cannot be combined with query"
+                    }
                 }),
-                &["slot_prefix", "operation"],
+                &[],
             ),
         }
     }
@@ -519,10 +530,31 @@ impl Tool for FactAggregateTool {
         call: &ToolCall,
         _context: &ToolContext,
     ) -> spine_runtime::Result<ToolResult> {
-        let Some(prefix) = call.arguments.get("slot_prefix").and_then(|v| v.as_str()) else {
+        let query = call
+            .arguments
+            .get("query")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let prefix = call.arguments.get("slot_prefix").and_then(|v| v.as_str());
+        let operation = call.arguments.get("operation").and_then(|v| v.as_str());
+
+        if query.is_some() && (prefix.is_some() || operation.is_some()) {
+            return Ok(ToolResult::failure(
+                "fact_aggregate query cannot be combined with slot_prefix or operation",
+            ));
+        }
+        if let Some(query) = query {
+            let aggregation = self.heart.aggregate_fact_query(query)?;
+            return Ok(ToolResult::success(
+                query_aggregation_json(aggregation).to_string(),
+            ));
+        }
+
+        let Some(prefix) = prefix else {
             return Ok(ToolResult::failure("fact_aggregate requires slot_prefix"));
         };
-        let Some(operation) = call.arguments.get("operation").and_then(|v| v.as_str()) else {
+        let Some(operation) = operation else {
             return Ok(ToolResult::failure("fact_aggregate requires operation"));
         };
         let (aggregation, fact_evidence) = self
@@ -574,6 +606,95 @@ impl Tool for FactAggregateTool {
         };
         Ok(ToolResult::success(value.to_string()))
     }
+}
+
+fn query_aggregation_json(aggregation: Option<FactQueryAggregation>) -> serde_json::Value {
+    match aggregation {
+        Some(FactQueryAggregation::Sum {
+            value,
+            evidence,
+            money,
+        }) => {
+            let (evidence, evidence_total, evidence_truncated) = evidence_json(&evidence, 40);
+            serde_json::json!({
+                "operation": "sum",
+                "value": value,
+                "money": money,
+                "evidence": evidence,
+                "evidence_total": evidence_total,
+                "evidence_truncated": evidence_truncated,
+            })
+        }
+        Some(FactQueryAggregation::Count { value, evidence }) => {
+            let (evidence, evidence_total, evidence_truncated) = evidence_json(&evidence, 10);
+            serde_json::json!({
+                "operation": "count",
+                "value": value,
+                "evidence": evidence,
+                "evidence_total": evidence_total,
+                "evidence_truncated": evidence_truncated,
+            })
+        }
+        Some(FactQueryAggregation::Diff {
+            value,
+            highest_value,
+            highest,
+            lowest_value,
+            lowest,
+            money,
+        }) => {
+            let highest = fact_json(&highest);
+            let lowest = fact_json(&lowest);
+            serde_json::json!({
+                "operation": "diff",
+                "value": value,
+                "money": money,
+                "highest": {"value": highest_value, "fact": highest.clone()},
+                "lowest": {"value": lowest_value, "fact": lowest.clone()},
+                "evidence": [highest, lowest],
+                "evidence_total": 2,
+                "evidence_truncated": 0,
+            })
+        }
+        Some(FactQueryAggregation::Max { value, fact, money }) => {
+            let fact = fact_json(&fact);
+            serde_json::json!({
+                "operation": "max",
+                "value": value,
+                "money": money,
+                "fact": fact.clone(),
+                "evidence": [fact],
+                "evidence_total": 1,
+                "evidence_truncated": 0,
+            })
+        }
+        Some(FactQueryAggregation::Min { value, fact, money }) => {
+            let fact = fact_json(&fact);
+            serde_json::json!({
+                "operation": "min",
+                "value": value,
+                "money": money,
+                "fact": fact.clone(),
+                "evidence": [fact],
+                "evidence_total": 1,
+                "evidence_truncated": 0,
+            })
+        }
+        None => serde_json::json!({
+            "operation": "none",
+            "value": null,
+            "evidence": [],
+            "evidence_total": 0,
+            "evidence_truncated": 0,
+        }),
+    }
+}
+
+fn evidence_json(facts: &[Fact], limit: usize) -> (Vec<serde_json::Value>, usize, usize) {
+    let total = facts.len();
+    let evidence = facts.iter().take(limit).map(fact_json).collect::<Vec<_>>();
+    let truncated = total.saturating_sub(evidence.len());
+    (evidence, total, truncated)
 }
 
 struct MaintainMemoryTool {

@@ -29,8 +29,8 @@ pub use event::{
     InteractionInput, ParticipantRole, Provenance, SignedEvent, ToolExchange,
 };
 pub use facts::{
-    Fact, FactAggregation, FactCandidate, FactExtractor, FactHit, FactSlotType, FactStore,
-    FactValue, TimeSource,
+    Fact, FactAggregation, FactAggregationIntent, FactAggregationRouter, FactCandidate,
+    FactExtractor, FactHit, FactQueryAggregation, FactSlotType, FactStore, FactValue, TimeSource,
 };
 pub use heart::{
     CommitReceipt, CreatedHeart, HeartConfig, ReadOnlyHeart, RecalledMemory, SpineHeart,

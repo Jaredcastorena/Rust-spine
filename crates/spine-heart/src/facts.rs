@@ -120,6 +120,97 @@ pub enum FactAggregation {
     Latest(Option<Box<Fact>>),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FactAggregationIntent {
+    None,
+    Sum,
+    Count,
+    Diff,
+    Max,
+    Min,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum FactQueryAggregation {
+    Sum {
+        value: f64,
+        evidence: Vec<Fact>,
+        money: bool,
+    },
+    Count {
+        value: i64,
+        evidence: Vec<Fact>,
+    },
+    Diff {
+        value: f64,
+        highest_value: f64,
+        highest: Box<Fact>,
+        lowest_value: f64,
+        lowest: Box<Fact>,
+        money: bool,
+    },
+    Max {
+        value: f64,
+        fact: Box<Fact>,
+        money: bool,
+    },
+    Min {
+        value: f64,
+        fact: Box<Fact>,
+        money: bool,
+    },
+}
+
+pub struct FactAggregationRouter {
+    sum: Regex,
+    count: Regex,
+    diff: Regex,
+    max: Regex,
+    min: Regex,
+}
+
+impl FactAggregationRouter {
+    pub fn new() -> Result<Self> {
+        fn pattern(value: &str) -> Result<Regex> {
+            Regex::new(value).map_err(|error| HeartError::InvalidInput(error.to_string()))
+        }
+
+        Ok(Self {
+            sum: pattern(
+                r"(?i)\b(total|how much|combined|altogether|in all|sum|overall|spent|raised|donated|paid|earned|expenses?|spending|costs?|money|donations?|across all|in total|altogether)\b",
+            )?,
+            count: pattern(
+                r"(?i)\b(how many|count|number of|times|occasions|how often|instances?|attended|visited|participated|frequency)\b",
+            )?,
+            diff: pattern(
+                r"(?i)\b(difference|more than|less than|compared to|versus|vs\.?|between .{1,30} and|more expensive|cheaper than|pricier|cost more|cost less|higher than|lower than)\b",
+            )?,
+            max: pattern(
+                r"(?i)\b(most|highest|maximum|most expensive|most often|biggest|largest|most times|greatest)\b",
+            )?,
+            min: pattern(
+                r"(?i)\b(least|lowest|minimum|cheapest|fewest|smallest|least expensive|least often)\b",
+            )?,
+        })
+    }
+
+    pub fn detect(&self, query: &str) -> FactAggregationIntent {
+        if self.diff.is_match(query) {
+            FactAggregationIntent::Diff
+        } else if self.max.is_match(query) {
+            FactAggregationIntent::Max
+        } else if self.min.is_match(query) {
+            FactAggregationIntent::Min
+        } else if self.sum.is_match(query) {
+            FactAggregationIntent::Sum
+        } else if self.count.is_match(query) {
+            FactAggregationIntent::Count
+        } else {
+            FactAggregationIntent::None
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct FactStore {
     facts: BTreeMap<FactId, Fact>,
@@ -330,6 +421,147 @@ impl FactStore {
                 "fact aggregation must be sum, count, or latest".into(),
             )),
         }
+    }
+
+    pub fn aggregate_query(&self, query: &str) -> Result<Option<FactQueryAggregation>> {
+        let detected = FactAggregationRouter::new()?.detect(query);
+        let intent = match detected {
+            FactAggregationIntent::None => FactAggregationIntent::Sum,
+            intent => intent,
+        };
+        Ok(self.aggregate_query_with_intent(query, intent))
+    }
+
+    pub fn aggregate_query_with_intent(
+        &self,
+        query: &str,
+        intent: FactAggregationIntent,
+    ) -> Option<FactQueryAggregation> {
+        let facts = self
+            .search(query, 40, false)
+            .into_iter()
+            .map(|hit| hit.fact)
+            .filter(|fact| fact.slot_type.aggregable())
+            .collect();
+        aggregate_facts_for_intent(facts, intent)
+    }
+}
+
+fn aggregate_facts_for_intent(
+    facts: Vec<Fact>,
+    intent: FactAggregationIntent,
+) -> Option<FactQueryAggregation> {
+    if facts.is_empty() || intent == FactAggregationIntent::None {
+        return None;
+    }
+
+    let money = facts
+        .iter()
+        .any(|fact| fact.slot_type == FactSlotType::EventAmount);
+    match intent {
+        FactAggregationIntent::None => None,
+        FactAggregationIntent::Sum => {
+            let mut numeric: Vec<_> = facts
+                .into_iter()
+                .filter_map(|fact| query_numeric_value(&fact).map(|value| (value, fact)))
+                .collect();
+            if numeric.is_empty() {
+                return None;
+            }
+            let value = numeric.iter().map(|(value, _)| value).sum();
+            numeric.sort_by(|(_, left), (_, right)| recency_cmp(left, right));
+            Some(FactQueryAggregation::Sum {
+                value,
+                evidence: numeric.into_iter().map(|(_, fact)| fact).collect(),
+                money,
+            })
+        }
+        FactAggregationIntent::Count => {
+            let value = facts
+                .iter()
+                .map(query_count_contribution)
+                .fold(0_i64, i64::saturating_add);
+            (value != 0).then_some(FactQueryAggregation::Count {
+                value,
+                evidence: facts,
+            })
+        }
+        FactAggregationIntent::Diff => {
+            let mut numeric: Vec<_> = facts
+                .into_iter()
+                .filter_map(|fact| query_numeric_value(&fact).map(|value| (value, fact)))
+                .collect();
+            if numeric.len() < 2 {
+                return None;
+            }
+            numeric.sort_by(|(left, _), (right, _)| left.total_cmp(right));
+            let (lowest_value, lowest) = numeric.first().cloned().expect("two numeric facts");
+            let (highest_value, highest) = numeric.last().cloned().expect("two numeric facts");
+            Some(FactQueryAggregation::Diff {
+                value: highest_value - lowest_value,
+                highest_value,
+                highest: Box::new(highest),
+                lowest_value,
+                lowest: Box::new(lowest),
+                money,
+            })
+        }
+        FactAggregationIntent::Max | FactAggregationIntent::Min => {
+            let mut numeric = facts
+                .into_iter()
+                .filter_map(|fact| query_numeric_value(&fact).map(|value| (value, fact)));
+            let (mut selected_value, mut selected_fact) = numeric.next()?;
+            for (value, fact) in numeric {
+                let replace = match intent {
+                    FactAggregationIntent::Max => value > selected_value,
+                    FactAggregationIntent::Min => value < selected_value,
+                    _ => unreachable!("only max/min reach this branch"),
+                };
+                if replace {
+                    selected_value = value;
+                    selected_fact = fact;
+                }
+            }
+            let fact = Box::new(selected_fact);
+            match intent {
+                FactAggregationIntent::Max => Some(FactQueryAggregation::Max {
+                    value: selected_value,
+                    fact,
+                    money,
+                }),
+                FactAggregationIntent::Min => Some(FactQueryAggregation::Min {
+                    value: selected_value,
+                    fact,
+                    money,
+                }),
+                _ => unreachable!("only max/min reach this branch"),
+            }
+        }
+    }
+}
+
+fn query_numeric_value(fact: &Fact) -> Option<f64> {
+    match &fact.value {
+        FactValue::Text(_) => fact.value_normalized.parse().ok(),
+        FactValue::Integer(value) => Some(*value as f64),
+        FactValue::Amount(value) => Some(*value),
+    }
+}
+
+fn query_count_contribution(fact: &Fact) -> i64 {
+    if fact.slot_type != FactSlotType::EventCount {
+        return 1;
+    }
+    match &fact.value {
+        FactValue::Integer(value) => *value,
+        FactValue::Amount(value) if value.is_finite() => *value as i64,
+        FactValue::Text(_) => fact
+            .value_normalized
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite())
+            .map_or(1, |value| value as i64),
+        FactValue::Amount(_) => 1,
     }
 }
 

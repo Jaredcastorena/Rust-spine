@@ -417,6 +417,10 @@ impl SpineHeart {
         Ok((aggregation, evidence))
     }
 
+    pub fn aggregate_fact_query(&self, query: &str) -> Result<Option<crate::FactQueryAggregation>> {
+        self.current_cognition()?.facts.aggregate_query(query)
+    }
+
     /// Run bounded DCMDb consolidation, pruning, and dream maintenance and persist the result.
     pub fn maintain_cognition(&self, maximum_rounds: usize) -> Result<crate::MaintenanceReport> {
         let mut state = self.current_cognition()?;

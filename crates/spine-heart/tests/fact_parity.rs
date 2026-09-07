@@ -1,13 +1,34 @@
 use std::collections::BTreeMap;
 
 use spine_heart::{
-    EventId, FactAggregation, FactExtractor, FactSlotType, FactStore, FactValue, NodeId, TimeSource,
+    EventId, FactAggregation, FactAggregationIntent, FactAggregationRouter, FactExtractor,
+    FactQueryAggregation, FactSlotType, FactStore, FactValue, NodeId, TimeSource,
 };
 
 fn one(extractor: &FactExtractor, text: &str) -> spine_heart::FactCandidate {
     let facts = extractor.extract(text, None, None, 42, [3, 4]);
     assert_eq!(facts.len(), 1, "expected one fact for {text:?}: {facts:?}");
     facts.into_iter().next().unwrap()
+}
+
+fn amount_candidate(label: &str, value: f64, arrival: u64) -> spine_heart::FactCandidate {
+    spine_heart::FactCandidate {
+        entity: "USER".into(),
+        attribute: format!("amount_{label}_{arrival}"),
+        value: FactValue::Amount(value),
+        slot_type: FactSlotType::EventAmount,
+        slot_key: format!("expense.{label}"),
+        excerpt: format!("I spent ${value} on {label} item {arrival}."),
+        event_time: None,
+        session_time: None,
+        ingest_millis: arrival,
+        time_source: TimeSource::Inferred,
+        arrival_order: [0, arrival],
+        source_role: "user".into(),
+        confidence: 0.9,
+        has_update_cue: false,
+        metadata: BTreeMap::new(),
+    }
 }
 
 #[test]
@@ -255,4 +276,238 @@ fn event_count_aggregation_sums_occurrences_not_fact_rows() {
         FactAggregation::Sum(0.0),
         "supersedable state quantities must never be summed as events"
     );
+}
+
+#[test]
+fn aggregation_intent_router_matches_oracle_priority() {
+    let router = FactAggregationRouter::new().unwrap();
+    let cases = [
+        (
+            "What is the difference between what I spent and what I paid?",
+            FactAggregationIntent::Diff,
+        ),
+        (
+            "What was the most expensive thing I spent money on?",
+            FactAggregationIntent::Max,
+        ),
+        (
+            "Which purchase was cheapest overall?",
+            FactAggregationIntent::Min,
+        ),
+        (
+            "How much did I spend across all trips?",
+            FactAggregationIntent::Sum,
+        ),
+        (
+            "How many times did I attend a wedding?",
+            FactAggregationIntent::Count,
+        ),
+        (
+            "How many times did I spend money?",
+            FactAggregationIntent::Sum,
+        ),
+        ("Remind me about my bicycle.", FactAggregationIntent::None),
+    ];
+
+    for (query, expected) in cases {
+        assert_eq!(router.detect(query), expected, "{query}");
+    }
+}
+
+#[test]
+fn natural_query_aggregation_matches_oracle_modes_and_exclusions() {
+    let extractor = FactExtractor::new().unwrap();
+    let mut store = FactStore::default();
+    let facts = [
+        ("I spent $45 on bike tires.", "2025-02-01"),
+        ("I spent $135 on bike accessories.", "2025-02-03"),
+        ("I attended 3 weddings.", "2025-03-01"),
+        ("I attended 2 weddings.", "2025-03-02"),
+        ("I've read 80 Sapiens pages.", "2025-04-01"),
+    ];
+    for (index, (text, event_time)) in facts.into_iter().enumerate() {
+        let candidates = extractor.extract(
+            text,
+            Some(event_time.into()),
+            None,
+            index as u64,
+            [0, index as u64],
+        );
+        store.add_candidates(
+            EventId::from_bytes([index as u8 + 1; 32]),
+            NodeId::from_bytes([index as u8 + 11; 32]),
+            candidates,
+        );
+    }
+
+    let sum = store
+        .aggregate_query("How much total did I spend on bike gear?")
+        .unwrap()
+        .unwrap();
+    let FactQueryAggregation::Sum {
+        value,
+        evidence,
+        money,
+    } = sum
+    else {
+        panic!("expected sum, got {sum:?}");
+    };
+    assert_eq!(value, 180.0);
+    assert!(money);
+    assert_eq!(evidence.len(), 2);
+    assert_eq!(evidence[0].value, FactValue::Amount(45.0));
+    assert_eq!(evidence[1].value, FactValue::Amount(135.0));
+
+    let default_sum = store.aggregate_query("bike").unwrap().unwrap();
+    assert!(matches!(
+        default_sum,
+        FactQueryAggregation::Sum { value: 180.0, .. }
+    ));
+
+    let count = store
+        .aggregate_query("How many weddings did I attend?")
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        count,
+        FactQueryAggregation::Count {
+            value: 5,
+            ref evidence,
+        } if evidence.len() == 2
+    ));
+
+    let diff = store
+        .aggregate_query("What was the difference between my bike expenses?")
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        diff,
+        FactQueryAggregation::Diff {
+            value: 90.0,
+            highest_value: 135.0,
+            lowest_value: 45.0,
+            money: true,
+            ..
+        }
+    ));
+
+    let max = store
+        .aggregate_query("What was the most expensive bike purchase?")
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        max,
+        FactQueryAggregation::Max {
+            value: 135.0,
+            money: true,
+            ..
+        }
+    ));
+
+    let min = store
+        .aggregate_query("What was the cheapest bike purchase?")
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        min,
+        FactQueryAggregation::Min {
+            value: 45.0,
+            money: true,
+            ..
+        }
+    ));
+
+    assert!(
+        store
+            .aggregate_query("How much total Sapiens reading?")
+            .unwrap()
+            .is_none(),
+        "state.quantity facts must never enter deterministic aggregation"
+    );
+}
+
+#[test]
+fn diff_and_extrema_preserve_python_tie_order() {
+    let mut store = FactStore::default();
+    for (index, value) in [100.0, 50.0, 100.0, 50.0].into_iter().enumerate() {
+        store.add_candidates(
+            EventId::from_bytes([index as u8 + 1; 32]),
+            NodeId::from_bytes([index as u8 + 11; 32]),
+            vec![amount_candidate("tiecase", value, index as u64)],
+        );
+    }
+
+    let incoming = store.search("tiecase", 40, false);
+    let first_high = incoming
+        .iter()
+        .find(|hit| hit.fact.value == FactValue::Amount(100.0))
+        .unwrap()
+        .fact
+        .id;
+    let last_high = incoming
+        .iter()
+        .rfind(|hit| hit.fact.value == FactValue::Amount(100.0))
+        .unwrap()
+        .fact
+        .id;
+    let first_low = incoming
+        .iter()
+        .find(|hit| hit.fact.value == FactValue::Amount(50.0))
+        .unwrap()
+        .fact
+        .id;
+
+    let maximum = store
+        .aggregate_query_with_intent("tiecase", FactAggregationIntent::Max)
+        .unwrap();
+    let FactQueryAggregation::Max { fact, .. } = maximum else {
+        panic!("expected max, got {maximum:?}");
+    };
+    assert_eq!(fact.id, first_high, "max keeps the first BM25-order tie");
+
+    let minimum = store
+        .aggregate_query_with_intent("tiecase", FactAggregationIntent::Min)
+        .unwrap();
+    let FactQueryAggregation::Min { fact, .. } = minimum else {
+        panic!("expected min, got {minimum:?}");
+    };
+    assert_eq!(fact.id, first_low, "min keeps the first BM25-order tie");
+
+    let difference = store
+        .aggregate_query_with_intent("tiecase", FactAggregationIntent::Diff)
+        .unwrap();
+    let FactQueryAggregation::Diff {
+        highest, lowest, ..
+    } = difference
+    else {
+        panic!("expected diff, got {difference:?}");
+    };
+    assert_eq!(highest.id, last_high, "diff takes the last tied maximum");
+    assert_eq!(lowest.id, first_low, "diff takes the first tied minimum");
+}
+
+#[test]
+fn natural_aggregation_is_capped_at_forty_active_search_hits() {
+    let mut store = FactStore::default();
+    for index in 0_u8..45 {
+        store.add_candidates(
+            EventId::from_bytes([index + 1; 32]),
+            NodeId::from_bytes([index + 101; 32]),
+            vec![amount_candidate("capstone", 1.0, u64::from(index))],
+        );
+    }
+    assert_eq!(store.active().count(), 45);
+
+    let aggregation = store
+        .aggregate_query("How much total capstone spending?")
+        .unwrap()
+        .unwrap();
+    let FactQueryAggregation::Sum {
+        value, evidence, ..
+    } = aggregation
+    else {
+        panic!("expected sum, got {aggregation:?}");
+    };
+    assert_eq!(value, 40.0);
+    assert_eq!(evidence.len(), 40);
 }

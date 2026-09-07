@@ -293,9 +293,16 @@ async fn execute(registry: &ToolRegistry, name: &str, arguments: Value) -> ToolR
 #[test]
 fn registration_exposes_the_complete_validated_tool_surface() {
     let fixture = fixture(true, true);
-    let names = fixture
-        .registry
-        .specs()
+    let specs = fixture.registry.specs();
+    let aggregation = specs
+        .iter()
+        .find(|spec| spec.name == "fact_aggregate")
+        .expect("fact aggregation spec");
+    assert!(aggregation.parameters["properties"]["query"].is_object());
+    assert!(aggregation.parameters.get("required").is_none());
+    assert!(aggregation.parameters.get("oneOf").is_none());
+
+    let names = specs
         .into_iter()
         .map(|spec| {
             assert!(!spec.description.trim().is_empty(), "{}", spec.name);
@@ -501,8 +508,7 @@ async fn filesystem_shell_browser_and_task_controls_work_together() {
 #[tokio::test]
 async fn ingestion_and_cognition_tools_round_trip_real_heart_state() {
     let fixture = fixture(true, false);
-    let document =
-        "I am 32 years old. I love cobalt hedgehogs. I attended 3 weddings. I attended 2 weddings.";
+    let document = "I am 32 years old. I love cobalt hedgehogs. I attended 3 weddings. I attended 2 weddings. My hobby is chess. I spent $45 on bike tires. I spent $135 on bike accessories.";
     fs::create_dir_all(fixture._directory.path().join("documents")).expect("document directory");
     let first_path = fixture._directory.path().join("documents/one.md");
     let second_path = fixture._directory.path().join("documents/two.md");
@@ -698,6 +704,67 @@ async fn ingestion_and_cognition_tools_round_trip_real_heart_state() {
     let counted: Value = serde_json::from_str(&counted.output).expect("fact count JSON");
     assert_eq!(counted["value"], 5);
     assert_eq!(counted["evidence"].as_array().map(Vec::len), Some(2));
+
+    let difference = execute(
+        &fixture.registry,
+        "fact_aggregate",
+        json!({"query":"What was the difference between my bike expenses?"}),
+    )
+    .await;
+    assert!(difference.success, "{:?}", difference.error);
+    let difference: Value = serde_json::from_str(&difference.output).expect("fact difference JSON");
+    assert_eq!(difference["operation"], "diff");
+    assert_eq!(difference["value"], 90.0, "{difference}");
+    assert_eq!(difference["highest"]["value"], 135.0);
+    assert_eq!(difference["lowest"]["value"], 45.0);
+    assert_eq!(difference["evidence"].as_array().map(Vec::len), Some(2));
+    assert_eq!(difference["evidence"][0]["value"], 135.0);
+    assert_eq!(difference["evidence"][1]["value"], 45.0);
+
+    let conflicting = execute(
+        &fixture.registry,
+        "fact_aggregate",
+        json!({"query":"bike","slot_prefix":"expense.","operation":"sum"}),
+    )
+    .await;
+    assert!(!conflicting.success);
+
+    let neither = execute(&fixture.registry, "fact_aggregate", json!({})).await;
+    assert!(!neither.success);
+    assert!(
+        neither
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("requires slot_prefix"))
+    );
+
+    let missing_operation = execute(
+        &fixture.registry,
+        "fact_aggregate",
+        json!({"slot_prefix":"expense."}),
+    )
+    .await;
+    assert!(!missing_operation.success);
+    assert!(
+        missing_operation
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("requires operation"))
+    );
+
+    let missing_prefix = execute(
+        &fixture.registry,
+        "fact_aggregate",
+        json!({"operation":"sum"}),
+    )
+    .await;
+    assert!(!missing_prefix.success);
+    assert!(
+        missing_prefix
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("requires slot_prefix"))
+    );
 
     let saved = execute(
         &fixture.registry,
