@@ -23,6 +23,10 @@ use spine_runtime::{
 use tokio::{process::Command, time::timeout};
 use walkdir::WalkDir;
 
+use crate::document_ingest::{
+    DocumentIdentity, DocumentIngestHistory, canonicalize_source, sha256_hex,
+};
+
 const MAX_FILE_READ_CHARS: usize = 50_000;
 const MAX_WEB_CHARS: usize = 12_000;
 const MAX_WEB_BODY_BYTES: usize = 2 * 1024 * 1024;
@@ -73,6 +77,7 @@ pub(crate) fn register_action_tools<E: SemanticEncoder + 'static>(
         encoder,
         cwd,
         running_tasks: Arc::clone(&running_tasks),
+        ingest_lock: Arc::new(Mutex::new(())),
     })?;
     Ok(running_tasks)
 }
@@ -1080,6 +1085,16 @@ struct DocumentIngestTool {
     encoder: Arc<dyn SemanticEncoder>,
     cwd: PathBuf,
     running_tasks: Arc<RunningTaskManager>,
+    ingest_lock: Arc<Mutex<()>>,
+}
+
+struct PendingDocumentChunk {
+    identity: DocumentIdentity,
+    index: usize,
+    count: usize,
+    legacy_hash: String,
+    sha256: String,
+    text: String,
 }
 
 impl DocumentIngestTool {
@@ -1108,6 +1123,10 @@ impl DocumentIngestTool {
     }
 
     fn execute_sync(&self, call: &ToolCall) -> spine_runtime::Result<ToolResult> {
+        let _ingest_guard = self
+            .ingest_lock
+            .lock()
+            .map_err(|_| RuntimeError::Tool("document ingestion lock poisoned".into()))?;
         let paths: Vec<&str> = call
             .arguments
             .get("paths")
@@ -1179,23 +1198,48 @@ impl DocumentIngestTool {
             Ok(files) => files,
             Err(error) => return Ok(ToolResult::failure(error)),
         };
-        let mut seen_hashes: BTreeSet<String> = if force {
-            BTreeSet::new()
-        } else {
-            self.heart
-                .events_canonical()?
-                .into_iter()
-                .filter_map(|event| {
-                    event
-                        .body
-                        .interaction
-                        .provenance
+        let mut history = DocumentIngestHistory::default();
+        if !force {
+            for event in self.heart.events_canonical()? {
+                let provenance = &event.body.interaction.provenance;
+                if provenance.provider.as_deref() != Some("spine-document-ingest") {
+                    continue;
+                }
+                if let Some(document_id) = provenance.metadata.get("document_id") {
+                    if let (Some(chunk_index), Some(chunk_count), Some(chunk_sha256)) = (
+                        provenance
+                            .metadata
+                            .get("chunk_index")
+                            .and_then(|index| index.parse::<usize>().ok()),
+                        provenance
+                            .metadata
+                            .get("chunk_count")
+                            .and_then(|count| count.parse::<usize>().ok()),
+                        provenance.metadata.get("chunk_sha256"),
+                    ) {
+                        history.record_document_chunk(
+                            document_id.clone(),
+                            chunk_index,
+                            chunk_count,
+                            chunk_sha256.clone(),
+                        );
+                    }
+                } else if let (Some(source_uri), Some(chunk_index), Some(chunk_hash)) = (
+                    provenance.source_uri.as_ref(),
+                    provenance
                         .metadata
-                        .get("document_chunk_hash")
-                        .cloned()
-                })
-                .collect()
-        };
+                        .get("chunk_index")
+                        .and_then(|index| index.parse::<usize>().ok()),
+                    provenance.metadata.get("document_chunk_hash"),
+                ) {
+                    history.record_legacy_chunk(
+                        source_uri.clone(),
+                        chunk_index,
+                        chunk_hash.clone(),
+                    );
+                }
+            }
+        }
         let mut pending = Vec::new();
         let mut skipped = 0_usize;
         for path in &files {
@@ -1210,8 +1254,8 @@ impl DocumentIngestTool {
                 skipped += 1;
                 continue;
             }
-            let text = match fs::read_to_string(path) {
-                Ok(text) if !text.contains('\0') => text,
+            let raw = match fs::read(path) {
+                Ok(raw) if !raw.contains(&0) => raw,
                 Err(_) => {
                     skipped += 1;
                     continue;
@@ -1221,30 +1265,83 @@ impl DocumentIngestTool {
                     continue;
                 }
             };
-            for (index, chunk) in chunk_words_preserving(&text, chunk_words, overlap)
-                .into_iter()
-                .enumerate()
-            {
-                let hash = blake3::hash(chunk.as_bytes()).to_hex().to_string();
-                if !seen_hashes.insert(hash.clone()) {
+            let identity = match DocumentIdentity::from_canonical_path(path.clone(), &raw) {
+                Ok(identity) => identity,
+                Err(_) => {
                     skipped += 1;
                     continue;
                 }
-                pending.push((path.clone(), index, hash, chunk));
+            };
+            let text = match String::from_utf8(raw) {
+                Ok(text) => text,
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+            let chunks = chunk_words_preserving(&text, chunk_words, overlap);
+            if chunks.is_empty() {
+                skipped += 1;
+                continue;
+            }
+            let legacy_hashes: Vec<String> = chunks
+                .iter()
+                .map(|chunk| blake3::hash(chunk.as_bytes()).to_hex().to_string())
+                .collect();
+            let sha256_hashes: Vec<String> = chunks
+                .iter()
+                .map(|chunk| sha256_hex(chunk.as_bytes()))
+                .collect();
+            if history.contains(&identity, &legacy_hashes) {
+                skipped += chunks.len();
+                continue;
+            }
+            let count = chunks.len();
+            for (index, ((chunk, legacy_hash), sha256)) in chunks
+                .into_iter()
+                .zip(legacy_hashes)
+                .zip(sha256_hashes)
+                .enumerate()
+            {
+                if history.contains_document_chunk(&identity.document_id, index, count, &sha256) {
+                    skipped += 1;
+                    continue;
+                }
+                pending.push(PendingDocumentChunk {
+                    identity: identity.clone(),
+                    index,
+                    count,
+                    legacy_hash,
+                    sha256,
+                    text: chunk,
+                });
             }
         }
         let mut items = Vec::with_capacity(pending.len());
         for batch in pending.chunks(32) {
-            let texts: Vec<String> = batch.iter().map(|item| item.3.clone()).collect();
+            let texts: Vec<String> = batch.iter().map(|item| item.text.clone()).collect();
             let embeddings = self.encoder.encode_batch(&texts)?;
-            for ((path, index, hash, text), embedding) in batch.iter().zip(embeddings) {
-                let source = format!("file://{}", path.display());
+            validate_embedding_count(batch.len(), embeddings.len())?;
+            for (chunk, embedding) in batch.iter().zip(embeddings) {
                 let mut metadata = BTreeMap::new();
-                metadata.insert("document_chunk_hash".into(), hash.clone());
-                metadata.insert("chunk_index".into(), index.to_string());
+                metadata.insert("record_schema".into(), "spine-document-chunk".into());
+                metadata.insert("record_version".into(), "1".into());
+                metadata.insert("document_id".into(), chunk.identity.document_id.clone());
+                metadata.insert("document_path".into(), chunk.identity.path_text.clone());
+                metadata.insert(
+                    "document_sha256".into(),
+                    chunk.identity.content_sha256.clone(),
+                );
+                metadata.insert("document_chunk_hash".into(), chunk.legacy_hash.clone());
+                metadata.insert("chunk_index".into(), chunk.index.to_string());
+                metadata.insert("chunk_count".into(), chunk.count.to_string());
+                metadata.insert("chunk_sha256".into(), chunk.sha256.clone());
+                metadata.insert("provenance".into(), "operator-supplied-document".into());
+                metadata.insert("ingest_path".into(), "bulk-document-tool".into());
                 let thread = format!(
                     "document-{}",
-                    &blake3::hash(path.as_os_str().as_encoded_bytes()).to_hex()[..16]
+                    &blake3::hash(chunk.identity.path.as_os_str().as_encoded_bytes()).to_hex()
+                        [..16]
                 );
                 items.push((
                     InteractionInput {
@@ -1253,15 +1350,18 @@ impl DocumentIngestTool {
                         role: ParticipantRole::User,
                         kind: EventKind::Message,
                         content: Content::Inline(format!(
-                            "[document: {}] [chunk: {}]\n{}",
-                            path.display(),
-                            index,
-                            text
+                            "[document id={} path={} chunk={}/{} sha256={}]\n{}",
+                            chunk.identity.document_id,
+                            chunk.identity.path_text,
+                            chunk.index + 1,
+                            chunk.count,
+                            chunk.sha256,
+                            chunk.text
                         )),
                         causal_parents: Vec::new(),
                         provenance: Provenance {
                             provider: Some("spine-document-ingest".into()),
-                            source_uri: Some(source),
+                            source_uri: Some(chunk.identity.source_uri.clone()),
                             metadata,
                             ..Provenance::default()
                         },
@@ -1380,8 +1480,10 @@ fn collect_path(
     files: &mut BTreeSet<PathBuf>,
 ) {
     if path.is_file() {
-        if accepted(path, extensions) {
-            files.insert(path.to_path_buf());
+        if accepted(path, extensions)
+            && let Ok(path) = canonicalize_source(path)
+        {
+            files.insert(path);
         }
     } else if path.is_dir() {
         let walker = if recursive {
@@ -1390,8 +1492,11 @@ fn collect_path(
             WalkDir::new(path).max_depth(1)
         };
         for entry in walker.into_iter().filter_map(Result::ok) {
-            if entry.file_type().is_file() && accepted(entry.path(), extensions) {
-                files.insert(entry.path().to_path_buf());
+            if (entry.file_type().is_file() || entry.path().is_file())
+                && accepted(entry.path(), extensions)
+                && let Ok(path) = canonicalize_source(entry.path())
+            {
+                files.insert(path);
             }
         }
     }
@@ -1401,6 +1506,16 @@ fn accepted(path: &Path, extensions: &BTreeSet<String>) -> bool {
     path.extension()
         .and_then(|value| value.to_str())
         .is_some_and(|value| extensions.contains(&value.to_ascii_lowercase()))
+}
+
+fn validate_embedding_count(expected: usize, actual: usize) -> spine_runtime::Result<()> {
+    if expected == actual {
+        Ok(())
+    } else {
+        Err(RuntimeError::Tool(format!(
+            "document encoder returned {actual} embeddings for {expected} chunks"
+        )))
+    }
 }
 
 fn chunk_words_preserving(text: &str, target: usize, overlap: usize) -> Vec<String> {
@@ -1487,12 +1602,41 @@ mod tests {
     }
 
     #[test]
+    fn document_ingest_rejects_short_embedding_batches() {
+        let error = validate_embedding_count(2, 1).expect_err("short batch must fail");
+        assert!(error.to_string().contains("1 embeddings for 2 chunks"));
+        validate_embedding_count(2, 2).expect("complete batch");
+    }
+
+    #[test]
     fn empty_document_path_does_not_expand_to_the_working_directory() {
         let temporary = tempfile::tempdir().unwrap();
         fs::write(temporary.path().join("should-not-be-found.txt"), "payload").unwrap();
         let files =
             discover_files(temporary.path(), &["", "   "], true, &default_extensions()).unwrap();
         assert!(files.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn document_discovery_collapses_symlink_aliases_to_canonical_source() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let corpus = directory.path().join("corpus");
+        let target = directory.path().join("target");
+        fs::create_dir_all(&corpus).expect("corpus directory");
+        fs::create_dir_all(&target).expect("target directory");
+        let document = target.join("source.md");
+        let alias = corpus.join("alias.md");
+        fs::write(&document, "canonical source").expect("document");
+        symlink(&document, &alias).expect("document symlink");
+        let values = [corpus.to_str().expect("UTF-8 directory path")];
+
+        let files = discover_files(&corpus, &values, true, &BTreeSet::from(["md".to_owned()]))
+            .expect("discover aliases");
+
+        assert_eq!(files, [document.canonicalize().expect("canonical source")]);
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -390,10 +390,10 @@ async fn ingestion_and_cognition_tools_round_trip_real_heart_state() {
     let fixture = fixture(true, false);
     let document = "I am 32 years old. I love cobalt hedgehogs.";
     fs::create_dir_all(fixture._directory.path().join("documents")).expect("document directory");
-    fs::write(fixture._directory.path().join("documents/one.md"), document)
-        .expect("first document");
-    fs::write(fixture._directory.path().join("documents/two.md"), document)
-        .expect("duplicate document");
+    let first_path = fixture._directory.path().join("documents/one.md");
+    let second_path = fixture._directory.path().join("documents/two.md");
+    fs::write(&first_path, document).expect("first document");
+    fs::write(&second_path, document).expect("same-content second document");
 
     let ingested = execute(
         &fixture.registry,
@@ -409,8 +409,69 @@ async fn ingestion_and_cognition_tools_round_trip_real_heart_state() {
     .await;
     assert!(ingested.success, "{:?}", ingested.error);
     assert!(ingested.output.contains("files_discovered=2"));
-    assert!(ingested.output.contains("chunks_ingested=1"));
-    assert!(ingested.output.contains("skipped=1"));
+    assert!(ingested.output.contains("chunks_ingested=2"));
+    assert!(ingested.output.contains("skipped=0"));
+
+    let document_events = fixture.heart.events_canonical().expect("document events");
+    assert_eq!(document_events.len(), 2);
+    let sources: BTreeSet<_> = document_events
+        .iter()
+        .filter_map(|event| event.body.interaction.provenance.source_uri.clone())
+        .collect();
+    let expected_sources = BTreeSet::from([
+        format!(
+            "file://{}",
+            first_path.canonicalize().expect("first realpath").display()
+        ),
+        format!(
+            "file://{}",
+            second_path
+                .canonicalize()
+                .expect("second realpath")
+                .display()
+        ),
+    ]);
+    assert_eq!(sources, expected_sources);
+    let document_ids: BTreeSet<_> = document_events
+        .iter()
+        .filter_map(|event| {
+            event
+                .body
+                .interaction
+                .provenance
+                .metadata
+                .get("document_id")
+                .cloned()
+        })
+        .collect();
+    assert_eq!(document_ids.len(), 2);
+    let content_hashes: BTreeSet<_> = document_events
+        .iter()
+        .filter_map(|event| {
+            event
+                .body
+                .interaction
+                .provenance
+                .metadata
+                .get("document_sha256")
+                .cloned()
+        })
+        .collect();
+    assert_eq!(content_hashes.len(), 1);
+    for event in &document_events {
+        let metadata = &event.body.interaction.provenance.metadata;
+        assert_eq!(
+            metadata.get("record_schema").map(String::as_str),
+            Some("spine-document-chunk")
+        );
+        assert_eq!(metadata.get("chunk_index").map(String::as_str), Some("0"));
+        assert_eq!(metadata.get("chunk_count").map(String::as_str), Some("1"));
+        assert!(metadata.contains_key("chunk_sha256"));
+        assert_eq!(
+            metadata.get("provenance").map(String::as_str),
+            Some("operator-supplied-document")
+        );
+    }
 
     let repeated = execute(
         &fixture.registry,
@@ -421,6 +482,50 @@ async fn ingestion_and_cognition_tools_round_trip_real_heart_state() {
     assert!(repeated.success);
     assert!(repeated.output.contains("chunks_ingested=0"));
     assert!(repeated.output.contains("skipped=2"));
+    assert_eq!(
+        fixture
+            .heart
+            .events_canonical()
+            .expect("events after repeat")
+            .len(),
+        2
+    );
+
+    fs::write(&first_path, format!("{document}\nVersion two.")).expect("changed document");
+    let changed = execute(
+        &fixture.registry,
+        "ingest_documents",
+        json!({"paths":["documents/one.md"],"maintain":false}),
+    )
+    .await;
+    assert!(changed.success, "{:?}", changed.error);
+    assert!(changed.output.contains("chunks_ingested=1"));
+    assert!(changed.output.contains("skipped=0"));
+    let versioned_events = fixture
+        .heart
+        .events_canonical()
+        .expect("versioned document events");
+    assert_eq!(versioned_events.len(), 3);
+    let first_source = format!(
+        "file://{}",
+        first_path.canonicalize().expect("first realpath").display()
+    );
+    let first_source_ids: BTreeSet<_> = versioned_events
+        .iter()
+        .filter(|event| {
+            event.body.interaction.provenance.source_uri.as_deref() == Some(first_source.as_str())
+        })
+        .filter_map(|event| {
+            event
+                .body
+                .interaction
+                .provenance
+                .metadata
+                .get("document_id")
+                .cloned()
+        })
+        .collect();
+    assert_eq!(first_source_ids.len(), 2);
 
     for recall_name in ["heart_recall", "search_memory"] {
         let recalled = execute(
@@ -480,9 +585,9 @@ async fn ingestion_and_cognition_tools_round_trip_real_heart_state() {
             .expect("stats JSON")
             .get("events")
             .and_then(Value::as_u64),
-        Some(2)
+        Some(4)
     );
-    assert_eq!(fixture.heart.stats().expect("heart stats").events, 2);
+    assert_eq!(fixture.heart.stats().expect("heart stats").events, 4);
 
     let maintained = execute(
         &fixture.registry,
@@ -493,6 +598,50 @@ async fn ingestion_and_cognition_tools_round_trip_real_heart_state() {
     assert!(maintained.success);
     let maintenance: Value = serde_json::from_str(&maintained.output).expect("maintenance JSON");
     assert!(maintenance.get("merges").is_some());
+}
+
+#[tokio::test]
+async fn concurrent_document_reingestion_is_idempotent() {
+    let fixture = fixture(true, false);
+    fs::write(
+        fixture._directory.path().join("source.md"),
+        "one source, one exact version",
+    )
+    .expect("document");
+    let first = execute(
+        &fixture.registry,
+        "ingest_documents",
+        json!({"paths":["source.md"],"maintain":false}),
+    );
+    let second = execute(
+        &fixture.registry,
+        "ingest_documents",
+        json!({"paths":["source.md"],"maintain":false}),
+    );
+
+    let (first, second) = tokio::join!(first, second);
+
+    assert!(first.success, "{:?}", first.error);
+    assert!(second.success, "{:?}", second.error);
+    let outputs = [first.output.as_str(), second.output.as_str()];
+    assert!(
+        outputs
+            .iter()
+            .any(|output| output.contains("chunks_ingested=1"))
+    );
+    assert!(
+        outputs
+            .iter()
+            .any(|output| output.contains("chunks_ingested=0"))
+    );
+    assert_eq!(
+        fixture
+            .heart
+            .events_canonical()
+            .expect("events after concurrent ingestion")
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]

@@ -2,6 +2,7 @@
 
 mod agent_tools;
 mod cognition_tools;
+mod document_ingest;
 mod grounding;
 mod longmem;
 mod onboarding;
