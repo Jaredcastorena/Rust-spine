@@ -375,7 +375,11 @@ impl FactStore {
             right
                 .score
                 .total_cmp(&left.score)
-                .then_with(|| right.fact.confidence.total_cmp(&left.fact.confidence))
+                // Python's stable BM25 ordering preserves ingestion order on a
+                // tie. Hash-map/ID order and confidence must not change which
+                // source is selected by a tied max/min or the forty-hit cap.
+                .then_with(|| left.fact.arrival_order.cmp(&right.fact.arrival_order))
+                .then_with(|| left.fact.ingest_millis.cmp(&right.fact.ingest_millis))
                 .then_with(|| left.fact.id.cmp(&right.fact.id))
         });
         hits.truncate(top_k);
@@ -1108,7 +1112,17 @@ impl FactExtractor {
                 let Some(matched) = capture.get(0) else {
                     continue;
                 };
-                let excerpt = sentence_containing(user_text, matched.start(), matched.end());
+                // Rust regex consumes the terminator used in Python's lookahead.
+                // Start the sentence-end search at the captured value instead,
+                // so a consumed period cannot pull in the following purchase.
+                let value_end = capture
+                    .iter()
+                    .skip(1)
+                    .flatten()
+                    .map(|value| value.end())
+                    .max()
+                    .unwrap_or(matched.end());
+                let excerpt = sentence_containing(user_text, matched.start(), value_end);
                 let mut push = |attribute: String,
                                 value: FactValue,
                                 slot_type: FactSlotType,
@@ -1441,14 +1455,29 @@ fn tokenize(text: &str) -> Vec<String> {
 }
 
 fn fact_tokens(fact: &Fact) -> Vec<String> {
-    tokenize(&format!(
-        "{} {} {} {} {}",
-        fact.entity, fact.attribute, fact.slot_key, fact.value_normalized, fact.excerpt
-    ))
+    // Match the oracle's raw value + normalized value search document. Amounts
+    // display as currency while their normalized value remains numeric.
+    let (display, normalized) = match &fact.value {
+        FactValue::Text(value) => (value.clone(), fact.value_normalized.clone()),
+        FactValue::Integer(value) => (value.to_string(), value.to_string()),
+        FactValue::Amount(value) => (format!("${value:.2}"), format!("{value:?}")),
+    };
+    let mut document = format!(
+        "{} {} {} {} {} {}",
+        fact.entity, fact.attribute, fact.slot_key, display, normalized, fact.excerpt
+    );
+    for key in ["over", "per", "category"] {
+        if let Some(value) = fact.metadata.get(key) {
+            document.push(' ');
+            document.push_str(value);
+        }
+    }
+    tokenize(&document)
 }
 
 const STOPWORDS: &[&str] = &[
     "the", "a", "an", "is", "are", "was", "were", "be", "my", "i", "me", "you", "your", "we",
     "our", "they", "their", "in", "on", "at", "to", "for", "of", "and", "or", "it", "its", "that",
-    "this", "do", "does", "did", "have", "has", "had",
+    "this", "do", "does", "did", "have", "has", "had", "will", "would", "could", "should", "can",
+    "not", "no",
 ];

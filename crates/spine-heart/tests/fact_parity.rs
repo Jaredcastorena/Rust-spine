@@ -511,3 +511,105 @@ fn natural_aggregation_is_capped_at_forty_active_search_hits() {
     assert_eq!(value, 40.0);
     assert_eq!(evidence.len(), 40);
 }
+
+#[test]
+fn adjacent_purchase_sentences_do_not_contaminate_aggregation_evidence() {
+    let extractor = FactExtractor::new().unwrap();
+    let candidates = extractor.extract(
+        "I spent $45 on bike tires. I spent $135 on concert tickets.",
+        None,
+        None,
+        1,
+        [0, 1],
+    );
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(candidates[0].excerpt, "I spent $45 on bike tires.");
+    assert_eq!(candidates[1].excerpt, "I spent $135 on concert tickets.");
+    let mut store = FactStore::default();
+    store.add_candidates(
+        EventId::from_bytes([1; 32]),
+        NodeId::from_bytes([2; 32]),
+        candidates,
+    );
+    assert!(matches!(
+        store.aggregate_query("concert").unwrap(),
+        Some(FactQueryAggregation::Sum { value: 135.0, ref evidence, .. })
+            if evidence.len() == 1
+    ));
+}
+
+#[test]
+fn fact_search_keeps_structured_metadata_and_oracle_stopwords() {
+    let mut candidate = amount_candidate("purchase", 45.0, 1);
+    candidate.metadata = BTreeMap::from([
+        ("over".into(), "rejected_choice".into()),
+        ("per".into(), "weekly_interval".into()),
+        ("category".into(), "outdoor_equipment".into()),
+        ("source_uri".into(), "private_source_location".into()),
+    ]);
+    candidate.excerpt = "I could buy this, but I would not. No, I should wait.".into();
+    let mut store = FactStore::default();
+    store.add_candidates(
+        EventId::from_bytes([1; 32]),
+        NodeId::from_bytes([2; 32]),
+        vec![candidate],
+    );
+    for query in ["rejected choice", "weekly interval", "outdoor equipment"] {
+        assert_eq!(store.search(query, 1, false).len(), 1, "{query}");
+    }
+    assert!(store.search("private source location", 1, false).is_empty());
+    assert!(
+        store
+            .search("could would not no should", 1, false)
+            .is_empty()
+    );
+    assert!(store.aggregate_query("could unicorn").unwrap().is_none());
+}
+
+#[test]
+fn amount_search_scores_match_python_fact_documents() {
+    let extractor = FactExtractor::new().unwrap();
+    let mut store = FactStore::default();
+    for (index, text) in [
+        "I spent $45 on bike tires.",
+        "I spent $135 on bike accessories.",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        store.add_candidates(
+            EventId::from_bytes([index as u8 + 1; 32]),
+            NodeId::from_bytes([index as u8 + 11; 32]),
+            extractor.extract(text, None, None, 1, [0, index as u64]),
+        );
+    }
+    let hits = store.search("bike tires", 2, false);
+    assert_eq!(hits[0].fact.slot_key, "expense.bike_tires");
+    // Python oracle: length 16, bike/tires frequency 4, BM25 k1=1.5, b=.75.
+    assert!((hits[0].score - 1.591_761_4).abs() < 1e-6);
+    assert!((hits[1].score - 0.331_493_74).abs() < 1e-6);
+}
+
+#[test]
+fn tied_fact_search_preserves_arrival_order_before_confidence_or_hashes() {
+    let mut store = FactStore::default();
+    for (index, confidence) in [0.5, 0.9].into_iter().enumerate() {
+        let mut candidate = amount_candidate("tie", 45.0, 0);
+        candidate.arrival_order = [0, index as u64];
+        candidate.confidence = confidence;
+        store.add_candidates(
+            EventId::from_bytes([index as u8 + 1; 32]),
+            NodeId::from_bytes([index as u8 + 11; 32]),
+            vec![candidate],
+        );
+    }
+    let hits = store.search("tie", 2, false);
+    assert_eq!(hits[0].score, hits[1].score);
+    assert_eq!(hits[0].fact.event_id, EventId::from_bytes([1; 32]));
+    let Some(FactQueryAggregation::Max { fact, .. }) =
+        store.aggregate_query_with_intent("tie", FactAggregationIntent::Max)
+    else {
+        panic!("expected a tied maximum");
+    };
+    assert_eq!(fact.event_id, EventId::from_bytes([1; 32]));
+}
