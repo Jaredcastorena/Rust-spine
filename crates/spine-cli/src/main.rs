@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
 mod agent_tools;
+#[cfg(test)]
+mod checkpoint_recovery_tests;
 mod cognition_tools;
 mod document_ingest;
 mod grounding;
@@ -645,6 +647,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             if catch_up_stale_cognition(&heart, encoder.as_ref())? {
                 eprintln!("[caught up stale cognitive projection from the canonical event log]");
+            }
+            if heart.upgrade_fact_projection()? {
+                eprintln!("[upgraded typed facts from the canonical event log]");
             }
             let heart = Arc::new(heart);
             let heart_was_empty = heart.stats()?.events == 0;
@@ -1519,28 +1524,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     let persist_start;
                     let run = if is_resume {
-                        let resumable = checkpoint.take().expect("checkpoint exists");
-                        persist_start = resumable.checkpoint.messages.len() + 1;
-                        if let Err(error) = mark_checkpoint_consumed(
+                        let resumable = match prepare_checkpoint_resume(
                             &heart,
                             encoder.as_ref(),
                             &agent_id,
                             &thread_id,
-                            &resumable,
+                            &mut checkpoint,
+                            &mut circuit_breaker,
                         ) {
-                            eprintln!("[checkpoint resume was not started: {error}]");
-                            if let Some(web) = &web_ui {
-                                web.complete("", false, true);
-                                web.notice(format!("Checkpoint resume was not started: {error}"));
+                            Ok(resumable) => resumable,
+                            Err(error) => {
+                                let notice = format!("Checkpoint resume was not started: {error}");
+                                eprintln!("[{notice}]");
+                                if let Some(web) = &web_ui {
+                                    web.complete_command(notice, checkpoint.is_some());
+                                }
+                                continue;
                             }
-                            checkpoint = Some(resumable);
-                            continue;
-                        }
+                        };
+                        persist_start = resumable.messages.len() + 1;
                         assert!(
                             circuit_breaker.allow(ResilienceChannel::Llm, Instant::now()),
                             "an available LLM circuit accepts its pending resume"
                         );
-                        Box::pin(harness.resume(resumable.checkpoint))
+                        Box::pin(harness.resume(resumable))
                             as std::pin::Pin<Box<dyn Future<Output = _>>>
                     } else {
                         unreachable!("new turns are handled above")
@@ -2632,7 +2639,7 @@ struct PersistedHarnessCheckpoint {
     event_id: EventId,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, PartialEq)]
 enum CheckpointDiscovery {
     Available(PersistedHarnessCheckpoint),
     None,
@@ -2750,7 +2757,7 @@ fn checkpoint_consumption_interaction(
 
 fn mark_checkpoint_consumed(
     heart: &SpineHeart,
-    encoder: &MiniLmEncoder,
+    encoder: &dyn SemanticEncoder,
     agent_id: &AgentId,
     thread_id: &ThreadId,
     resumable: &PersistedHarnessCheckpoint,
@@ -2763,6 +2770,88 @@ fn mark_checkpoint_consumed(
     let embedding = encoder.encode(text)?;
     heart.commit_embedded(interaction, embedding)?;
     Ok(())
+}
+
+/// Consume the exact persisted checkpoint before any resumed work can start.
+/// A failed projection write may already have committed its canonical marker.
+fn prepare_checkpoint_resume(
+    heart: &SpineHeart,
+    encoder: &dyn SemanticEncoder,
+    agent_id: &AgentId,
+    thread_id: &ThreadId,
+    checkpoint: &mut Option<PersistedHarnessCheckpoint>,
+    circuit_breaker: &mut CircuitBreaker,
+) -> Result<HarnessCheckpoint, String> {
+    let resumable = checkpoint.take().ok_or("no resumable checkpoint")?;
+    if !circuit_breaker.allow(ResilienceChannel::Dcmdb, Instant::now()) {
+        *checkpoint = Some(resumable);
+        return Err("memory circuit is open; checkpoint remains available after recovery".into());
+    }
+    match mark_checkpoint_consumed(heart, encoder, agent_id, thread_id, &resumable) {
+        Ok(()) => {
+            circuit_breaker.record_success(ResilienceChannel::Dcmdb);
+            Ok(resumable.checkpoint)
+        }
+        Err(error) => {
+            circuit_breaker.record_failure(ResilienceChannel::Dcmdb, Instant::now());
+            let recovery = catch_up_stale_cognition(heart, encoder);
+            if let Err(recovery_error) = &recovery {
+                circuit_breaker.record_failure(ResilienceChannel::Dcmdb, Instant::now());
+                eprintln!("[checkpoint projection recovery unavailable: {recovery_error}]");
+            }
+            let consumed = heart
+                .events_canonical()
+                .map_err(|error| error.to_string())
+                .and_then(|events| {
+                    exact_checkpoint_consumed(&events, agent_id, thread_id, resumable.event_id)
+                });
+            match consumed {
+                Ok(true) => {
+                    if recovery.is_ok() {
+                        circuit_breaker.record_success(ResilienceChannel::Dcmdb);
+                    }
+                    eprintln!(
+                        "[checkpoint consumption confirmed in canonical events after write error; resuming once]"
+                    );
+                    Ok(resumable.checkpoint)
+                }
+                Ok(false) => {
+                    *checkpoint = Some(resumable);
+                    Err(format!(
+                        "{error}; no consumption marker was committed; checkpoint remains available"
+                    ))
+                }
+                Err(canonical_error) => Err(format!(
+                    "{error}; checkpoint consumption is indeterminate ({canonical_error}); local resume disabled"
+                )),
+            }
+        }
+    }
+}
+
+fn exact_checkpoint_consumed(
+    events: &[SignedEvent],
+    agent_id: &AgentId,
+    thread_id: &ThreadId,
+    checkpoint_id: EventId,
+) -> Result<bool, String> {
+    let mut consumed = false;
+    for event in events {
+        let interaction = &event.body.interaction;
+        if &interaction.agent_id == agent_id
+            && &interaction.thread_id == thread_id
+            && interaction
+                .provenance
+                .metadata
+                .get("record_type")
+                .map(String::as_str)
+                == Some(CHECKPOINT_CONSUMED_RECORD_TYPE)
+        {
+            // Validate every candidate: a malformed record makes absence uncertain.
+            consumed |= consumed_checkpoint_id(interaction)? == checkpoint_id;
+        }
+    }
+    Ok(consumed)
 }
 
 fn checkpoint_from_outcome(
