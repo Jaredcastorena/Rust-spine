@@ -42,6 +42,7 @@ impl Default for HarnessConfig {
 
 /// Per-run controls selected by host policy from committed cognitive state.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HarnessPolicy {
     pub temperature: Option<f32>,
     pub max_action_calls: Option<NonZeroUsize>,
@@ -209,6 +210,20 @@ impl HarnessCheckpoint {
         if self.pending_task.trim().is_empty() {
             return Err(invalid_checkpoint("pending task is empty"));
         }
+        if self
+            .policy
+            .temperature
+            .is_some_and(|value| !value.is_finite() || value < 0.0)
+            || self.completed_action_calls as u128 > u128::from(self.completed_tool_calls)
+            || self
+                .policy
+                .max_action_calls
+                .is_some_and(|limit| self.completed_action_calls > limit.get())
+        {
+            return Err(invalid_checkpoint(
+                "checkpoint action policy or counters are invalid",
+            ));
+        }
         if self.messages.len() < 3
             || self.messages.first().map(|message| message.role) != Some(MessageRole::System)
             || self.messages.last().map(|message| message.role) != Some(MessageRole::Assistant)
@@ -294,10 +309,7 @@ impl HarnessCheckpoint {
                 "checkpoint transcript does not end with a safe assistant summary",
             ));
         }
-        if self.completed_tool_rounds > tool_rounds
-            || self.completed_tool_calls > tool_results
-            || self.completed_tool_rounds > self.completed_tool_calls
-        {
+        if self.completed_tool_rounds > tool_rounds || self.completed_tool_calls > tool_results {
             return Err(invalid_checkpoint(
                 "checkpoint tool counters do not match its transcript",
             ));

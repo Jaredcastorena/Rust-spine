@@ -327,6 +327,21 @@ async fn exhausted_checkpoint_action_budget_still_honors_stop_and_policy() {
     let checkpoint = resumed.checkpoint.unwrap();
     assert_eq!(checkpoint.completed_action_calls, 1);
     assert_eq!(checkpoint.policy, policy);
+    assert_eq!(checkpoint.completed_tool_rounds, 2);
+    assert_eq!(checkpoint.completed_tool_calls, 1);
+    checkpoint
+        .validate()
+        .expect("skipped action rounds remain restartable");
+    let record = checkpoint
+        .to_interaction(
+            AgentId::new("main").unwrap(),
+            ThreadId::new("interactive").unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        HarnessCheckpoint::from_interaction(&record).unwrap(),
+        checkpoint
+    );
     assert!(
         provider
             .requests
@@ -627,6 +642,14 @@ fn checkpoint_validation_rejects_unsafe_boundaries_and_impossible_counters() {
     assert!(checkpoint.validate().is_err());
 
     checkpoint.completed_tool_calls = 0;
+    checkpoint.completed_action_calls = 1;
+    assert!(checkpoint.validate().is_err());
+    checkpoint.completed_action_calls = 0;
+    checkpoint.policy.temperature = Some(f32::NAN);
+    assert!(checkpoint.validate().is_err());
+    checkpoint.policy.temperature = Some(-1.0);
+    assert!(checkpoint.validate().is_err());
+    checkpoint.policy.temperature = None;
     checkpoint.schema = 2;
     assert!(checkpoint.validate().is_err());
 
