@@ -18,6 +18,7 @@ use crate::{
         encrypt_record, generate_root, open_object, root_from_phrase, seal_object, unwrap_root,
         verify_detached, verify_event, wrap_root,
     },
+    diagnostics::{DiagnosticHistory, FeelingObservation},
 };
 
 const SCHEMA_VERSION: u32 = 3;
@@ -532,6 +533,80 @@ impl Store {
     pub fn get_projection<T: DeserializeOwned>(&self, generation: u64) -> Result<Option<T>> {
         let key = self.projection_key(generation);
         self.get_encrypted(PROJECTIONS, &key)
+    }
+
+    pub fn diagnostic_history(&self, generation: u64) -> Result<DiagnosticHistory> {
+        let key = self.object_id(b"thymos-diagnostic-history-v1", &generation.to_be_bytes());
+        Ok(self.get_encrypted(PROJECTIONS, &key)?.unwrap_or_default())
+    }
+
+    /// Install cognitive state and its observed diagnostic samples atomically.
+    pub fn put_projection_with_history<T: Serialize>(
+        &self,
+        generation: u64,
+        expected: Option<&T>,
+        state: &T,
+        samples: &[FeelingObservation],
+        reset_history: bool,
+        expected_events: &[EventId],
+    ) -> Result<()> {
+        let expected_bytes = expected.map(postcard::to_allocvec).transpose()?;
+        let key = self.projection_key(generation);
+        let history_key =
+            self.object_id(b"thymos-diagnostic-history-v1", &generation.to_be_bytes());
+        let (wrapped, encrypted) = seal_object(&self.keys, &key, &postcard::to_allocvec(state)?)?;
+        let write = self.db.begin_write()?;
+        {
+            let mut table = write.open_table(PROJECTIONS)?;
+            let mut data_keys = write.open_table(DATA_KEYS)?;
+            {
+                let current = table.get(key.as_slice())?;
+                let current_bytes = current
+                    .map(|current| {
+                        let current_key =
+                            data_keys.get(key.as_slice())?.ok_or(HeartError::NotFound)?;
+                        open_object(&self.keys, &key, current_key.value(), current.value())
+                    })
+                    .transpose()?;
+                if current_bytes != expected_bytes {
+                    return Err(HeartError::ProjectionStale);
+                }
+                let order = write.open_table(EVENT_ORDER)?;
+                let mut current_events = Vec::new();
+                for entry in order.iter()? {
+                    let (_, id) = entry?;
+                    if data_keys.get(id.value())?.is_some() {
+                        current_events.push(EventId::from_bytes(
+                            id.value().try_into().map_err(|_| HeartError::NotFound)?,
+                        ));
+                    }
+                }
+                if current_events != expected_events {
+                    return Err(HeartError::ProjectionStale);
+                }
+            }
+            let mut history = DiagnosticHistory::default();
+            if !reset_history && let Some(current) = table.get(history_key.as_slice())? {
+                let current_key = data_keys
+                    .get(history_key.as_slice())?
+                    .ok_or(HeartError::NotFound)?;
+                history = postcard::from_bytes(&open_object(
+                    &self.keys,
+                    &history_key,
+                    current_key.value(),
+                    current.value(),
+                )?)?;
+            }
+            history.add(samples)?;
+            let (history_wrapped, history_encrypted) =
+                seal_object(&self.keys, &history_key, &postcard::to_allocvec(&history)?)?;
+            table.insert(key.as_slice(), encrypted.as_slice())?;
+            data_keys.insert(key.as_slice(), wrapped.as_slice())?;
+            table.insert(history_key.as_slice(), history_encrypted.as_slice())?;
+            data_keys.insert(history_key.as_slice(), history_wrapped.as_slice())?;
+        }
+        write.commit()?;
+        Ok(())
     }
 
     /// Installs a projection upgrade only if its input projection and canonical

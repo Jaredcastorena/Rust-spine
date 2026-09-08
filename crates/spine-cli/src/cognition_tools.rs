@@ -623,13 +623,7 @@ impl Tool for FeelTool {
         }
         output["grid_state"] = self
             .heart
-            .cognition()?
-            .and_then(|state| {
-                state
-                    .thymos
-                    .get(&agent)
-                    .map(|thymos| thymos.state_summary())
-            })
+            .thymos_diagnostics(&agent)?
             .unwrap_or(serde_json::Value::Null);
         Ok(ToolResult::success(output.to_string()))
     }

@@ -10,6 +10,7 @@ use crate::{
     FeelingVector, HeartError, ImportReceipt, InteractionInput, KeySource, MemoryReceipt,
     RecoveryPhrase, Result, SemanticEncoder, SignedEvent, Snapshot, SnapshotId, StoreStats,
     SyncFrontier, Tombstone, TombstoneId, TombstoneTarget,
+    diagnostics::FeelingObservation,
     store::{CreatedStore, Store},
     sync,
 };
@@ -221,14 +222,24 @@ impl SpineHeart {
         if !state.is_current(&self.store.frontier()?) {
             return Err(HeartError::ProjectionStale);
         }
+        let previous = state.clone();
         let receipt = self.commit_interaction(interaction)?;
         let events = self.store.events_canonical()?;
         if events.last().map(|event| event.id) != Some(receipt.event.id) {
             return Err(HeartError::ProjectionStale);
         }
+        let before_updates =
+            agent_observation_frontier(&state, &receipt.event.body.interaction.agent_id)?;
         let memory = state.observe(&receipt.event, embedding)?;
-        self.store
-            .put_projection(self.config.projection_generation, &state)?;
+        let samples = observed_feeling(&state, &receipt.event, &memory.feeling, before_updates)?;
+        self.store.put_projection_with_history(
+            self.config.projection_generation,
+            Some(&previous),
+            &state,
+            &samples,
+            false,
+            &events.iter().map(|event| event.id).collect::<Vec<_>>(),
+        )?;
         Ok((receipt, memory))
     }
 
@@ -256,6 +267,7 @@ impl SpineHeart {
                 ));
             }
         }
+        let previous = state.clone();
 
         let mut commits = Vec::with_capacity(items.len());
         for (interaction, _) in &items {
@@ -273,12 +285,27 @@ impl SpineHeart {
         }
 
         let mut results = Vec::with_capacity(items.len());
+        let mut samples = Vec::new();
         for (commit, (_, embedding)) in commits.into_iter().zip(items) {
+            let before_updates =
+                agent_observation_frontier(&state, &commit.event.body.interaction.agent_id)?;
             let memory = state.observe(&commit.event, embedding)?;
+            samples.extend(observed_feeling(
+                &state,
+                &commit.event,
+                &memory.feeling,
+                before_updates,
+            )?);
             results.push((commit, memory));
         }
-        self.store
-            .put_projection(self.config.projection_generation, &state)?;
+        self.store.put_projection_with_history(
+            self.config.projection_generation,
+            Some(&previous),
+            &state,
+            &samples,
+            false,
+            &canonical.iter().map(|event| event.id).collect::<Vec<_>>(),
+        )?;
         Ok(results)
     }
 
@@ -297,16 +324,33 @@ impl SpineHeart {
                 "encoder manifest does not match cognitive projection".into(),
             ));
         }
+        let previous = self.cognition()?;
+        let canonical = self.store.events_canonical()?;
         let mut state = CognitiveState::new(config)?;
-        for event in self.store.events_canonical()? {
-            if let Some(text) = CognitiveState::inline_text(&event) {
-                state.observe(&event, encoder.encode(text)?)?;
+        let mut samples = Vec::new();
+        for event in &canonical {
+            if let Some(text) = CognitiveState::inline_text(event) {
+                let before_updates =
+                    agent_observation_frontier(&state, &event.body.interaction.agent_id)?;
+                let memory = state.observe(event, encoder.encode(text)?)?;
+                samples.extend(observed_feeling(
+                    &state,
+                    event,
+                    &memory.feeling,
+                    before_updates,
+                )?);
             } else {
-                state.acknowledge_unembedded(&event);
+                state.acknowledge_unembedded(event);
             }
         }
-        self.store
-            .put_projection(self.config.projection_generation, &state)?;
+        self.store.put_projection_with_history(
+            self.config.projection_generation,
+            previous.as_ref(),
+            &state,
+            &samples,
+            true,
+            &canonical.iter().map(|event| event.id).collect::<Vec<_>>(),
+        )?;
         Ok(state)
     }
 
@@ -442,6 +486,41 @@ impl SpineHeart {
         self.current_cognition()?.feel(agent, context)
     }
 
+    /// Grid diagnostics and the last ten known observed learning samples. Old
+    /// hearts have unknown history until new samples are observed; querying this
+    /// summary never replays or changes the live learned tensor.
+    pub fn thymos_diagnostics(&self, agent: &AgentId) -> Result<Option<serde_json::Value>> {
+        let state = self.current_cognition()?;
+        let Some(thymos) = state.thymos.get(agent) else {
+            return Ok(None);
+        };
+        let events = self.events_canonical()?;
+        if state.projected_events != events.len() as u64 {
+            return Err(HeartError::ProjectionStale);
+        }
+        let live_events = events.into_iter().map(|event| event.id).collect();
+        let history = self
+            .store
+            .diagnostic_history(self.config.projection_generation)?;
+        let history_summary = history.summary(
+            agent,
+            thymos.update_count(),
+            &live_events,
+            crate::diagnostics::thymos_hash(thymos)?,
+        )?;
+        let mut summary = thymos.state_summary();
+        summary
+            .as_object_mut()
+            .expect("grid summary object")
+            .extend(
+                history_summary
+                    .as_object()
+                    .expect("history summary object")
+                    .clone(),
+            );
+        Ok(Some(summary))
+    }
+
     pub fn predict_risk(
         &self,
         agent: &AgentId,
@@ -572,9 +651,34 @@ impl SpineHeart {
         actual: &Embedding,
     ) -> Result<FeelingVector> {
         let mut state = self.current_cognition()?;
+        let previous = state.clone();
+        let canonical = self.events_canonical()?;
+        let predecessor_hash = agent_observation_frontier(&state, agent)?.1;
         let feeling = state.learn_experience(agent, context, expected, actual)?;
-        self.store
-            .put_projection(self.config.projection_generation, &state)?;
+        let samples = canonical
+            .iter()
+            .rev()
+            .find(|event| &event.body.interaction.agent_id == agent)
+            .map(|event| {
+                FeelingObservation::new(
+                    agent.clone(),
+                    event.id,
+                    &state.thymos[agent],
+                    &feeling,
+                    predecessor_hash,
+                )
+            })
+            .transpose()?
+            .into_iter()
+            .collect::<Vec<_>>();
+        self.store.put_projection_with_history(
+            self.config.projection_generation,
+            Some(&previous),
+            &state,
+            &samples,
+            false,
+            &canonical.iter().map(|event| event.id).collect::<Vec<_>>(),
+        )?;
         Ok(feeling)
     }
 
@@ -746,6 +850,43 @@ fn validate_interaction(interaction: &InteractionInput) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn agent_update_count(state: &CognitiveState, agent: &AgentId) -> u64 {
+    state
+        .thymos
+        .get(agent)
+        .map_or(0, crate::Thymos::update_count)
+}
+
+fn agent_observation_frontier(state: &CognitiveState, agent: &AgentId) -> Result<(u64, [u8; 32])> {
+    let hash = state
+        .thymos
+        .get(agent)
+        .map(crate::diagnostics::thymos_hash)
+        .transpose()?
+        .unwrap_or([0; 32]);
+    Ok((agent_update_count(state, agent), hash))
+}
+
+fn observed_feeling(
+    state: &CognitiveState,
+    event: &SignedEvent,
+    feeling: &FeelingVector,
+    before_updates: (u64, [u8; 32]),
+) -> Result<Vec<FeelingObservation>> {
+    let agent = &event.body.interaction.agent_id;
+    let updates = agent_update_count(state, agent);
+    if updates <= before_updates.0 {
+        return Ok(Vec::new());
+    }
+    Ok(vec![FeelingObservation::new(
+        agent.clone(),
+        event.id,
+        &state.thymos[agent],
+        feeling,
+        before_updates.1,
+    )?])
 }
 
 fn now_millis() -> Result<u64> {
@@ -975,6 +1116,121 @@ mod fact_upgrade_tests {
         expected.facts = upgraded.facts.clone();
         assert_eq!(upgraded, expected);
         assert!(!heart.upgrade_fact_projection().unwrap());
+    }
+
+    #[test]
+    fn diagnostic_history_survives_reopen_and_old_missing_history_stays_unknown() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("diagnostics.spine");
+        let heart = heart(&path);
+        let agent = AgentId::new("main").unwrap();
+        let mut observed = Vec::new();
+        for index in 0..15 {
+            let vector =
+                Embedding::normalized(vec![1.0, index as f32 / 10.0 + 0.1, 0.2], 3).unwrap();
+            let before = agent_update_count(&heart.cognition().unwrap().unwrap(), &agent);
+            let (_, memory) = heart
+                .commit_embedded(input(&format!("observation {index}")), vector)
+                .unwrap();
+            let after = agent_update_count(&heart.cognition().unwrap().unwrap(), &agent);
+            if after > before {
+                observed.push(memory.feeling);
+            }
+        }
+        assert!(observed.len() >= 10);
+        let before = heart.cognition().unwrap().unwrap();
+        let summary = heart.thymos_diagnostics(&agent).unwrap().unwrap();
+        let expected = observed
+            .iter()
+            .rev()
+            .take(10)
+            .map(|feeling| f64::from(feeling.valence))
+            .sum::<f64>()
+            / 10.0;
+        assert!((summary["valence_trend"].as_f64().unwrap() - expected).abs() < 1e-9);
+        assert_eq!(summary["history_length"], observed.len());
+        assert_eq!(summary["trend_window_complete"], true);
+        assert_eq!(heart.cognition().unwrap().unwrap(), before);
+        drop(heart);
+        let reopened = SpineHeart::open(
+            HeartConfig::new(&path),
+            KeySource::Passphrase("upgrade-pass".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.thymos_diagnostics(&agent).unwrap().unwrap(),
+            summary
+        );
+        let canonical = reopened.events_canonical().unwrap();
+        let ids: Vec<_> = canonical.iter().map(|event| event.id).collect();
+        reopened
+            .store
+            .put_projection_with_history(1, Some(&before), &before, &[], true, &ids)
+            .unwrap();
+        let unknown = reopened.thymos_diagnostics(&agent).unwrap().unwrap();
+        assert!(unknown["valence_trend"].is_null());
+        assert_eq!(unknown["history_length"], 0);
+        assert_eq!(reopened.cognition().unwrap().unwrap(), before);
+        reopened
+            .commit_embedded(
+                input("new known observation"),
+                Embedding::normalized(vec![0.4, 1.0, 0.3], 3).unwrap(),
+            )
+            .unwrap();
+        let known = reopened.thymos_diagnostics(&agent).unwrap().unwrap();
+        assert_eq!(known["history_length"], 1);
+        assert!(known["valence_trend"].is_number());
+        assert_eq!(known["trend_window_complete"], false);
+        reopened
+            .redact(TombstoneTarget::Event(canonical[0].id), None)
+            .unwrap();
+        assert!(matches!(
+            reopened.thymos_diagnostics(&agent),
+            Err(HeartError::ProjectionStale)
+        ));
+    }
+
+    #[test]
+    fn diagnostic_history_install_is_atomic_and_rejects_concurrent_projection_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let heart = heart(&temp.path().join("diagnostic-atomic.spine"));
+        let previous = heart.cognition().unwrap().unwrap();
+        let mut proposed = previous.clone();
+        proposed.schema = 99;
+        let invalid = FeelingObservation {
+            agent: AgentId::new("main").unwrap(),
+            event_id: crate::EventId::from_bytes([1; 32]),
+            update_count: 1,
+            valence: f32::NAN,
+            arousal: 0.0,
+            state_hash: [0; 32],
+            predecessor_hash: [0; 32],
+        };
+        assert!(
+            heart
+                .store
+                .put_projection_with_history(1, Some(&previous), &proposed, &[invalid], false, &[])
+                .is_err()
+        );
+        assert_eq!(heart.cognition().unwrap().unwrap(), previous);
+        heart.store.put_projection(1, &proposed).unwrap();
+        assert!(matches!(
+            heart
+                .store
+                .put_projection_with_history(1, Some(&previous), &previous, &[], true, &[]),
+            Err(HeartError::ProjectionStale)
+        ));
+        assert_eq!(heart.cognition().unwrap().unwrap(), proposed);
+        heart
+            .commit_interaction(input("concurrent canonical event"))
+            .unwrap();
+        assert!(matches!(
+            heart
+                .store
+                .put_projection_with_history(1, Some(&proposed), &proposed, &[], true, &[]),
+            Err(HeartError::ProjectionStale)
+        ));
+        assert_eq!(heart.cognition().unwrap().unwrap(), proposed);
     }
 }
 

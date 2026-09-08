@@ -2,6 +2,7 @@
 
 mod crypto;
 mod dcmdb;
+mod diagnostics;
 mod embedding;
 mod error;
 mod event;
