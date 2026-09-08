@@ -1740,6 +1740,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 MiniLmAssets::from_directory(model_dir),
                 256,
             )?);
+            catch_up_stale_cognition(&heart, encoder.as_ref())?;
+            heart.upgrade_fact_projection()?;
             let agent_id = AgentId::new(agent)?;
             let thread_id = ThreadId::new(thread)?;
             let mut provider_config = LlamaCppConfig::new(server_url);
