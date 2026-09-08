@@ -6,8 +6,8 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentId, Content, ContextForest, Dcmdb, DcmdbConfig, Embedding, EventId, FactExtractor,
-    FactStore, FeelingVector, HeartError, MemoryObservation, ModelManifest, NodeId,
+    AgentId, Content, ContextForest, Dcmdb, DcmdbConfig, Embedding, EventId, FactCandidate,
+    FactExtractor, FactStore, FeelingVector, HeartError, MemoryObservation, ModelManifest, NodeId,
     ParticipantRole, Result, RiskField, SignedEvent, Thymos, ThymosConfig, TrajectoryStep,
 };
 
@@ -62,6 +62,8 @@ pub struct MemoryReceipt {
 }
 
 impl CognitiveState {
+    pub(crate) const CURRENT_SCHEMA: u32 = 2;
+
     pub fn new(config: CognitiveConfig) -> Result<Self> {
         let dcmdb = Dcmdb::new(DcmdbConfig::dense(config.model.dimension))?;
         let risk = RiskField::new(
@@ -70,7 +72,7 @@ impl CognitiveState {
             config.retrieval_stat_dimensions,
         );
         Ok(Self {
-            schema: 1,
+            schema: Self::CURRENT_SCHEMA,
             config,
             event_frontier: BTreeMap::new(),
             dcmdb,
@@ -133,58 +135,8 @@ impl CognitiveState {
             source: interaction.provenance.source_uri.clone(),
             metadata,
         })?;
-        if interaction.role == ParticipantRole::User
-            && let Some(text) = Self::inline_text(event)
-        {
-            let provenance = &interaction.provenance;
-            let event_time = provenance
-                .metadata
-                .get("event_time")
-                .or_else(|| provenance.metadata.get("date"))
-                .cloned();
-            let session_time = provenance
-                .metadata
-                .get("session_time")
-                .or_else(|| provenance.metadata.get("date"))
-                .cloned();
-            let arrival_order = provenance
-                .metadata
-                .get("session_index")
-                .and_then(|value| value.parse().ok())
-                .zip(
-                    provenance
-                        .metadata
-                        .get("chunk_index")
-                        .and_then(|value| value.parse().ok()),
-                )
-                .map_or(
-                    [
-                        event.body.timestamp.wall_millis,
-                        u64::from(event.body.timestamp.counter),
-                    ],
-                    |(session, chunk)| [session, chunk],
-                );
-            let mut candidates = fact_extractor()?.extract(
-                text,
-                event_time,
-                session_time,
-                event.body.timestamp.wall_millis,
-                arrival_order,
-            );
-            for candidate in &mut candidates {
-                for (key, value) in &provenance.metadata {
-                    candidate
-                        .metadata
-                        .entry(key.clone())
-                        .or_insert_with(|| value.clone());
-                }
-                if let Some(source_uri) = &provenance.source_uri {
-                    candidate
-                        .metadata
-                        .entry("source_uri".into())
-                        .or_insert_with(|| source_uri.clone());
-                }
-            }
+        let candidates = extract_event_facts(event)?;
+        if !candidates.is_empty() {
             self.facts.add_candidates(event.id, node_id, candidates);
         }
 
@@ -275,6 +227,102 @@ impl CognitiveState {
             Content::ColdBlob(_) | Content::Redacted => None,
         }
     }
+
+    pub(crate) fn upgrade_facts(&mut self, events: &[SignedEvent]) -> Result<()> {
+        let mut by_event = BTreeMap::new();
+        // Absorbed originals are preferable to merged aggregate coordinates.
+        // Existing facts then override either choice with their exact provenance.
+        for node in self
+            .dcmdb
+            .nodes
+            .values()
+            .chain(self.dcmdb.absorbed.values())
+        {
+            for event_id in &node.event_ids {
+                by_event.insert(*event_id, node.id);
+            }
+        }
+        for fact in self.facts.facts() {
+            by_event.insert(fact.event_id, fact.node_id);
+        }
+        let mut facts = FactStore::default();
+        for event in events {
+            let candidates = extract_event_facts(event)?;
+            if candidates.is_empty() {
+                continue;
+            }
+            let node_id = by_event.get(&event.id).ok_or_else(|| {
+                HeartError::InvalidInput(format!(
+                    "cannot upgrade facts: event {} has no retained DCMDb provenance",
+                    event.id
+                ))
+            })?;
+            facts.add_candidates(event.id, *node_id, candidates);
+        }
+        self.facts = facts;
+        self.schema = Self::CURRENT_SCHEMA;
+        Ok(())
+    }
+}
+
+fn extract_event_facts(event: &SignedEvent) -> Result<Vec<FactCandidate>> {
+    let interaction = &event.body.interaction;
+    if interaction.role != ParticipantRole::User {
+        return Ok(Vec::new());
+    }
+    let Some(text) = CognitiveState::inline_text(event) else {
+        return Ok(Vec::new());
+    };
+    let provenance = &interaction.provenance;
+    let event_time = provenance
+        .metadata
+        .get("event_time")
+        .or_else(|| provenance.metadata.get("date"))
+        .cloned();
+    let session_time = provenance
+        .metadata
+        .get("session_time")
+        .or_else(|| provenance.metadata.get("date"))
+        .cloned();
+    let arrival_order = provenance
+        .metadata
+        .get("session_index")
+        .and_then(|value| value.parse().ok())
+        .zip(
+            provenance
+                .metadata
+                .get("chunk_index")
+                .and_then(|value| value.parse().ok()),
+        )
+        .map_or(
+            [
+                event.body.timestamp.wall_millis,
+                u64::from(event.body.timestamp.counter),
+            ],
+            |(session, chunk)| [session, chunk],
+        );
+    let mut candidates = fact_extractor()?.extract(
+        text,
+        event_time,
+        session_time,
+        event.body.timestamp.wall_millis,
+        arrival_order,
+    );
+    for candidate in &mut candidates {
+        for (key, value) in &provenance.metadata {
+            candidate
+                .metadata
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
+        }
+        if let Some(source_uri) = &provenance.source_uri {
+            candidate
+                .metadata
+                .entry("source_uri".into())
+                .or_insert_with(|| source_uri.clone());
+        }
+    }
+    Ok(candidates)
 }
 
 fn fact_extractor() -> Result<&'static FactExtractor> {

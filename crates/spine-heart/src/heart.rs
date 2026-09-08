@@ -143,6 +143,48 @@ impl SpineHeart {
         Ok(state.is_current(&self.store.frontier()?))
     }
 
+    /// Backfills historical typed facts once after the fact extractor upgrade.
+    ///
+    /// Call during startup after stale-frontier recovery. This requires no model
+    /// inference and preserves DCMDb, affect, learned risk, context triangles and
+    /// event frontiers exactly. A failed or concurrent upgrade installs nothing.
+    pub fn upgrade_fact_projection(&self) -> Result<bool> {
+        let previous = self.current_cognition()?;
+        match previous.schema {
+            CognitiveState::CURRENT_SCHEMA => return Ok(false),
+            1 => {}
+            found => {
+                return Err(HeartError::UnsupportedSchema {
+                    found,
+                    expected: CognitiveState::CURRENT_SCHEMA,
+                });
+            }
+        }
+        let events = self.store.events_canonical()?;
+        let mut frontier = std::collections::BTreeMap::new();
+        for event in &events {
+            frontier
+                .entry(event.body.device_id)
+                .and_modify(|sequence: &mut u64| {
+                    *sequence = (*sequence).max(event.body.device_sequence)
+                })
+                .or_insert(event.body.device_sequence);
+        }
+        if !previous.is_current(&frontier) {
+            return Err(HeartError::ProjectionStale);
+        }
+        let mut replacement = previous.clone();
+        replacement.upgrade_facts(&events)?;
+        let event_ids: Vec<_> = events.iter().map(|event| event.id).collect();
+        self.store.replace_projection_if_unchanged(
+            self.config.projection_generation,
+            &previous,
+            &event_ids,
+            &replacement,
+        )?;
+        Ok(true)
+    }
+
     pub fn commit_embedded(
         &self,
         interaction: InteractionInput,
@@ -682,4 +724,158 @@ fn now_millis() -> Result<u64> {
         .duration_since(UNIX_EPOCH)
         .map_err(|_| HeartError::InvalidInput("system clock precedes Unix epoch".into()))?;
     Ok(duration.as_millis().min(u128::from(u64::MAX)) as u64)
+}
+
+#[cfg(test)]
+mod fact_upgrade_tests {
+    use super::*;
+    use crate::{
+        ContextLeaf, EventKind, FactStore, FactValue, ModelManifest, ParticipantRole, Provenance,
+        ThreadId,
+    };
+
+    fn input(text: &str) -> InteractionInput {
+        InteractionInput {
+            agent_id: AgentId::new("main").unwrap(),
+            thread_id: ThreadId::new("facts-upgrade").unwrap(),
+            role: ParticipantRole::User,
+            kind: EventKind::Message,
+            content: Content::Inline(text.into()),
+            causal_parents: Vec::new(),
+            provenance: Provenance::default(),
+            tool: None,
+            attachments: Vec::new(),
+            outcome: None,
+        }
+    }
+
+    fn heart(path: &Path) -> SpineHeart {
+        let heart = SpineHeart::create(HeartConfig::new(path), "upgrade-pass")
+            .unwrap()
+            .heart;
+        let manifest = ModelManifest {
+            schema: 1,
+            model_name: "upgrade-test".into(),
+            artifact_hash: [3; 32],
+            tokenizer_hash: [4; 32],
+            dimension: 3,
+            normalized: true,
+            quantization: None,
+        };
+        heart
+            .initialize_cognition(CognitiveConfig::new(1, manifest, 2).unwrap())
+            .unwrap();
+        heart
+    }
+
+    #[test]
+    fn current_legacy_heart_backfills_facts_once_without_replaying_cognition() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("upgrade.spine");
+        let heart = heart(&path);
+        assert!(!heart.upgrade_fact_projection().unwrap());
+        let vector = Embedding::normalized(vec![1.0, 0.0, 0.0], 3).unwrap();
+        let (commit, memory) = heart.commit_embedded(
+            input("[date: 2025/02/03] [user]: I attended 3 weddings.\n[assistant]: I attended 99 weddings."),
+            vector.clone(),
+        ).unwrap();
+        heart
+            .update_risk(&AgentId::new("main").unwrap(), &vector, &[0.0; 4], 0.8)
+            .unwrap();
+        heart
+            .compact_context(
+                [ContextLeaf {
+                    node_id: memory.node_id,
+                    chronology: 1,
+                }],
+                1,
+            )
+            .unwrap();
+        let mut legacy = heart.cognition().unwrap().unwrap();
+        legacy.schema = 1;
+        legacy.facts = FactStore::default();
+        heart.store.put_projection(1, &legacy).unwrap();
+        assert!(heart.cognition_is_current().unwrap());
+        drop(heart);
+
+        let reopened = SpineHeart::open(
+            HeartConfig::new(&path),
+            KeySource::Passphrase("upgrade-pass".into()),
+        )
+        .unwrap();
+        assert!(reopened.upgrade_fact_projection().unwrap());
+        let upgraded = reopened.cognition().unwrap().unwrap();
+        assert_eq!(upgraded.schema, 2);
+        let facts: Vec<_> = upgraded.facts.facts().collect();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].event_id, commit.event.id);
+        assert_eq!(facts[0].node_id, memory.node_id);
+        assert_eq!(facts[0].value, FactValue::Integer(3));
+        assert_eq!(facts[0].event_time.as_deref(), Some("2025-02-03"));
+        let mut expected = legacy;
+        expected.schema = 2;
+        expected.facts = upgraded.facts.clone();
+        assert_eq!(
+            upgraded, expected,
+            "all non-fact cognitive state must survive exactly"
+        );
+        assert!(!reopened.upgrade_fact_projection().unwrap());
+        assert_eq!(reopened.cognition().unwrap().unwrap(), upgraded);
+        assert_eq!(reopened.events_canonical().unwrap(), vec![commit.event]);
+    }
+
+    #[test]
+    fn fact_upgrade_without_retained_provenance_installs_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let heart = heart(&temp.path().join("missing.spine"));
+        heart
+            .commit_embedded(
+                input("I attended 3 weddings."),
+                Embedding::normalized(vec![1.0, 0.0, 0.0], 3).unwrap(),
+            )
+            .unwrap();
+        let mut legacy = heart.cognition().unwrap().unwrap();
+        legacy.schema = 1;
+        legacy.facts = FactStore::default();
+        legacy.dcmdb.nodes.clear();
+        legacy.dcmdb.absorbed.clear();
+        heart.store.put_projection(1, &legacy).unwrap();
+        assert!(
+            matches!(heart.upgrade_fact_projection(), Err(HeartError::InvalidInput(message)) if message.contains("no retained DCMDb provenance"))
+        );
+        assert_eq!(heart.cognition().unwrap().unwrap(), legacy);
+        heart
+            .commit_interaction(input("new unprojected event"))
+            .unwrap();
+        assert!(matches!(
+            heart.upgrade_fact_projection(),
+            Err(HeartError::ProjectionStale)
+        ));
+        assert_eq!(heart.cognition().unwrap().unwrap(), legacy);
+    }
+
+    #[test]
+    fn fact_upgrade_compare_and_swap_rejects_concurrent_state_and_event_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let heart = heart(&temp.path().join("concurrent.spine"));
+        let previous = heart.cognition().unwrap().unwrap();
+        let mut concurrent = previous.clone();
+        concurrent.config.retrieval_stat_dimensions = 5;
+        heart.store.put_projection(1, &concurrent).unwrap();
+        assert!(matches!(
+            heart
+                .store
+                .replace_projection_if_unchanged(1, &previous, &[], &previous),
+            Err(HeartError::ProjectionStale)
+        ));
+        assert_eq!(heart.cognition().unwrap().unwrap(), concurrent);
+        heart.commit_interaction(input("new event")).unwrap();
+        assert!(matches!(
+            heart
+                .store
+                .replace_projection_if_unchanged(1, &concurrent, &[], &previous),
+            Err(HeartError::ProjectionStale)
+        ));
+        assert_eq!(heart.cognition().unwrap().unwrap(), concurrent);
+    }
 }

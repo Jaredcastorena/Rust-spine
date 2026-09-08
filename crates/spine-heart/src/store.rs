@@ -534,6 +534,54 @@ impl Store {
         self.get_encrypted(PROJECTIONS, &key)
     }
 
+    /// Installs a projection upgrade only if its input projection and canonical
+    /// event set are unchanged, including deletion by crypto-shredding.
+    pub fn replace_projection_if_unchanged<T: Serialize>(
+        &self,
+        generation: u64,
+        expected: &T,
+        expected_events: &[EventId],
+        replacement: &T,
+    ) -> Result<()> {
+        let key = self.projection_key(generation);
+        let expected_bytes = postcard::to_allocvec(expected)?;
+        let bytes = postcard::to_allocvec(replacement)?;
+        let (wrapped_key, encrypted) = seal_object(&self.keys, &key, &bytes)?;
+        let write = self.db.begin_write()?;
+        {
+            let mut projections = write.open_table(PROJECTIONS)?;
+            let mut data_keys = write.open_table(DATA_KEYS)?;
+            {
+                let current = projections
+                    .get(key.as_slice())?
+                    .ok_or(HeartError::NotFound)?;
+                let current_key = data_keys.get(key.as_slice())?.ok_or(HeartError::NotFound)?;
+                if open_object(&self.keys, &key, current_key.value(), current.value())?
+                    != expected_bytes
+                {
+                    return Err(HeartError::ProjectionStale);
+                }
+                let order = write.open_table(EVENT_ORDER)?;
+                let mut current_events = Vec::new();
+                for entry in order.iter()? {
+                    let (_, id) = entry?;
+                    if data_keys.get(id.value())?.is_some() {
+                        current_events.push(EventId::from_bytes(
+                            id.value().try_into().map_err(|_| HeartError::NotFound)?,
+                        ));
+                    }
+                }
+                if current_events != expected_events {
+                    return Err(HeartError::ProjectionStale);
+                }
+            }
+            projections.insert(key.as_slice(), encrypted.as_slice())?;
+            data_keys.insert(key.as_slice(), wrapped_key.as_slice())?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
     pub fn frontier(&self) -> Result<BTreeMap<DeviceId, u64>> {
         let mut frontier = BTreeMap::new();
         for event in self.events_canonical()? {
