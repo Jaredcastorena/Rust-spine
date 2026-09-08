@@ -1,7 +1,7 @@
 use spine_heart::{
-    AgentId, CognitiveConfig, Content, Embedding, EventKind, HeartConfig, InteractionInput,
-    KeySource, ModelManifest, ParticipantRole, Provenance, Result, SemanticEncoder, SpineHeart,
-    ThreadId,
+    AgentId, CognitiveConfig, Content, ContextLeaf, Embedding, EventKind, HeartConfig, HeartError,
+    InteractionInput, KeySource, ModelManifest, ParticipantRole, Provenance, Result,
+    SemanticEncoder, SpineHeart, ThreadId,
 };
 
 #[derive(Clone)]
@@ -111,6 +111,117 @@ fn encrypted_cognition_survives_reopen_and_detects_staleness() {
         .unwrap();
     assert_eq!(rebuilt.projected_events, 2);
     assert!(reopened.cognition_is_current().unwrap());
+}
+
+#[test]
+fn suffix_catch_up_preserves_projection_only_learning_and_context() {
+    let temp = tempfile::tempdir().unwrap();
+    let encoder = TinyEncoder::new();
+    let created = SpineHeart::create(
+        HeartConfig::new(temp.path().join("suffix.spine")),
+        "suffix-pass",
+    )
+    .unwrap();
+    created
+        .heart
+        .initialize_cognition(CognitiveConfig::new(1, encoder.manifest.clone(), 2).unwrap())
+        .unwrap();
+    let (first_event, first_memory) = created
+        .heart
+        .commit_embedded(
+            interaction("first context coordinate"),
+            Embedding::normalized(vec![1.0, 0.0, 0.0], 3).unwrap(),
+        )
+        .unwrap();
+    let (second_event, second_memory) = created
+        .heart
+        .commit_embedded(
+            interaction("second context coordinate"),
+            Embedding::normalized(vec![0.82, 0.57, 0.0], 3).unwrap(),
+        )
+        .unwrap();
+    created
+        .heart
+        .compact_context(
+            [
+                ContextLeaf {
+                    node_id: first_memory.node_id,
+                    chronology: first_event.event.body.device_sequence,
+                },
+                ContextLeaf {
+                    node_id: second_memory.node_id,
+                    chronology: second_event.event.body.device_sequence,
+                },
+            ],
+            1,
+        )
+        .unwrap();
+    let risk_context = Embedding::normalized(vec![0.0, 0.0, 1.0], 3).unwrap();
+    created
+        .heart
+        .update_risk(
+            &AgentId::new("main").unwrap(),
+            &risk_context,
+            &[0.8, 0.2, 0.1, 0.3],
+            0.9,
+        )
+        .unwrap();
+    let learned = created.heart.cognition().unwrap().unwrap();
+    assert!(!learned.triangles.roots.is_empty());
+    assert!(!learned.triangles.triangles.is_empty());
+
+    created
+        .heart
+        .commit_interaction(interaction("canonical suffix event"))
+        .unwrap();
+    let caught_up = created.heart.catch_up_cognition(&encoder).unwrap();
+
+    assert_eq!(caught_up.projected_events, learned.projected_events + 1);
+    assert_eq!(caught_up.risk, learned.risk);
+    assert_eq!(caught_up.triangles, learned.triangles);
+    assert!(created.heart.cognition_is_current().unwrap());
+}
+
+#[test]
+fn catch_up_rejects_imports_that_reorder_the_projected_prefix() {
+    let temp = tempfile::tempdir().unwrap();
+    let first_path = temp.path().join("first.spine");
+    let second_path = temp.path().join("second.spine");
+    let created = SpineHeart::create(HeartConfig::new(&first_path), "first-pass").unwrap();
+    let recovery_phrase = created.recovery_phrase.expose().to_owned();
+    let first = created.heart;
+    let second = SpineHeart::create_replica(
+        HeartConfig::new(&second_path),
+        &recovery_phrase,
+        "second-pass",
+    )
+    .unwrap();
+    let encoder = TinyEncoder::new();
+
+    second
+        .commit_interaction(interaction("older offline event"))
+        .unwrap();
+    first
+        .initialize_cognition(CognitiveConfig::new(1, encoder.manifest.clone(), 2).unwrap())
+        .unwrap();
+    first
+        .commit_embedded(
+            interaction("already projected local event"),
+            encoder.encode("already projected local event").unwrap(),
+        )
+        .unwrap();
+    let before = first.cognition().unwrap().unwrap();
+    let delta = second
+        .export_delta(&first.sync_frontier().unwrap())
+        .unwrap();
+    assert_eq!(first.import_delta(delta).unwrap().inserted, 1);
+    assert!(!first.cognition_is_current().unwrap());
+
+    assert!(matches!(
+        first.catch_up_cognition(&encoder),
+        Err(HeartError::ProjectionStale)
+    ));
+    assert_eq!(first.cognition().unwrap().unwrap(), before);
 }
 
 #[test]

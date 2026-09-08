@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use spine_heart::{Dcmdb, DcmdbConfig, EventId, MemoryObservation};
 
@@ -43,6 +43,23 @@ fn pruning_cleans_all_graph_and_count_references() {
     assert_eq!(memory.prune_pass(2.0), 2);
     assert!(memory.nodes.is_empty());
     assert!(memory.graph.is_empty());
+    assert!(memory.check_invariants().is_empty());
+}
+
+#[test]
+fn pruning_preserves_nodes_addressed_by_context_triangles() {
+    let mut config = DcmdbConfig::dense(3);
+    config.prune_weight_threshold = 2.0;
+    let mut memory = Dcmdb::new(config).unwrap();
+    let protected = add(&mut memory, 1, [1.0, 0.0, 0.0], 1.0);
+    let disposable = add(&mut memory, 2, [0.0, 1.0, 0.0], 2.0);
+
+    assert_eq!(
+        memory.prune_pass_protected(2.0, &BTreeSet::from([protected])),
+        1
+    );
+    assert!(memory.node(protected).is_some());
+    assert!(memory.node(disposable).is_none());
     assert!(memory.check_invariants().is_empty());
 }
 

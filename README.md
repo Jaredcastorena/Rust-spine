@@ -458,6 +458,9 @@ identity, or demographic profiling.
 | `/interrupt` | Stops immediately. |
 | `/resume` | Continues a saved checkpoint. |
 | `/tasks` | Shows work managed by the host. |
+| `/circuit` | Shows LLM, Thymos, and DCMDb circuit-breaker state. |
+| `/reset llm`, `/reset thymos`, `/reset dcmdb` | Resets one recovered subsystem circuit. |
+| `reset`, `reset cb`, `reset circuit breaker` | Resets all subsystem circuits. |
 | `/quit` | Exits at a safe boundary. |
 
 Terminal lines that arrive in one paste burst are submitted together as a
@@ -468,6 +471,11 @@ Graceful-stop checkpoints are stored in the encrypted heart. Reopening the
 same agent and thread restores the newest unconsumed checkpoint for `/resume`;
 once a resume begins, that exact checkpoint is durably marked consumed so it
 cannot be replayed after another restart.
+
+Transient recall, Thymos, or provider failures degrade the affected operation
+without discarding the encrypted canonical event log. If a prior write left the
+cognitive projection stale, the next chat startup verifies it and applies only
+the missing canonical suffix before accepting a turn.
 
 ### Browser interface
 

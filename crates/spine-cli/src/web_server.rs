@@ -156,6 +156,11 @@ impl WebUi {
         state.checkpoint_available = checkpoint;
     }
 
+    pub fn complete_command(&self, notice: impl Into<String>, checkpoint: bool) {
+        self.notice(notice);
+        self.complete("", false, checkpoint);
+    }
+
     pub fn fail(&self, message: &str) {
         let mut state = self.state.write().expect("web state poisoned");
         state.busy = false;
@@ -659,6 +664,49 @@ mod tests {
             Some("no-store")
         );
         assert_eq!(rx.recv().await.unwrap().unwrap(), "hello from browser");
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn completed_idle_commands_release_browser_busy_state() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = start(
+            WebBind {
+                host: "127.0.0.1",
+                port: 0,
+                allow_remote: false,
+            },
+            tx,
+            "test".into(),
+            true,
+            false,
+            1,
+        )
+        .await
+        .unwrap();
+        let base_url = server
+            .access_url
+            .split('#')
+            .next()
+            .unwrap()
+            .trim_end_matches('/');
+        let token = server.access_url.split('#').nth(1).unwrap();
+        let client = reqwest::Client::new();
+
+        for command in ["/circuit", "/reset llm", "ordinary next turn"] {
+            let response = client
+                .post(format!("{base_url}/api/message"))
+                .header("x-spine-token", token)
+                .json(&serde_json::json!({"message": command}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            assert_eq!(rx.recv().await.unwrap().unwrap(), command);
+            server.ui().complete_command("command completed", false);
+        }
+
+        assert!(!server.ui().state.read().unwrap().busy);
         server.shutdown().await;
     }
 }

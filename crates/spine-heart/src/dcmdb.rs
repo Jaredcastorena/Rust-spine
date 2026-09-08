@@ -689,12 +689,17 @@ impl Dcmdb {
     }
 
     pub fn prune_pass(&mut self, now: f64) -> usize {
+        self.prune_pass_protected(now, &BTreeSet::new())
+    }
+
+    pub fn prune_pass_protected(&mut self, now: f64, protected: &BTreeSet<NodeId>) -> usize {
         let to_remove: Vec<_> = self
             .nodes
             .iter_mut()
             .filter_map(|(id, node)| {
                 node.apply_decay(now, self.config.eps);
-                (node.weight < self.config.prune_weight_threshold
+                (!protected.contains(id)
+                    && node.weight < self.config.prune_weight_threshold
                     && (now - node.last_seen).max(0.0) as f32 >= self.config.minimum_prune_age)
                     .then_some(*id)
             })
@@ -805,6 +810,15 @@ impl Dcmdb {
     }
 
     pub fn maintain(&mut self, now: f64, maximum_rounds: usize) -> MaintenanceReport {
+        self.maintain_protected(now, maximum_rounds, &BTreeSet::new())
+    }
+
+    pub fn maintain_protected(
+        &mut self,
+        now: f64,
+        maximum_rounds: usize,
+        protected: &BTreeSet<NodeId>,
+    ) -> MaintenanceReport {
         let mut report = MaintenanceReport::default();
         for _ in 0..maximum_rounds {
             let merged = self.consolidate_pass();
@@ -813,7 +827,7 @@ impl Dcmdb {
                 break;
             }
         }
-        report.pruned = self.prune_pass(now);
+        report.pruned = self.prune_pass_protected(now, protected);
         let dream = self.dream_pass(now);
         report.merges += dream.merges;
         report.walks_completed = dream.walks_completed;

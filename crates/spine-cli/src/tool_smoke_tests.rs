@@ -9,8 +9,9 @@ use async_trait::async_trait;
 use axum::{Router, response::Html, routing::get};
 use serde_json::{Value, json};
 use spine_heart::{
-    AgentId, CognitiveConfig, Embedding, HeartConfig, ModelManifest, Result as HeartResult,
-    SemanticEncoder, SpineHeart,
+    AgentId, CognitiveConfig, Content, Embedding, EventKind, HeartConfig, InteractionInput,
+    ModelManifest, ParticipantRole, Provenance, Result as HeartResult, SemanticEncoder, SpineHeart,
+    ThreadId,
 };
 use spine_runtime::{
     CompletionRequest, Harness, HarnessConfig, MessageRole, ModelProvider, ModelTurn, ToolCall,
@@ -58,8 +59,120 @@ impl SemanticEncoder for TinyEncoder {
     }
 }
 
+#[test]
+fn chat_startup_catches_up_a_stale_cognitive_projection_once() {
+    let temporary = tempfile::tempdir().unwrap();
+    let encoder = TinyEncoder::new();
+    let created = SpineHeart::create(
+        HeartConfig::new(temporary.path().join("stale.spine")),
+        "stale-passphrase",
+    )
+    .unwrap();
+    created
+        .heart
+        .initialize_cognition(CognitiveConfig::new(1, encoder.manifest().clone(), 2).unwrap())
+        .unwrap();
+    created
+        .heart
+        .commit_interaction(InteractionInput {
+            agent_id: AgentId::new("main").unwrap(),
+            thread_id: ThreadId::new("startup-recovery").unwrap(),
+            role: ParticipantRole::User,
+            kind: EventKind::Message,
+            content: Content::Inline("recover this canonical event".into()),
+            causal_parents: Vec::new(),
+            provenance: Provenance::default(),
+            tool: None,
+            attachments: Vec::new(),
+            outcome: None,
+        })
+        .unwrap();
+
+    assert!(!created.heart.cognition_is_current().unwrap());
+    assert!(crate::catch_up_stale_cognition(&created.heart, &encoder).unwrap());
+    assert!(created.heart.cognition_is_current().unwrap());
+    assert_eq!(
+        created.heart.cognition().unwrap().unwrap().projected_events,
+        1
+    );
+    assert!(!crate::catch_up_stale_cognition(&created.heart, &encoder).unwrap());
+}
+
 #[derive(Default)]
 struct FinalProvider;
+
+#[test]
+fn checkpoint_persistence_respects_the_memory_breaker() {
+    use crate::resilience::{BreakerState, CircuitBreaker, ResilienceChannel};
+    use spine_runtime::{HarnessCheckpoint, RunOutcome};
+    let temporary = tempfile::tempdir().unwrap();
+    let encoder = TinyEncoder::new();
+    let created = SpineHeart::create(
+        HeartConfig::new(temporary.path().join("checkpoint.spine")),
+        "checkpoint-passphrase",
+    )
+    .unwrap();
+    created
+        .heart
+        .initialize_cognition(CognitiveConfig::new(1, encoder.manifest().clone(), 2).unwrap())
+        .unwrap();
+    let outcome = RunOutcome {
+        response: String::new(),
+        stopped_gracefully: true,
+        checkpoint: Some(HarnessCheckpoint {
+            schema: 1,
+            harness_id: "test".into(),
+            messages: vec![],
+            completed_tool_calls: 0,
+            completed_tool_rounds: 0,
+            pending_task: "continue".into(),
+            host_plan: None,
+        }),
+        completed_tool_calls: 0,
+        completed_tool_rounds: 0,
+        usage: Default::default(),
+        messages: vec![],
+        host_plan: None,
+    };
+    let agent = AgentId::new("main").unwrap();
+    let thread = ThreadId::new("checkpoint").unwrap();
+    let mut checkpoint = None;
+    let mut breaker = CircuitBreaker::default();
+    for _ in 0..2 {
+        breaker.record_failure(ResilienceChannel::Dcmdb, std::time::Instant::now());
+    }
+    assert!(
+        crate::checkpoint_from_outcome(
+            &created.heart,
+            &encoder,
+            &agent,
+            &thread,
+            &outcome,
+            &mut checkpoint,
+            &mut breaker,
+        )
+        .is_err()
+    );
+    assert!(checkpoint.is_none());
+    assert_eq!(created.heart.stats().unwrap().events, 0);
+    assert_eq!(
+        breaker.status(ResilienceChannel::Dcmdb).state,
+        BreakerState::Open
+    );
+    breaker.reset(ResilienceChannel::Dcmdb);
+    crate::checkpoint_from_outcome(
+        &created.heart,
+        &encoder,
+        &agent,
+        &thread,
+        &outcome,
+        &mut checkpoint,
+        &mut breaker,
+    )
+    .unwrap();
+    assert!(checkpoint.is_some());
+    assert_eq!(created.heart.stats().unwrap().events, 1);
+}
 
 #[async_trait]
 impl ModelProvider for FinalProvider {

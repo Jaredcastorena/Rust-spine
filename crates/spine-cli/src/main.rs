@@ -7,6 +7,7 @@ mod grounding;
 mod longmem;
 mod onboarding;
 mod partner_tools;
+mod resilience;
 mod terminal_input;
 #[cfg(test)]
 mod tool_smoke_tests;
@@ -36,6 +37,8 @@ use spine_runtime::{
     Harness, HarnessCheckpoint, HarnessConfig, HarnessEvent, LlamaCppConfig, LlamaCppProvider,
     Message, MessageRole, RunOutcome, ToolCall, ToolRegistry,
 };
+
+use resilience::{CircuitBreaker, ResilienceChannel};
 
 #[derive(Parser)]
 #[command(
@@ -637,6 +640,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 (created.heart, true)
             };
+            if catch_up_stale_cognition(&heart, encoder.as_ref())? {
+                eprintln!("[caught up stale cognitive projection from the canonical event log]");
+            }
             let heart = Arc::new(heart);
             let heart_was_empty = heart.stats()?.events == 0;
             let agent_id = AgentId::new(agent)?;
@@ -847,7 +853,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             if !quit_after_onboarding {
                 println!(
-                    "Spine ready: Rust heart={} events={} tools={} grounding={} (/tasks, /stop, /interrupt, /resume, /quit)",
+                    "Spine ready: Rust heart={} events={} tools={} grounding={} (/tasks, /circuit, /stop, /interrupt, /resume, /quit)",
                     path.display(),
                     heart.stats()?.events,
                     harness.registry().len(),
@@ -863,6 +869,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let mut history = Vec::<Message>::new();
             let mut completed_turns = 0_u64;
+            let mut circuit_breaker = CircuitBreaker::default();
             if !quit_after_onboarding {
                 loop {
                     print!("you> ");
@@ -879,11 +886,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if task.is_empty() {
                         continue;
                     }
+                    if matches!(task, "reset" | "reset cb" | "reset circuit breaker") {
+                        circuit_breaker.reset_all();
+                        println!("[circuit breakers reset]");
+                        if let Some(web) = &web_ui {
+                            web.complete_command("Circuit breakers reset", checkpoint.is_some());
+                        }
+                        continue;
+                    }
+                    if let Some(channel) =
+                        task.strip_prefix("/reset ").and_then(|name| {
+                            match name.trim().to_ascii_lowercase().as_str() {
+                                "llm" => Some(ResilienceChannel::Llm),
+                                "thymos" => Some(ResilienceChannel::Thymos),
+                                "dcmdb" | "memory" => Some(ResilienceChannel::Dcmdb),
+                                _ => None,
+                            }
+                        })
+                    {
+                        circuit_breaker.reset(channel);
+                        println!(
+                            "[circuit breaker reset: {}]",
+                            task.trim_start_matches("/reset ")
+                        );
+                        if let Some(web) = &web_ui {
+                            web.complete_command(
+                                format!(
+                                    "Circuit breaker reset: {}",
+                                    task.trim_start_matches("/reset ")
+                                ),
+                                checkpoint.is_some(),
+                            );
+                        }
+                        continue;
+                    }
+                    if task == "/circuit" {
+                        let summary = circuit_breaker.status_summary();
+                        println!("{summary}");
+                        if let Some(web) = &web_ui {
+                            web.complete_command(summary, checkpoint.is_some());
+                        }
+                        continue;
+                    }
                     if task == "/tasks" {
                         let tasks = running_tasks.format();
                         println!("{tasks}");
                         if let Some(web) = &web_ui {
-                            web.notice(tasks);
+                            web.complete_command(tasks, checkpoint.is_some());
                         }
                         continue;
                     }
@@ -891,7 +940,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let result = running_tasks.cancel(task_id.trim());
                         println!("{result}");
                         if let Some(web) = &web_ui {
-                            web.notice(result);
+                            web.complete_command(result, checkpoint.is_some());
                         }
                         continue;
                     }
@@ -904,15 +953,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         continue;
                     }
+                    if !circuit_breaker.available(ResilienceChannel::Llm, Instant::now()) {
+                        let notice = format!(
+                            "LLM circuit is open; retry after cooldown or use /reset llm ({})",
+                            circuit_breaker.status_summary()
+                        );
+                        eprintln!("[{notice}]");
+                        if let Some(web) = &web_ui {
+                            web.complete_command(notice, checkpoint.is_some());
+                        }
+                        continue;
+                    }
+                    if !circuit_breaker.available(ResilienceChannel::Dcmdb, Instant::now()) {
+                        let notice = format!(
+                            "memory circuit is open; retry after cooldown or use /reset dcmdb ({})",
+                            circuit_breaker.status_summary()
+                        );
+                        eprintln!("[{notice}]");
+                        if let Some(web) = &web_ui {
+                            web.complete_command(notice, checkpoint.is_some());
+                        }
+                        continue;
+                    }
                     if !is_resume {
                         if let Some(web) = &web_ui {
                             web.begin_turn(task);
                         }
                         status.begin("Checking memory");
-                        let recalled = if heart.stats()?.events == 0 {
-                            "[]".into()
+                        let recalled = if circuit_breaker
+                            .allow(ResilienceChannel::Dcmdb, Instant::now())
+                        {
+                            match cognition_tools::recall_context(&heart, encoder.as_ref(), task, 5)
+                            {
+                                Ok(recalled) => {
+                                    circuit_breaker.record_success(ResilienceChannel::Dcmdb);
+                                    recalled
+                                }
+                                Err(error) => {
+                                    circuit_breaker
+                                        .record_failure(ResilienceChannel::Dcmdb, Instant::now());
+                                    eprintln!("[memory recall unavailable: {error}]");
+                                    "[]".into()
+                                }
+                            }
                         } else {
-                            cognition_tools::recall_context(&heart, encoder.as_ref(), task, 5)?
+                            eprintln!("[memory recall skipped: DCMDB circuit is open]");
+                            "[]".into()
                         };
                         let recalled_count =
                             serde_json::from_str::<Vec<serde_json::Value>>(&recalled)
@@ -923,12 +1009,71 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             0.0,
                             0.0,
                         ];
-                        let task_embedding = encoder.encode(task)?;
-                        let triangle_context =
-                            cognition_tools::rehydrate_triangle_context(&heart, &task_embedding)?;
-                        let risk =
-                            heart.predict_risk(&agent_id, &task_embedding, &retrieval_stats)?;
-                        let user_commit = commit_text(
+                        let task_embedding = match encoder.encode(task) {
+                            Ok(embedding) => embedding,
+                            Err(error) => {
+                                circuit_breaker
+                                    .record_failure(ResilienceChannel::Dcmdb, Instant::now());
+                                let notice = format!(
+                                    "task embedding unavailable: {error}; turn was not sent"
+                                );
+                                eprintln!("[{notice}]");
+                                if let Some(web) = &web_ui {
+                                    web.fail(&notice);
+                                }
+                                status.end();
+                                continue;
+                            }
+                        };
+                        let triangle_context = if circuit_breaker
+                            .allow(ResilienceChannel::Dcmdb, Instant::now())
+                        {
+                            match cognition_tools::rehydrate_triangle_context(
+                                &heart,
+                                &task_embedding,
+                            ) {
+                                Ok(context) => {
+                                    circuit_breaker.record_success(ResilienceChannel::Dcmdb);
+                                    context
+                                }
+                                Err(error) => {
+                                    circuit_breaker
+                                        .record_failure(ResilienceChannel::Dcmdb, Instant::now());
+                                    eprintln!("[triangle context unavailable: {error}]");
+                                    "[]".into()
+                                }
+                            }
+                        } else {
+                            "[]".into()
+                        };
+                        let risk_context = if circuit_breaker
+                            .allow(ResilienceChannel::Thymos, Instant::now())
+                        {
+                            match heart.predict_risk(&agent_id, &task_embedding, &retrieval_stats) {
+                                Ok(risk) => {
+                                    circuit_breaker.record_success(ResilienceChannel::Thymos);
+                                    format!("{risk:.3}")
+                                }
+                                Err(error) => {
+                                    circuit_breaker
+                                        .record_failure(ResilienceChannel::Thymos, Instant::now());
+                                    eprintln!("[host risk estimate unavailable: {error}]");
+                                    "unavailable; use conservative high-risk policy".into()
+                                }
+                            }
+                        } else {
+                            "unavailable; use conservative high-risk policy".into()
+                        };
+                        if !circuit_breaker.allow(ResilienceChannel::Dcmdb, Instant::now()) {
+                            let notice = "memory circuit opened during recall; turn was not sent";
+                            eprintln!("[{notice}]");
+                            if let Some(web) = &web_ui {
+                                web.fail(notice);
+                            }
+                            status.end();
+                            continue;
+                        }
+                        let user_commit = match commit_text(
                             &heart,
                             &encoder,
                             &agent_id,
@@ -937,16 +1082,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             EventKind::Message,
                             task,
                             None,
-                        )?;
-                        let feeling = heart.feel(&agent_id, &task_embedding)?.map_or_else(
-                            || "unavailable".into(),
-                            |value| {
-                                serde_json::to_string(&value)
-                                    .unwrap_or_else(|_| "unavailable".into())
-                            },
-                        );
+                        ) {
+                            Ok(commit) => {
+                                circuit_breaker.record_success(ResilienceChannel::Dcmdb);
+                                commit
+                            }
+                            Err(error) => {
+                                circuit_breaker
+                                    .record_failure(ResilienceChannel::Dcmdb, Instant::now());
+                                let recovered = catch_up_stale_cognition(&heart, encoder.as_ref())
+                                    .unwrap_or(false);
+                                let notice = format!(
+                                    "memory write failed: {error}; projection_caught_up={recovered}; turn was not sent",
+                                );
+                                eprintln!("[{notice}]");
+                                if let Some(web) = &web_ui {
+                                    web.fail(&notice);
+                                }
+                                status.end();
+                                continue;
+                            }
+                        };
+                        let feeling = if circuit_breaker
+                            .allow(ResilienceChannel::Thymos, Instant::now())
+                        {
+                            match heart.feel(&agent_id, &task_embedding) {
+                                Ok(feeling) => {
+                                    circuit_breaker.record_success(ResilienceChannel::Thymos);
+                                    feeling.map_or_else(
+                                        || "unavailable".into(),
+                                        |value| {
+                                            serde_json::to_string(&value)
+                                                .unwrap_or_else(|_| "unavailable".into())
+                                        },
+                                    )
+                                }
+                                Err(error) => {
+                                    circuit_breaker
+                                        .record_failure(ResilienceChannel::Thymos, Instant::now());
+                                    eprintln!("[Thymos feeling unavailable: {error}]");
+                                    "unavailable".into()
+                                }
+                            }
+                        } else {
+                            "unavailable".into()
+                        };
                         let system_prompt = format!(
-                            "{partner_system_prompt}\n\nCurrent Thymos proprioception: {feeling}\nHost risk estimate for this memory region: {risk:.3}. At higher risk, deepen recall and avoid unsupported certainty.\n\nAutomatically recalled canonical evidence for this turn (it may be irrelevant; verify before using):\n{recalled}\n\nBudgeted triangle-context rehydration:\n{triangle_context}\n\nRunning/recent host tasks:\n{}",
+                            "{partner_system_prompt}\n\nCurrent Thymos proprioception: {feeling}\nHost risk estimate for this memory region: {risk_context}. At higher or unavailable risk, deepen recall and avoid unsupported certainty.\n\nAutomatically recalled canonical evidence for this turn (it may be irrelevant; verify before using):\n{recalled}\n\nBudgeted triangle-context rehydration:\n{triangle_context}\n\nRunning/recent host tasks:\n{}",
                             running_tasks.format()
                         );
                         let persist_start = history.len() + 2;
@@ -956,6 +1138,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }];
                         let run = Box::pin(harness.run_with_history(system_prompt, &history, task))
                             as std::pin::Pin<Box<dyn Future<Output = _>>>;
+                        assert!(
+                            circuit_breaker.allow(ResilienceChannel::Llm, Instant::now()),
+                            "an available LLM circuit accepts its pending call"
+                        );
                         status.show("Thinking");
                         let controlled = run_with_operator_controls(
                             &harness,
@@ -965,8 +1151,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         )
                         .await;
                         let outcome = match controlled.outcome {
-                            Ok(outcome) => outcome,
+                            Ok(Some(outcome)) => {
+                                circuit_breaker.record_success(ResilienceChannel::Llm);
+                                Some(outcome)
+                            }
+                            Ok(None) => {
+                                circuit_breaker
+                                    .record_cancelled(ResilienceChannel::Llm, Instant::now());
+                                None
+                            }
                             Err(error) => {
+                                circuit_breaker
+                                    .record_failure(ResilienceChannel::Llm, Instant::now());
                                 commit_control_text(
                                     &heart,
                                     &encoder,
@@ -1005,13 +1201,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             continue;
                         };
-                        turn_leaves.extend(persist_harness_messages(
-                            &heart,
-                            &encoder,
-                            &agent_id,
-                            &thread_id,
-                            &outcome.messages[persist_start.min(outcome.messages.len())..],
-                        )?);
+                        if circuit_breaker.allow(ResilienceChannel::Dcmdb, Instant::now()) {
+                            match persist_harness_messages(
+                                &heart,
+                                &encoder,
+                                &agent_id,
+                                &thread_id,
+                                &outcome.messages[persist_start.min(outcome.messages.len())..],
+                            ) {
+                                Ok(leaves) => {
+                                    circuit_breaker.record_success(ResilienceChannel::Dcmdb);
+                                    turn_leaves.extend(leaves);
+                                }
+                                Err(error) => {
+                                    circuit_breaker
+                                        .record_failure(ResilienceChannel::Dcmdb, Instant::now());
+                                    let recovered =
+                                        catch_up_stale_cognition(&heart, encoder.as_ref())
+                                            .unwrap_or(false);
+                                    eprintln!(
+                                        "[turn-message persistence incomplete: {error}; projection_caught_up={recovered}]"
+                                    );
+                                }
+                            }
+                        } else {
+                            eprintln!("[turn-message persistence deferred: DCMDB circuit is open]");
+                        }
                         let mut quit_after = controlled.quit_after;
                         if let Some(gate) = &grounding
                             && !outcome.response.trim().is_empty()
@@ -1043,12 +1258,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let tension = (0.6 * (1.0 - decision.report.coverage)
                                     + 0.4 * decision.report.contradiction)
                                     .clamp(0.0, 1.0);
-                                heart.update_risk(
-                                    &agent_id,
-                                    &task_embedding,
-                                    &retrieval_stats,
-                                    tension,
-                                )?;
+                                if circuit_breaker.allow(ResilienceChannel::Thymos, Instant::now())
+                                {
+                                    match heart.update_risk(
+                                        &agent_id,
+                                        &task_embedding,
+                                        &retrieval_stats,
+                                        tension,
+                                    ) {
+                                        Ok(_) => circuit_breaker
+                                            .record_success(ResilienceChannel::Thymos),
+                                        Err(error) => {
+                                            circuit_breaker.record_failure(
+                                                ResilienceChannel::Thymos,
+                                                Instant::now(),
+                                            );
+                                            eprintln!("[risk update unavailable: {error}]");
+                                        }
+                                    }
+                                }
                                 if decision.needs_repair {
                                     status.show("Repairing answer");
                                     if let Some(web) = &web_ui {
@@ -1059,6 +1287,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let repair_task = format!(
                                         "[HOST GROUNDING REPAIR] The draft's factual coverage was {:.3} and contradiction risk was {:.3}. Re-check the supplied evidence and tool results. Use more recall/tools if needed, correct unsupported claims, and abstain explicitly where evidence remains insufficient. Return the corrected final answer.",
                                         decision.report.coverage, decision.report.contradiction
+                                    );
+                                    assert!(
+                                        circuit_breaker
+                                            .allow(ResilienceChannel::Llm, Instant::now()),
+                                        "a successful draft leaves the LLM circuit available for repair"
                                     );
                                     let repair = Box::pin(harness.run_with_history(
                                         partner_system_prompt.clone(),
@@ -1076,6 +1309,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     quit_after |= repaired.quit_after;
                                     match repaired.outcome {
                                         Ok(Some(mut repaired_outcome)) => {
+                                            circuit_breaker.record_success(ResilienceChannel::Llm);
                                             let repaired_evidence =
                                                 grounding::evidence_from_recall_and_messages(
                                                     &recalled,
@@ -1100,17 +1334,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 ));
                                                 }
                                             }
-                                            turn_leaves.extend(persist_harness_messages(
-                                                &heart,
-                                                &encoder,
-                                                &agent_id,
-                                                &thread_id,
-                                                &repaired_outcome.messages[repair_start
-                                                    .min(repaired_outcome.messages.len())..],
-                                            )?);
+                                            if circuit_breaker
+                                                .allow(ResilienceChannel::Dcmdb, Instant::now())
+                                            {
+                                                match persist_harness_messages(
+                                                    &heart,
+                                                    &encoder,
+                                                    &agent_id,
+                                                    &thread_id,
+                                                    &repaired_outcome.messages[repair_start
+                                                        .min(repaired_outcome.messages.len())..],
+                                                ) {
+                                                    Ok(leaves) => {
+                                                        circuit_breaker.record_success(
+                                                            ResilienceChannel::Dcmdb,
+                                                        );
+                                                        turn_leaves.extend(leaves);
+                                                    }
+                                                    Err(error) => {
+                                                        circuit_breaker.record_failure(
+                                                            ResilienceChannel::Dcmdb,
+                                                            Instant::now(),
+                                                        );
+                                                        let recovered = catch_up_stale_cognition(
+                                                            &heart,
+                                                            encoder.as_ref(),
+                                                        )
+                                                        .unwrap_or(false);
+                                                        eprintln!(
+                                                            "[repair-message persistence incomplete: {error}; projection_caught_up={recovered}]"
+                                                        );
+                                                    }
+                                                }
+                                            } else {
+                                                eprintln!(
+                                                    "[repair-message persistence deferred: DCMDB circuit is open]"
+                                                );
+                                            }
                                             outcome = repaired_outcome;
                                         }
                                         Ok(None) => {
+                                            circuit_breaker.record_cancelled(
+                                                ResilienceChannel::Llm,
+                                                Instant::now(),
+                                            );
                                             commit_control_text(
                                                 &heart,
                                                 &encoder,
@@ -1125,6 +1392,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             }
                                         }
                                         Err(error) => {
+                                            circuit_breaker.record_failure(
+                                                ResilienceChannel::Llm,
+                                                Instant::now(),
+                                            );
                                             commit_control_text(
                                                 &heart,
                                                 &encoder,
@@ -1151,7 +1422,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if let Some(web) = &web_ui {
                                 web.activity("Saving context");
                             }
-                            heart.compact_context(turn_leaves, 6)?;
+                            if circuit_breaker.allow(ResilienceChannel::Dcmdb, Instant::now()) {
+                                if let Err(error) = heart.compact_context(turn_leaves, 6) {
+                                    circuit_breaker
+                                        .record_failure(ResilienceChannel::Dcmdb, Instant::now());
+                                    eprintln!("[context compaction deferred: {error}]");
+                                } else {
+                                    circuit_breaker.record_success(ResilienceChannel::Dcmdb);
+                                }
+                            } else {
+                                eprintln!("[context compaction deferred: DCMDB circuit is open]");
+                            }
                         }
                         completed_turns = completed_turns.saturating_add(1);
                         if completed_turns.is_multiple_of(10) {
@@ -1159,16 +1440,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if let Some(web) = &web_ui {
                                 web.activity("Maintaining memory");
                             }
-                            heart.maintain_cognition(4)?;
+                            if circuit_breaker.allow(ResilienceChannel::Dcmdb, Instant::now()) {
+                                if let Err(error) = heart.maintain_cognition(4) {
+                                    circuit_breaker
+                                        .record_failure(ResilienceChannel::Dcmdb, Instant::now());
+                                    eprintln!("[memory maintenance deferred: {error}]");
+                                } else {
+                                    circuit_breaker.record_success(ResilienceChannel::Dcmdb);
+                                }
+                            } else {
+                                eprintln!("[memory maintenance deferred: DCMDB circuit is open]");
+                            }
                         }
-                        checkpoint_from_outcome(
+                        if let Err(error) = checkpoint_from_outcome(
                             &heart,
-                            &encoder,
+                            encoder.as_ref(),
                             &agent_id,
                             &thread_id,
                             &outcome,
                             &mut checkpoint,
-                        )?;
+                            &mut circuit_breaker,
+                        ) {
+                            checkpoint = None;
+                            outcome.checkpoint = None;
+                            let notice = format!(
+                                "checkpoint persistence could not be confirmed: {error}; do not rely on /resume until restart"
+                            );
+                            eprintln!("[{notice}]");
+                            if let Some(web) = &web_ui {
+                                web.notice(notice);
+                            }
+                        }
                         history.push(Message::new(MessageRole::User, task));
                         status.end();
                         if let Some(web) = &web_ui {
@@ -1209,6 +1511,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             checkpoint = Some(resumable);
                             continue;
                         }
+                        assert!(
+                            circuit_breaker.allow(ResilienceChannel::Llm, Instant::now()),
+                            "an available LLM circuit accepts its pending resume"
+                        );
                         Box::pin(harness.resume(resumable.checkpoint))
                             as std::pin::Pin<Box<dyn Future<Output = _>>>
                     } else {
@@ -1226,8 +1532,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     )
                     .await;
                     let outcome = match controlled.outcome {
-                        Ok(outcome) => outcome,
+                        Ok(Some(outcome)) => {
+                            circuit_breaker.record_success(ResilienceChannel::Llm);
+                            Some(outcome)
+                        }
+                        Ok(None) => {
+                            circuit_breaker
+                                .record_cancelled(ResilienceChannel::Llm, Instant::now());
+                            None
+                        }
                         Err(error) => {
+                            circuit_breaker.record_failure(ResilienceChannel::Llm, Instant::now());
                             commit_control_text(
                                 &heart,
                                 &encoder,
@@ -1247,7 +1562,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             continue;
                         }
                     };
-                    let Some(outcome) = outcome else {
+                    let Some(mut outcome) = outcome else {
                         commit_control_text(
                             &heart,
                             &encoder,
@@ -1266,25 +1581,67 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         continue;
                     };
-                    let leaves = persist_harness_messages(
-                        &heart,
-                        &encoder,
-                        &agent_id,
-                        &thread_id,
-                        &outcome.messages[persist_start.min(outcome.messages.len())..],
-                    )?;
+                    let leaves = if circuit_breaker.allow(ResilienceChannel::Dcmdb, Instant::now())
+                    {
+                        match persist_harness_messages(
+                            &heart,
+                            &encoder,
+                            &agent_id,
+                            &thread_id,
+                            &outcome.messages[persist_start.min(outcome.messages.len())..],
+                        ) {
+                            Ok(leaves) => {
+                                circuit_breaker.record_success(ResilienceChannel::Dcmdb);
+                                leaves
+                            }
+                            Err(error) => {
+                                circuit_breaker
+                                    .record_failure(ResilienceChannel::Dcmdb, Instant::now());
+                                let recovered = catch_up_stale_cognition(&heart, encoder.as_ref())
+                                    .unwrap_or(false);
+                                eprintln!(
+                                    "[resumed-message persistence incomplete: {error}; projection_caught_up={recovered}]"
+                                );
+                                Vec::new()
+                            }
+                        }
+                    } else {
+                        eprintln!("[resumed-message persistence deferred: DCMDB circuit is open]");
+                        Vec::new()
+                    };
                     if !leaves.is_empty() {
                         status.show("Saving context");
-                        heart.compact_context(leaves, 6)?;
+                        if circuit_breaker.allow(ResilienceChannel::Dcmdb, Instant::now()) {
+                            if let Err(error) = heart.compact_context(leaves, 6) {
+                                circuit_breaker
+                                    .record_failure(ResilienceChannel::Dcmdb, Instant::now());
+                                eprintln!("[context compaction deferred: {error}]");
+                            } else {
+                                circuit_breaker.record_success(ResilienceChannel::Dcmdb);
+                            }
+                        } else {
+                            eprintln!("[context compaction deferred: DCMDB circuit is open]");
+                        }
                     }
-                    checkpoint_from_outcome(
+                    if let Err(error) = checkpoint_from_outcome(
                         &heart,
-                        &encoder,
+                        encoder.as_ref(),
                         &agent_id,
                         &thread_id,
                         &outcome,
                         &mut checkpoint,
-                    )?;
+                        &mut circuit_breaker,
+                    ) {
+                        checkpoint = None;
+                        outcome.checkpoint = None;
+                        let notice = format!(
+                            "checkpoint persistence could not be confirmed: {error}; do not rely on /resume until restart"
+                        );
+                        eprintln!("[{notice}]");
+                        if let Some(web) = &web_ui {
+                            web.notice(notice);
+                        }
+                    }
                     status.end();
                     if let Some(web) = &web_ui {
                         web.capture_messages(&outcome.messages);
@@ -2168,7 +2525,11 @@ fn finish_visible_turn(
         trim_history(history, maximum_turns, maximum_chars);
         println!("spine> {}", outcome.response);
     } else if outcome.stopped_gracefully {
-        println!("[stopped safely; use /resume to continue]");
+        if outcome.checkpoint.is_some() {
+            println!("[stopped safely; use /resume to continue]");
+        } else {
+            println!("[stopped; no confirmed resumable checkpoint]");
+        }
     }
 }
 
@@ -2316,11 +2677,12 @@ fn mark_checkpoint_consumed(
 
 fn checkpoint_from_outcome(
     heart: &SpineHeart,
-    encoder: &MiniLmEncoder,
+    encoder: &dyn SemanticEncoder,
     agent_id: &AgentId,
     thread_id: &ThreadId,
     outcome: &RunOutcome,
     checkpoint: &mut Option<PersistedHarnessCheckpoint>,
+    circuit_breaker: &mut CircuitBreaker,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(resumable) = outcome.checkpoint.clone() {
         let interaction = resumable.to_interaction(agent_id.clone(), thread_id.clone())?;
@@ -2328,10 +2690,24 @@ fn checkpoint_from_outcome(
             Content::Inline(text) => text.clone(),
             Content::ColdBlob(_) | Content::Redacted => String::new(),
         };
-        let (receipt, _) = heart.commit_embedded(interaction, encoder.encode(&text)?)?;
+        if !circuit_breaker.allow(ResilienceChannel::Dcmdb, Instant::now()) {
+            return Err("checkpoint was not saved: DCMDB circuit is open".into());
+        }
+        let commit = (|| -> Result<EventId, Box<dyn std::error::Error>> {
+            let (receipt, _) = heart.commit_embedded(interaction, encoder.encode(&text)?)?;
+            Ok(receipt.event.id)
+        })();
+        let event_id = match commit {
+            Ok(id) => id,
+            Err(error) => {
+                circuit_breaker.record_failure(ResilienceChannel::Dcmdb, Instant::now());
+                return Err(error);
+            }
+        };
+        circuit_breaker.record_success(ResilienceChannel::Dcmdb);
         *checkpoint = Some(PersistedHarnessCheckpoint {
             checkpoint: resumable,
-            event_id: receipt.event.id,
+            event_id,
         });
     }
     Ok(())
@@ -2345,22 +2721,42 @@ fn commit_control_text(
     text: &str,
     outcome: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    heart.commit_embedded(
-        InteractionInput {
-            agent_id: agent_id.clone(),
-            thread_id: thread_id.clone(),
-            role: ParticipantRole::Operator,
-            kind: EventKind::Control,
-            content: Content::Inline(text.to_owned()),
-            causal_parents: Vec::new(),
-            provenance: Provenance::default(),
-            tool: None,
-            attachments: Vec::new(),
-            outcome: Some(outcome.into()),
-        },
-        encoder.encode(text)?,
-    )?;
+    let commit = (|| -> Result<(), Box<dyn std::error::Error>> {
+        heart.commit_embedded(
+            InteractionInput {
+                agent_id: agent_id.clone(),
+                thread_id: thread_id.clone(),
+                role: ParticipantRole::Operator,
+                kind: EventKind::Control,
+                content: Content::Inline(text.to_owned()),
+                causal_parents: Vec::new(),
+                provenance: Provenance::default(),
+                tool: None,
+                attachments: Vec::new(),
+                outcome: Some(outcome.into()),
+            },
+            encoder.encode(text)?,
+        )?;
+        Ok(())
+    })();
+    if let Err(error) = commit {
+        let recovered = catch_up_stale_cognition(heart, encoder).unwrap_or(false);
+        eprintln!(
+            "[control-event persistence unavailable: {error}; projection_caught_up={recovered}]"
+        );
+    }
     Ok(())
+}
+
+fn catch_up_stale_cognition(
+    heart: &SpineHeart,
+    encoder: &dyn SemanticEncoder,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    if heart.cognition_is_current()? {
+        return Ok(false);
+    }
+    heart.catch_up_cognition(encoder)?;
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]

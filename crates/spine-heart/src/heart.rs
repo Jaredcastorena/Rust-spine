@@ -241,6 +241,64 @@ impl SpineHeart {
         Ok(state)
     }
 
+    /// Apply only canonical events missing from the persisted projection.
+    ///
+    /// Unlike a full rebuild, this preserves projection-only learned state such
+    /// as risk updates, maintenance results, and context triangles.
+    pub fn catch_up_cognition(&self, encoder: &dyn SemanticEncoder) -> Result<CognitiveState> {
+        let mut state = self
+            .cognition()?
+            .ok_or_else(|| HeartError::InvalidInput("heart has no cognitive projection".into()))?;
+        if encoder.manifest() != &state.config.model {
+            return Err(HeartError::InvalidInput(
+                "encoder manifest does not match cognitive projection".into(),
+            ));
+        }
+        state.triangles.verify(&state.dcmdb)?;
+        let canonical_frontier = self.store.frontier()?;
+        if state.event_frontier.iter().any(|(device, projected)| {
+            canonical_frontier.get(device).copied().unwrap_or_default() < *projected
+        }) {
+            return Err(HeartError::ProjectionStale);
+        }
+        let canonical = self.store.events_canonical()?;
+        let projected_events =
+            usize::try_from(state.projected_events).map_err(|_| HeartError::ProjectionStale)?;
+        if projected_events > canonical.len()
+            || canonical.iter().enumerate().any(|(index, event)| {
+                let projected = state
+                    .event_frontier
+                    .get(&event.body.device_id)
+                    .is_some_and(|sequence| *sequence >= event.body.device_sequence);
+                (index < projected_events) != projected
+            })
+        {
+            return Err(HeartError::ProjectionStale);
+        }
+        for event in canonical.into_iter().skip(projected_events) {
+            let projected = state
+                .event_frontier
+                .get(&event.body.device_id)
+                .is_some_and(|sequence| *sequence >= event.body.device_sequence);
+            debug_assert!(
+                !projected,
+                "suffix validation rejects projected tail events"
+            );
+            if let Some(text) = CognitiveState::inline_text(&event) {
+                state.observe(&event, encoder.encode(text)?)?;
+            } else {
+                state.acknowledge_unembedded(&event);
+            }
+        }
+        if !state.is_current(&canonical_frontier) {
+            return Err(HeartError::ProjectionStale);
+        }
+        state.triangles.verify(&state.dcmdb)?;
+        self.store
+            .put_projection(self.config.projection_generation, &state)?;
+        Ok(state)
+    }
+
     pub fn recall(
         &self,
         query: &Embedding,
@@ -351,8 +409,12 @@ impl SpineHeart {
     /// Run bounded DCMDb consolidation, pruning, and dream maintenance and persist the result.
     pub fn maintain_cognition(&self, maximum_rounds: usize) -> Result<crate::MaintenanceReport> {
         let mut state = self.current_cognition()?;
+        state.triangles.verify(&state.dcmdb)?;
         let now = now_millis()? as f64 / 1_000.0;
-        let report = state.dcmdb.maintain(now, maximum_rounds);
+        let protected = state.triangles.referenced_nodes();
+        let report = state
+            .dcmdb
+            .maintain_protected(now, maximum_rounds, &protected);
         let invariant_errors = state.dcmdb.check_invariants();
         if !invariant_errors.is_empty() {
             return Err(HeartError::InvalidInput(format!(
@@ -360,6 +422,7 @@ impl SpineHeart {
                 invariant_errors.join("; ")
             )));
         }
+        state.triangles.verify(&state.dcmdb)?;
         self.store
             .put_projection(self.config.projection_generation, &state)?;
         Ok(report)
