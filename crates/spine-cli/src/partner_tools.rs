@@ -796,19 +796,27 @@ struct BrowserState {
 
 struct WebBrowser {
     client: reqwest::Client,
-    search_endpoint: reqwest::Url,
+    search_endpoints: Vec<reqwest::Url>,
     state: Mutex<BrowserState>,
 }
 
 impl WebBrowser {
-    fn new() -> Result<Self, reqwest::Error> {
+    fn new() -> Result<Self, String> {
+        let search_override = std::env::var("SPINE_WEB_SEARCH_URL")
+            .map(Some)
+            .or_else(|error| match error {
+                std::env::VarError::NotPresent => Ok(None),
+                std::env::VarError::NotUnicode(_) => {
+                    Err("SPINE_WEB_SEARCH_URL must be valid Unicode".to_owned())
+                }
+            })?;
         Ok(Self {
             client: reqwest::Client::builder()
                 .user_agent("Spine/0.1 text browser")
                 .timeout(Duration::from_secs(30))
-                .build()?,
-            search_endpoint: reqwest::Url::parse("https://html.duckduckgo.com/html/")
-                .expect("static search URL is valid"),
+                .build()
+                .map_err(|error| error.to_string())?,
+            search_endpoints: search_endpoints(search_override.as_deref())?,
             state: Mutex::new(BrowserState {
                 history: Vec::new(),
                 cursor: None,
@@ -919,6 +927,26 @@ impl WebBrowser {
     }
 }
 
+fn search_endpoints(override_url: Option<&str>) -> Result<Vec<reqwest::Url>, String> {
+    const DEFAULTS: [&str; 3] = [
+        "https://www.google.com/search",
+        "https://search.brave.com/search",
+        "https://duckduckgo.com/",
+    ];
+    let values = override_url.map_or_else(|| DEFAULTS.to_vec(), |value| vec![value.trim()]);
+    values
+        .into_iter()
+        .map(|value| {
+            let url = reqwest::Url::parse(value)
+                .map_err(|_| "SPINE_WEB_SEARCH_URL must be an absolute HTTP(S) URL".to_owned())?;
+            if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+                return Err("SPINE_WEB_SEARCH_URL must be an absolute HTTP(S) URL".into());
+            }
+            Ok(url)
+        })
+        .collect()
+}
+
 fn decode_html_entities(value: &str) -> String {
     value
         .replace("&nbsp;", " ")
@@ -1008,12 +1036,32 @@ impl Tool for WebSearchTool {
         let Some(query) = string_arg(call, "query") else {
             return Ok(ToolResult::failure("query is required"));
         };
-        let mut url = self.browser.search_endpoint.clone();
-        url.query_pairs_mut().append_pair("q", query);
-        Ok(match self.browser.fetch(url.as_str(), true).await {
-            Ok(page) => ToolResult::success(page_text(&page)),
-            Err(error) => ToolResult::failure(error),
-        })
+        let mut last_error = "no search endpoints configured".to_owned();
+        for endpoint in &self.browser.search_endpoints {
+            let mut url = endpoint.clone();
+            let parameters: Vec<_> = url
+                .query_pairs()
+                .filter(|(key, _)| key != "q")
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect();
+            url.set_query(None);
+            url.query_pairs_mut()
+                .extend_pairs(parameters)
+                .append_pair("q", query);
+            match self.browser.fetch(url.as_str(), true).await {
+                Ok(page) => {
+                    return Ok(ToolResult::success(format!(
+                        "Search results for: {query}\nEngine: {}\n{}",
+                        endpoint.host_str().unwrap_or("unknown"),
+                        page_text(&page)
+                    )));
+                }
+                Err(error) => last_error = error,
+            }
+        }
+        Ok(ToolResult::failure(format!(
+            "Search failed for all configured engines. Last error: {last_error}"
+        )))
     }
 }
 
@@ -1698,6 +1746,156 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn web_search_falls_back_in_order_and_reports_complete_failure_honestly() {
+        use axum::{
+            extract::{Path as RequestPath, Query, State},
+            http::StatusCode,
+            response::IntoResponse,
+        };
+        type Attempts = Arc<Mutex<Vec<(String, BTreeMap<String, String>)>>>;
+        let attempts: Attempts = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route("/{engine}", get(
+            |RequestPath(engine): RequestPath<String>, Query(query): Query<BTreeMap<String, String>>, State(attempts): State<Attempts>| async move {
+                attempts.lock().unwrap().push((engine.clone(), query));
+                if engine == "second" {
+                    Html("<title>Fallback results</title><a href='/evidence'>Verified local result</a>").into_response()
+                } else {
+                    (StatusCode::SERVICE_UNAVAILABLE, "engine unavailable").into_response()
+                }
+            }
+        )).with_state(Arc::clone(&attempts));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let endpoint = |name| reqwest::Url::parse(&format!("http://{address}/{name}")).unwrap();
+        let mut browser = WebBrowser::new().unwrap();
+        browser.search_endpoints = vec![endpoint("first"), endpoint("second"), endpoint("third")];
+        let browser = Arc::new(browser);
+        let search = WebSearchTool {
+            browser: Arc::clone(&browser),
+        };
+        let call = ToolCall {
+            id: "search".into(),
+            name: "web_search".into(),
+            arguments: serde_json::json!({"query":"Rust & λ?q"}),
+        };
+        let result = search
+            .execute(&call, &ToolContext::default())
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.output.contains("Fallback results"));
+        assert!(result.output.contains("Verified local result"));
+        assert!(
+            result
+                .output
+                .contains(&format!("http://{address}/evidence"))
+        );
+        assert_eq!(
+            attempts
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|item| item.0.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        assert!(
+            attempts
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, query)| query["q"] == "Rust & λ?q")
+        );
+        assert_eq!(browser.state.lock().unwrap().history.len(), 1);
+
+        let mut failing = WebBrowser::new().unwrap();
+        failing.search_endpoints = vec![endpoint("first"), endpoint("third")];
+        let failing = Arc::new(failing);
+        attempts.lock().unwrap().clear();
+        let result = WebSearchTool {
+            browser: Arc::clone(&failing),
+        }
+        .execute(&call, &ToolContext::default())
+        .await
+        .unwrap();
+        assert!(!result.success);
+        assert!(result.output.is_empty());
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("all configured engines")
+        );
+        assert!(result.error.as_deref().unwrap().contains("/third"));
+        assert_eq!(
+            attempts
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|item| item.0.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "third"]
+        );
+        assert!(failing.state.lock().unwrap().history.is_empty());
+
+        // An operator-provided endpoint is exclusive: never send its query to
+        // public fallback engines, even when it fails. Existing URL parameters
+        // survive while any placeholder q parameter is replaced exactly once.
+        let mut exclusive = WebBrowser::new().unwrap();
+        exclusive.search_endpoints = search_endpoints(Some(&format!(
+            "http://{address}/first?fixed=1&q=placeholder"
+        )))
+        .unwrap();
+        attempts.lock().unwrap().clear();
+        let result = WebSearchTool {
+            browser: Arc::new(exclusive),
+        }
+        .execute(&call, &ToolContext::default())
+        .await
+        .unwrap();
+        assert!(!result.success);
+        let recorded = attempts.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].1["q"], "Rust & λ?q");
+        assert_eq!(recorded[0].1["fixed"], "1");
+        server.abort();
+    }
+
+    #[test]
+    fn search_engine_defaults_match_python_and_invalid_overrides_are_not_ignored() {
+        let defaults = search_endpoints(None).unwrap();
+        assert_eq!(
+            defaults
+                .iter()
+                .map(reqwest::Url::as_str)
+                .collect::<Vec<_>>(),
+            [
+                "https://www.google.com/search",
+                "https://search.brave.com/search",
+                "https://duckduckgo.com/"
+            ]
+        );
+        for invalid in [
+            "",
+            "relative/path",
+            "file:///tmp/search",
+            "ftp://example.com/search",
+        ] {
+            assert!(search_endpoints(Some(invalid)).is_err());
+        }
+        assert_eq!(
+            search_endpoints(Some("http://127.0.0.1:9000/search"))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn web_search_uses_the_browser_pipeline_and_large_pages_fail_boundedly() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1720,7 +1918,8 @@ mod tests {
         });
 
         let mut browser = WebBrowser::new().unwrap();
-        browser.search_endpoint = reqwest::Url::parse(&format!("http://{address}/search")).unwrap();
+        browser.search_endpoints =
+            vec![reqwest::Url::parse(&format!("http://{address}/search")).unwrap()];
         let browser = Arc::new(browser);
         let search = WebSearchTool {
             browser: Arc::clone(&browser),
