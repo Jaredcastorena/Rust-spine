@@ -80,8 +80,11 @@ parity. Each now has a regression that failed before its correction:
   unlimited policy. Only the legacy missing-policy case inherits the configured
   total-round ceiling, including already completed rounds. Persist/reload keeps
   that distinction; resume introspection shows the same resolved effective policy.
-- Partner names require explicit `is named` / `is called` constructions. Ordinary
-  partner sentences cannot supersede an existing name. This deliberately avoids
+- Partner names require explicit `is named` / `is called` constructions with a
+  capitalized single name ending its clause. Only the prefix is case-insensitive;
+  `named after her grandmother`, `called every evening`, and `called daily` must
+  not supersede an existing name. Lowercase/compound/multiword mentions remain
+  searchable text, not guessed or truncated typed names. This deliberately avoids
   the same permissive-regex defect present in the Python oracle.
 - Numeric age validation is independent of the text-length minimum, preserving
   both single- and double-digit ages across the supported constructions.

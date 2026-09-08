@@ -17,7 +17,8 @@ fn partner_names_require_explicit_naming_statements() {
     for (text, name) in [
         ("My wife is named Ana.", "Ana"),
         ("My husband is called Alex.", "Alex"),
-        ("MY PARTNER IS NAMED sam.", "sam"),
+        ("MY PARTNER IS NAMED Sam.", "Sam"),
+        ("My partner is named Ana", "Ana"),
     ] {
         let fact = one(&extractor, text);
         assert_eq!(fact.attribute, "partner_name");
@@ -30,6 +31,10 @@ fn partner_names_require_explicit_naming_statements() {
         "My partner called yesterday.",
         "MY WIFE IS FEELING BETTER.",
         "My girlfriend is a teacher.",
+        "My wife is named after her grandmother.",
+        "My wife is called every evening.",
+        "My wife is called daily.",
+        "My wife is called Often when someone needs help.",
     ] {
         assert!(
             extractor
@@ -49,6 +54,9 @@ fn ordinary_partner_updates_do_not_supersede_a_known_name() {
         "My wife is named Ana.",
         "My wife is feeling better.",
         "My wife loves hiking.",
+        "My wife is named after her grandmother.",
+        "My wife is called every evening.",
+        "My wife is called daily.",
     ]
     .into_iter()
     .enumerate()

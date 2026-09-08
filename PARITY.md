@@ -38,8 +38,10 @@ accept the combined branch.
   re-extracts schema 1–3 facts to remove false partner names and recover omitted
   single-digit ages. All non-fact cognitive state is preserved exactly.
 - Partner extraction deliberately tightens the Python oracle's permissive rule:
-  `is named` or `is called` is required; ordinary relationship-related prose must
-  not replace a known name.
+  `is named` or `is called` must introduce a complete, capitalized single-name
+  clause. Lowercase, compound and multiword mentions remain canonical searchable
+  text rather than guessed or truncated names. Ordinary relationship-related
+  prose must not replace a known name.
 - Unsupported or damaged projection layouts fail visibly. A fact upgrade cannot
   invent an original memory coordinate if all provenance has already been pruned.
 - Restart uses exact checkpoint event IDs. An uncertain write is reconciled

@@ -794,9 +794,10 @@ impl FactExtractor {
                 0.90,
             ),
             (
-                // A partner predicate is not necessarily a naming statement:
-                // "my wife is feeling better" must never supersede her name.
-                r"(?i)\bmy (?:wife|husband|partner|girlfriend|boyfriend|fiancee?|spouse) is\s+(?:named|called)\s+([A-Z][a-z]+)\b",
+                // Only the naming prefix is case-insensitive. Require a complete
+                // capitalized single-name clause, not "called daily" or the
+                // first word of "named after her grandmother".
+                r"(?i:\bmy (?:wife|husband|partner|girlfriend|boyfriend|fiancee?|spouse) is\s+(?:named|called)\s+)([A-Z][a-z]+)\b[^\S\r\n]*(?:[.,;!?]|\r?\n|$)",
                 Single {
                     attribute: "partner_name",
                     slot_type: FactSlotType::State,
