@@ -201,6 +201,39 @@ impl Thymos {
         self.update_count
     }
 
+    /// Non-mutating diagnostics corresponding to the Python grid-cell summary.
+    pub fn state_summary(&self) -> serde_json::Value {
+        let rows: Vec<_> = self.tensor.chunks(self.config.dimension).collect();
+        let norms: Vec<_> = rows.iter().map(|row| vector::norm(row)).collect();
+        let mut cross_sum = 0.0;
+        for (i, left) in rows.iter().enumerate() {
+            for (j, right) in rows.iter().enumerate() {
+                if i != j {
+                    cross_sum += vector::dot(left, right)
+                        / (norms[i].max(self.config.eps) * norms[j].max(self.config.eps));
+                }
+            }
+        }
+        let pairs = rows.len() * rows.len().saturating_sub(1);
+        let resultant: Vec<_> = norms
+            .iter()
+            .zip(&self.channel_mass)
+            .map(|(norm, mass)| (norm / mass.max(self.config.eps)).clamp(0.0, 1.0))
+            .collect();
+        serde_json::json!({
+            "t": self.logical_time,
+            "update_count": self.update_count,
+            "channel_norms": norms,
+            "channel_mass": self.channel_mass,
+            "mean_resultant_length": resultant,
+            "mean_cross_similarity": if pairs == 0 { 0.0 } else { cross_sum / pairs as f32 },
+            "heading_norm": self.heading_norm,
+            "has_trajectory": self.previous_position.is_some(),
+            "config_K": self.config.channels,
+            "config_d": self.config.dimension,
+        })
+    }
+
     pub fn query(&self, input: &[f32]) -> Result<FeelingVector> {
         vector::validate_dimension(input, self.config.dimension)?;
         let input_norm = vector::norm(input);

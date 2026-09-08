@@ -86,6 +86,90 @@ fn answer(text: &str) -> ModelTurn {
     }
 }
 
+struct MetadataProbe;
+
+#[async_trait]
+impl Tool for MetadataProbe {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "metadata_probe".into(),
+            description: "Inspect the host-owned tool context".into(),
+            category: ToolCategory::Internal,
+            risk: ToolRisk::ReadOnly,
+            parameters: serde_json::json!({"type":"object"}),
+        }
+    }
+
+    async fn execute(&self, _: &ToolCall, context: &ToolContext) -> Result<ToolResult> {
+        Ok(ToolResult::success(
+            serde_json::to_string(&context.metadata).unwrap(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn host_introspection_metadata_is_bounded_isolated_and_cannot_override_task() {
+    let mut registry = ToolRegistry::default();
+    registry.register(MetadataProbe).unwrap();
+    let make_provider = || {
+        Arc::new(ScriptedProvider::new(vec![
+            tool_turn(vec![ToolCall {
+                id: "metadata".into(),
+                name: "metadata_probe".into(),
+                arguments: serde_json::json!({}),
+            }]),
+            answer("Finished."),
+        ]))
+    };
+    let mut harness =
+        Harness::new(make_provider(), registry.clone(), HarnessConfig::default()).unwrap();
+    harness
+        .set_tool_metadata(
+            [
+                ("spine_trajectory".into(), "{\"surprise\":0.25}".into()),
+                ("task".into(), "spoofed task".into()),
+                (
+                    "unrelated_private_value".into(),
+                    "must not reach tools".into(),
+                ),
+            ]
+            .into(),
+        )
+        .unwrap();
+    assert!(
+        harness
+            .set_tool_metadata([("spine_trajectory".into(), "[]".into())].into())
+            .is_err()
+    );
+    assert!(
+        harness
+            .set_tool_metadata([("spine_trajectory".into(), " ".repeat(8_193))].into())
+            .is_err()
+    );
+    let outcome = harness.run("Use the probe.", "actual task").await.unwrap();
+    let message = outcome
+        .messages
+        .iter()
+        .find(|message| message.role == MessageRole::Tool)
+        .unwrap();
+    let metadata: serde_json::Value = serde_json::from_str(&message.content).unwrap();
+    assert_eq!(metadata["task"], "actual task");
+    assert_eq!(metadata["spine_trajectory"], "{\"surprise\":0.25}");
+    assert!(metadata.get("unrelated_private_value").is_none());
+    let separate = Harness::new(make_provider(), registry, HarnessConfig::default()).unwrap();
+    let outcome = separate
+        .run("Use the probe.", "independent task")
+        .await
+        .unwrap();
+    let message = outcome
+        .messages
+        .iter()
+        .find(|message| message.role == MessageRole::Tool)
+        .unwrap();
+    let metadata: serde_json::Value = serde_json::from_str(&message.content).unwrap();
+    assert_eq!(metadata, serde_json::json!({"task":"independent task"}));
+}
+
 fn registry(executed: Arc<Mutex<Vec<String>>>) -> ToolRegistry {
     let mut registry = ToolRegistry::default();
     registry

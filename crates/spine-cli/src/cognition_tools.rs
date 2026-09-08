@@ -289,12 +289,24 @@ impl Tool for MemoryStatsTool {
                 .map(|node| node.level)
                 .max()
                 .unwrap_or_default();
+            let mut level_distribution = BTreeMap::<u32, usize>::new();
+            let mut source_counts = BTreeMap::<String, f32>::new();
+            for node in state.dcmdb.nodes.values() {
+                *level_distribution.entry(node.level).or_default() += 1;
+                for (source, count) in &node.source_counts {
+                    *source_counts.entry(source.clone()).or_default() += count;
+                }
+            }
             serde_json::json!({
                 "current": state.is_current(&self.heart.sync_frontier().map(|f| f.devices).unwrap_or_default()),
                 "active_nodes": state.dcmdb.nodes.len(),
                 "absorbed_nodes": state.dcmdb.absorbed.len(),
                 "hierarchy_depth": hierarchy_depth,
                 "mean_confidence": mean_confidence,
+                "min_confidence": confidences.iter().copied().reduce(f32::min),
+                "max_confidence": confidences.iter().copied().reduce(f32::max),
+                "level_distribution": level_distribution,
+                "source_counts": source_counts,
                 "fact_count": state.facts.facts().count(),
                 "active_fact_count": state.facts.active().count(),
                 "agents_with_thymos": state.thymos.len(),
@@ -518,7 +530,7 @@ impl Tool for FeelTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "feel".into(),
-            description: "Introspect the current agent's Thymos feeling vector for a context."
+            description: "Introspect the current agent's feeling vector, grid state, and host-reported trajectory, modulation, and risk policy."
                 .into(),
             category: ToolCategory::Internal,
             risk: ToolRisk::ReadOnly,
@@ -542,10 +554,39 @@ impl Tool for FeelTool {
             .unwrap_or("current context");
         let agent = context.agent_id.clone().unwrap_or(AgentId::new("main")?);
         let feeling = self.heart.feel(&agent, &self.encoder.encode(text)?)?;
-        Ok(ToolResult::success(match feeling {
-            Some(feeling) => serde_json::to_string(&feeling)?,
-            None => serde_json::json!({"available": false, "reason": "agent has no Thymos observations yet"}).to_string(),
-        }))
+        let mut output = match feeling {
+            Some(feeling) => serde_json::to_value(&feeling)?,
+            None => {
+                serde_json::json!({"available": false, "reason": "agent has no Thymos observations yet"})
+            }
+        };
+        if output.get("available").is_none() {
+            output["available"] = serde_json::json!(true);
+        }
+        for (key, field) in [
+            ("spine_trajectory", "trajectory"),
+            ("spine_modulation", "modulation"),
+            ("spine_risk_policy", "risk_policy"),
+        ] {
+            output[field] = context
+                .metadata
+                .get(key)
+                .filter(|value| value.len() <= 8_192)
+                .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+                .filter(serde_json::Value::is_object)
+                .unwrap_or(serde_json::Value::Null);
+        }
+        output["grid_state"] = self
+            .heart
+            .cognition()?
+            .and_then(|state| {
+                state
+                    .thymos
+                    .get(&agent)
+                    .map(|thymos| thymos.state_summary())
+            })
+            .unwrap_or(serde_json::Value::Null);
+        Ok(ToolResult::success(output.to_string()))
     }
 }
 

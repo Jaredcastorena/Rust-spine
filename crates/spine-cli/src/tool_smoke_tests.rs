@@ -298,6 +298,104 @@ async fn execute(registry: &ToolRegistry, name: &str, arguments: Value) -> ToolR
     .unwrap_or_else(|error| panic!("execute {name}: {error}"))
 }
 
+#[tokio::test]
+async fn introspection_tools_preserve_fields_and_report_host_policy_and_memory_distributions() {
+    let fixture = fixture(false, false);
+    for (index, vector) in [vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0]]
+        .into_iter()
+        .enumerate()
+    {
+        fixture
+            .heart
+            .commit_embedded(
+                spine_heart::InteractionInput {
+                    agent_id: AgentId::new("main").unwrap(),
+                    thread_id: spine_heart::ThreadId::new("introspection").unwrap(),
+                    role: spine_heart::ParticipantRole::User,
+                    kind: spine_heart::EventKind::Message,
+                    content: spine_heart::Content::Inline(format!("memory {index}")),
+                    causal_parents: Vec::new(),
+                    provenance: spine_heart::Provenance {
+                        source_uri: Some(format!("source-{index}")),
+                        ..Default::default()
+                    },
+                    tool: None,
+                    attachments: Vec::new(),
+                    outcome: None,
+                },
+                Embedding::normalized(vector, 3).unwrap(),
+            )
+            .unwrap();
+    }
+    let before = fixture.heart.cognition().unwrap().unwrap();
+    let result = fixture
+        .registry
+        .get("feel")
+        .unwrap()
+        .execute(
+            &ToolCall {
+                id: "feel".into(),
+                name: "feel".into(),
+                arguments: json!({}),
+            },
+            &ToolContext {
+                agent_id: Some(AgentId::new("main").unwrap()),
+                metadata: [
+                    ("task".into(), "active task".into()),
+                    (
+                        "spine_trajectory".into(),
+                        json!({"surprise":0.4,"speed":0.3,"heading_norm":0.2}).to_string(),
+                    ),
+                    (
+                        "spine_modulation".into(),
+                        json!({"recall_top_k":8}).to_string(),
+                    ),
+                    (
+                        "spine_risk_policy".into(),
+                        json!({"risk_estimate":0.6,"coverage_threshold":0.7}).to_string(),
+                    ),
+                ]
+                .into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(result.success);
+    let value: Value = serde_json::from_str(&result.output).unwrap();
+    assert!(value["raw"].is_array());
+    assert!(value["valence"].is_number());
+    assert_eq!(value["trajectory"]["surprise"], 0.4);
+    assert_eq!(value["modulation"]["recall_top_k"], 8);
+    assert_eq!(value["risk_policy"]["coverage_threshold"], 0.7);
+    assert_eq!(value["grid_state"]["config_K"], 2);
+    assert_eq!(value["grid_state"]["has_trajectory"], true);
+    assert_eq!(fixture.heart.cognition().unwrap().unwrap(), before);
+    let no_host_snapshot = execute(&fixture.registry, "feel", json!({})).await;
+    let value: Value = serde_json::from_str(&no_host_snapshot.output).unwrap();
+    assert!(value["trajectory"].is_null());
+    assert!(value["modulation"].is_null());
+    assert!(value["risk_policy"].is_null());
+    let stats = execute(&fixture.registry, "memory_stats", json!({})).await;
+    let alias = execute(&fixture.registry, "heart_stats", json!({})).await;
+    assert_eq!(stats.output, alias.output);
+    let stats: Value = serde_json::from_str(&stats.output).unwrap();
+    assert_eq!(stats["events"], 2);
+    assert_eq!(stats["cognition"]["level_distribution"]["0"], 2);
+    assert!(stats["cognition"]["min_confidence"].is_number());
+    assert!(stats["cognition"]["max_confidence"].is_number());
+    assert_eq!(
+        stats["cognition"]["source_counts"]["source-0"],
+        before
+            .dcmdb
+            .nodes
+            .values()
+            .find(|node| node.source_counts.contains_key("source-0"))
+            .unwrap()
+            .source_counts["source-0"]
+    );
+}
+
 #[test]
 fn registration_exposes_the_complete_validated_tool_surface() {
     let fixture = fixture(true, true);

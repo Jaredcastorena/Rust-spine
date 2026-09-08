@@ -12,6 +12,31 @@ fn close(actual: f32, expected: f64, tolerance: f32) {
 }
 
 #[test]
+fn thymos_state_summary_matches_grid_equations_without_mutation() {
+    let thymos = Thymos::with_tensor(
+        ThymosConfig::new(2, 2).unwrap(),
+        vec![1.0, 0.0, 0.0, 2.0],
+        Some(vec![2.0, 4.0]),
+    )
+    .unwrap();
+    let before = thymos.clone();
+    let summary = thymos.state_summary();
+    assert_eq!(summary["channel_norms"], serde_json::json!([1.0, 2.0]));
+    assert_eq!(
+        summary["mean_resultant_length"],
+        serde_json::json!([0.5, 0.5])
+    );
+    assert_eq!(summary["mean_cross_similarity"], 0.0);
+    assert_eq!(summary["config_K"], 2);
+    assert_eq!(summary["config_d"], 2);
+    assert_eq!(summary["has_trajectory"], false);
+    assert_eq!(thymos, before);
+    let one_channel =
+        Thymos::with_tensor(ThymosConfig::new(2, 1).unwrap(), vec![0.0, 0.0], None).unwrap();
+    assert_eq!(one_channel.state_summary()["mean_cross_similarity"], 0.0);
+}
+
+#[test]
 fn dcmdb_matches_python_two_observation_oracle() {
     let mut config = DcmdbConfig::dense(3);
     config.theta_similarity = 0.8;

@@ -392,6 +392,7 @@ pub struct Harness {
     controls: ControlPlane,
     events: broadcast::Sender<HarnessEvent>,
     agent_id: Option<spine_heart::AgentId>,
+    tool_metadata: std::collections::BTreeMap<String, String>,
 }
 
 impl Harness {
@@ -418,12 +419,38 @@ impl Harness {
             controls: ControlPlane::default(),
             events,
             agent_id: None,
+            tool_metadata: std::collections::BTreeMap::new(),
         })
     }
 
     pub fn with_agent_id(mut self, agent_id: spine_heart::AgentId) -> Self {
         self.agent_id = Some(agent_id);
         self
+    }
+
+    /// Replace this harness's bounded host introspection snapshot. Only the
+    /// three selected JSON object fields are forwarded; task and other keys are
+    /// runtime-owned. New harnesses/subagents start with an empty snapshot.
+    pub fn set_tool_metadata(
+        &mut self,
+        metadata: std::collections::BTreeMap<String, String>,
+    ) -> Result<()> {
+        let mut selected = std::collections::BTreeMap::new();
+        for key in ["spine_trajectory", "spine_modulation", "spine_risk_policy"] {
+            if let Some(value) = metadata.get(key) {
+                if value.len() > 8_192
+                    || !serde_json::from_str::<serde_json::Value>(value)
+                        .is_ok_and(|value| value.is_object())
+                {
+                    return Err(RuntimeError::InvalidConfig(format!(
+                        "{key} must be a JSON object no larger than 8192 bytes"
+                    )));
+                }
+                selected.insert(key.to_owned(), value.clone());
+            }
+        }
+        self.tool_metadata = selected;
+        Ok(())
     }
 
     pub fn id(&self) -> &str {
@@ -836,7 +863,7 @@ impl Harness {
         let result = if call_risk == ToolRisk::Destructive && !self.config.allow_destructive_tools {
             ToolResult::failure("destructive tool call blocked by this harness")
         } else {
-            let mut metadata = std::collections::BTreeMap::new();
+            let mut metadata = self.tool_metadata.clone();
             metadata.insert("task".into(), task.into());
             tool.execute(
                 call,
