@@ -265,13 +265,33 @@ impl Thymos {
     }
 
     pub fn update(&mut self, context: &[f32], eligibility: &[f32]) -> Result<()> {
+        self.update_scaled(context, eligibility, 1.0)
+    }
+
+    /// Apply one observation's learning-rate multiplier without changing decay
+    /// or the persistent base configuration.
+    pub fn update_scaled(
+        &mut self,
+        context: &[f32],
+        eligibility: &[f32],
+        learning_multiplier: f32,
+    ) -> Result<()> {
+        let learning_rate = self.config.learning_rate * learning_multiplier;
+        if !learning_multiplier.is_finite()
+            || learning_multiplier < 0.0
+            || !learning_rate.is_finite()
+        {
+            return Err(HeartError::InvalidInput(
+                "invalid Thymos learning multiplier".into(),
+            ));
+        }
         vector::validate_dimension(context, self.config.dimension)?;
         vector::validate_dimension(eligibility, self.config.channels)?;
         let context = vector::unit(context, self.config.eps);
         let activation = self.multiply(&context);
         let rho = 1.0 - self.config.decay;
         for channel in 0..self.config.channels {
-            let signal = self.config.learning_rate * eligibility[channel] * activation[channel];
+            let signal = learning_rate * eligibility[channel] * activation[channel];
             let row_start = channel * self.config.dimension;
             let row_end = row_start + self.config.dimension;
             let row = &mut self.tensor[row_start..row_end];
@@ -303,6 +323,14 @@ impl Thymos {
     /// Learn from the trajectory's prior prediction and a newly observed incoming context.
     /// Returns `None` until both a previous position and heading exist.
     pub fn learn_predicted_next(&mut self, actual: &[f32]) -> Result<Option<FeelingVector>> {
+        self.learn_predicted_next_scaled(actual, 1.0)
+    }
+
+    pub fn learn_predicted_next_scaled(
+        &mut self,
+        actual: &[f32],
+        learning_multiplier: f32,
+    ) -> Result<Option<FeelingVector>> {
         vector::validate_dimension(actual, self.config.dimension)?;
         let Some(context) = self.previous_position.clone() else {
             return Ok(None);
@@ -310,8 +338,9 @@ impl Thymos {
         let Some(expected) = self.predict_next() else {
             return Ok(None);
         };
-        self.update_from_experience(&context, &expected, actual)
-            .map(Some)
+        let eligibility = self.compute_valence(&expected, actual)?;
+        self.update_scaled(&context, &eligibility, learning_multiplier)?;
+        self.query(actual).map(Some)
     }
 
     pub fn step(&mut self, input: &[f32]) -> Result<TrajectoryStep> {

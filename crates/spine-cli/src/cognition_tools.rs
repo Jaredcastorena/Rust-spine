@@ -150,6 +150,33 @@ impl AutomaticRecall {
     }
 }
 
+/// Select the reflection policy before committing an observation. Keeping this
+/// value in event provenance makes the policy stable across replay and sync.
+pub fn reflection_multiplier(
+    heart: &SpineHeart,
+    agent: &AgentId,
+    embedding: &Embedding,
+) -> spine_runtime::Result<f32> {
+    let Some(mut thymos) = heart
+        .cognition()?
+        .and_then(|state| state.thymos.get(agent).cloned())
+    else {
+        return Ok(1.0);
+    };
+    let surprise = thymos.step(embedding.as_slice())?.surprise;
+    let policy =
+        spine_runtime::ModulationConfig::default().compute(spine_runtime::ModulationInput {
+            surprise,
+            valence: 0.0,
+            arousal: 0.0,
+            risk: 0.0,
+            tensions: 0,
+            base_temperature: 0.7,
+            configured_tool_rounds: None,
+        });
+    Ok(policy.reflect_eta_multiplier)
+}
+
 /// Recall context for a just-committed user turn without recalling that turn as
 /// its own evidence. The returned node hits drive host modulation directly.
 pub fn automatic_recall_context(
@@ -158,6 +185,7 @@ pub fn automatic_recall_context(
     lexical_query: &str,
     top_k: usize,
     excluded_event: EventId,
+    expansion_depth: usize,
 ) -> spine_runtime::Result<AutomaticRecall> {
     hybrid_recall(
         heart,
@@ -165,6 +193,7 @@ pub fn automatic_recall_context(
         lexical_query,
         top_k.clamp(1, 16),
         Some(excluded_event),
+        Some(expansion_depth.min(3)),
     )
 }
 
@@ -345,7 +374,7 @@ fn hybrid_recall_json(
     top_k: usize,
 ) -> spine_runtime::Result<String> {
     let embedding = encoder.encode(query)?;
-    Ok(hybrid_recall(heart, &embedding, query, top_k, None)?.context)
+    Ok(hybrid_recall(heart, &embedding, query, top_k, None, None)?.context)
 }
 
 fn hybrid_recall(
@@ -354,12 +383,19 @@ fn hybrid_recall(
     query: &str,
     top_k: usize,
     excluded_event: Option<EventId>,
+    expansion_depth: Option<usize>,
 ) -> spine_runtime::Result<AutomaticRecall> {
     let dense_limit = top_k
         .saturating_mul(2)
         .saturating_add(usize::from(excluded_event.is_some()));
     let max_events_per_node = 6 + usize::from(excluded_event.is_some());
-    let dense = heart.recall_memories(embedding, f64::MAX, dense_limit, max_events_per_node)?;
+    let dense = heart.recall_memories_with_expansion(
+        embedding,
+        f64::MAX,
+        dense_limit,
+        max_events_per_node,
+        expansion_depth,
+    )?;
     let mut dense = dense
         .into_iter()
         .filter_map(|mut memory| {
@@ -987,6 +1023,7 @@ mod tests {
             "new prompt must not recall itself",
             5,
             current.event_id,
+            1,
         )
         .expect("automatic recall");
 
@@ -997,5 +1034,16 @@ mod tests {
                 .contains("new prompt must not recall itself")
         );
         assert_eq!(recalled.hits.len(), 1);
+        let before = created.heart.cognition().unwrap().unwrap().thymos;
+        let surprising = Embedding::normalized(vec![0.0, 1.0, 0.0], 3).unwrap();
+        assert_eq!(
+            reflection_multiplier(&created.heart, &agent, &embedding).unwrap(),
+            1.0
+        );
+        assert_eq!(
+            reflection_multiplier(&created.heart, &agent, &surprising).unwrap(),
+            2.0
+        );
+        assert_eq!(created.heart.cognition().unwrap().unwrap().thymos, before);
     }
 }

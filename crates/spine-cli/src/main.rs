@@ -1075,6 +1075,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             task,
                             preliminary_policy.recall_top_k,
                             user_commit.1.event_id,
+                            preliminary_policy.recall_expansion_depth(),
                             &mut circuit_breaker,
                         );
                         let risk_estimate = if circuit_breaker
@@ -1113,13 +1114,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             base_temperature: temperature,
                             configured_tool_rounds: max_tool_rounds,
                         });
-                        if policy.recall_top_k > preliminary_policy.recall_top_k {
+                        if policy.recall_top_k > preliminary_policy.recall_top_k
+                            || policy.recall_expansion_depth()
+                                > preliminary_policy.recall_expansion_depth()
+                        {
                             automatic_recall = resilient_automatic_recall(
                                 &heart,
                                 &task_embedding,
                                 task,
                                 policy.recall_top_k,
                                 user_commit.1.event_id,
+                                policy.recall_expansion_depth(),
                                 &mut circuit_breaker,
                             );
                         }
@@ -1275,7 +1280,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             if let Ok(decision) = decision {
                                 if let Some(tension) = decision.risk_target()
-                                    && circuit_breaker.allow(ResilienceChannel::Thymos, Instant::now())
+                                    && circuit_breaker
+                                        .allow(ResilienceChannel::Thymos, Instant::now())
                                 {
                                     match heart.update_risk(
                                         &agent_id,
@@ -1808,6 +1814,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &task,
                 preliminary_policy.recall_top_k,
                 user_commit.1.event_id,
+                preliminary_policy.recall_expansion_depth(),
             )?;
             let risk =
                 heart.predict_risk(&agent_id, &task_embedding, &automatic_recall.risk_stats())?;
@@ -1820,13 +1827,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 base_temperature: temperature,
                 configured_tool_rounds: max_tool_rounds,
             });
-            if policy.recall_top_k > preliminary_policy.recall_top_k {
+            if policy.recall_top_k > preliminary_policy.recall_top_k
+                || policy.recall_expansion_depth() > preliminary_policy.recall_expansion_depth()
+            {
                 automatic_recall = cognition_tools::automatic_recall_context(
                     &heart,
                     &task_embedding,
                     &task,
                     policy.recall_top_k,
                     user_commit.1.event_id,
+                    policy.recall_expansion_depth(),
                 )?;
             }
             let system_prompt = format!(
@@ -2834,10 +2844,18 @@ fn resilient_automatic_recall(
     task: &str,
     top_k: usize,
     excluded_event: EventId,
+    expansion_depth: usize,
     circuit_breaker: &mut CircuitBreaker,
 ) -> cognition_tools::AutomaticRecall {
     if circuit_breaker.allow(ResilienceChannel::Dcmdb, Instant::now()) {
-        match cognition_tools::automatic_recall_context(heart, query, task, top_k, excluded_event) {
+        match cognition_tools::automatic_recall_context(
+            heart,
+            query,
+            task,
+            top_k,
+            excluded_event,
+            expansion_depth,
+        ) {
             Ok(recall) => {
                 circuit_breaker.record_success(ResilienceChannel::Dcmdb);
                 return recall;
@@ -2878,6 +2896,14 @@ fn commit_text(
     text: &str,
     tool: Option<ToolExchange>,
 ) -> Result<(spine_heart::CommitReceipt, spine_heart::MemoryReceipt), Box<dyn std::error::Error>> {
+    let embedding = encoder.encode(text)?;
+    let mut metadata = BTreeMap::new();
+    if role == ParticipantRole::User {
+        metadata.insert(
+            "thymos_learning_multiplier".into(),
+            cognition_tools::reflection_multiplier(heart, agent_id, &embedding)?.to_string(),
+        );
+    }
     Ok(heart.commit_embedded(
         InteractionInput {
             agent_id: agent_id.clone(),
@@ -2888,13 +2914,14 @@ fn commit_text(
             causal_parents: Vec::new(),
             provenance: Provenance {
                 provider: Some("llama.cpp".into()),
+                metadata,
                 ..Provenance::default()
             },
             tool,
             attachments: Vec::new(),
             outcome: None,
         },
-        encoder.encode(text)?,
+        embedding,
     )?)
 }
 

@@ -609,9 +609,12 @@ enabling llama.cpp's separate built-in host tools.
 After each user message is committed, the host uses its Thymos trajectory,
 recalled-memory tensions, and learned risk to widen automatic recall, cool the
 provider temperature, cap external actions, and raise the answer-grounding
-coverage requirement. A positive `--max-tool-rounds` ceiling can expand under
-risk; omitting it remains unlimited. Triangle-context rehydration keeps its
-fixed bounded topology.
+coverage requirement. Surprise also scales reflection learning through a
+per-observation multiplier stored in the signed event. Risk expands exact
+evidence from absorbed DCMDb nodes to a bounded depth of one to three levels.
+A positive `--max-tool-rounds` ceiling can expand under risk; omitting it remains
+unlimited, including after checkpoint resume. Triangle-context rehydration keeps
+its fixed bounded topology.
 
 ## Developer reference
 

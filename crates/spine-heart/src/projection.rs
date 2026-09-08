@@ -103,6 +103,23 @@ impl CognitiveState {
         }
 
         let interaction = &event.body.interaction;
+        // Persist the host-selected multiplier with the signed observation so
+        // replicas and projection rebuilds replay the same learning update.
+        let learning_multiplier = interaction
+            .provenance
+            .metadata
+            .get("thymos_learning_multiplier")
+            .map(|value| value.parse::<f32>())
+            .transpose()
+            .map_err(|_| {
+                HeartError::InvalidInput("invalid Thymos learning multiplier metadata".into())
+            })?
+            .unwrap_or(1.0);
+        if !learning_multiplier.is_finite() || !(0.0..=2.0).contains(&learning_multiplier) {
+            return Err(HeartError::InvalidInput(
+                "Thymos learning multiplier must be in [0, 2]".into(),
+            ));
+        }
         let mut metadata = BTreeMap::new();
         metadata.insert("event_id".into(), event.id.to_string());
         metadata.insert("agent_id".into(), interaction.agent_id.to_string());
@@ -190,7 +207,7 @@ impl CognitiveState {
         };
         let (feeling, trajectory) = if interaction.role == ParticipantRole::User {
             let feeling = thymos
-                .learn_predicted_next(embedding.as_slice())?
+                .learn_predicted_next_scaled(embedding.as_slice(), learning_multiplier)?
                 .unwrap_or(thymos.query(embedding.as_slice())?);
             let trajectory = thymos.step(embedding.as_slice())?;
             (feeling, trajectory)

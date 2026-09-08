@@ -225,6 +225,45 @@ fn catch_up_rejects_imports_that_reorder_the_projected_prefix() {
 }
 
 #[test]
+fn signed_reflection_policy_replays_the_same_tensor_after_reopen() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("reflection.spine");
+    let encoder = TinyEncoder::new();
+    let config = CognitiveConfig::new(1, encoder.manifest.clone(), 2).unwrap();
+    let created = SpineHeart::create(HeartConfig::new(&path), "reflection-pass").unwrap();
+    created.heart.initialize_cognition(config.clone()).unwrap();
+    for (text, multiplier) in [
+        ("first scene", "1"),
+        ("second scene", "1.5"),
+        ("unexpected scene", "2"),
+    ] {
+        let mut observation = interaction(text);
+        observation
+            .provenance
+            .metadata
+            .insert("thymos_learning_multiplier".into(), multiplier.into());
+        created
+            .heart
+            .commit_embedded(observation, encoder.encode(text).unwrap())
+            .unwrap();
+    }
+    let expected = created.heart.cognition().unwrap().unwrap().thymos;
+    let agent = AgentId::new("main").unwrap();
+    assert_eq!(expected[&agent].update_count(), 1);
+    drop(created);
+    let reopened = SpineHeart::open(
+        HeartConfig::new(&path),
+        KeySource::Passphrase("reflection-pass".into()),
+    )
+    .unwrap();
+    assert_eq!(reopened.cognition().unwrap().unwrap().thymos, expected);
+    assert_eq!(
+        reopened.rebuild_cognition(config, &encoder).unwrap().thymos,
+        expected
+    );
+}
+
+#[test]
 fn embedded_batch_commits_every_event_and_projection_together() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("batch.spine");

@@ -316,6 +316,19 @@ impl SpineHeart {
         top_k: usize,
         max_events_per_node: usize,
     ) -> Result<Vec<RecalledMemory>> {
+        self.recall_memories_with_expansion(query, now, top_k, max_events_per_node, None)
+    }
+
+    /// As recall_memories, with optional bounded DCMDb evidence expansion.
+    /// This walks absorbed memory coordinates, never context triangles.
+    pub fn recall_memories_with_expansion(
+        &self,
+        query: &Embedding,
+        now: f64,
+        top_k: usize,
+        max_events_per_node: usize,
+        max_depth: Option<usize>,
+    ) -> Result<Vec<RecalledMemory>> {
         let state = self.current_cognition()?;
         let hits = state.dcmdb.query(query.as_slice(), now, top_k)?;
         let canonical = self.store.events_canonical()?;
@@ -331,9 +344,21 @@ impl SpineHeart {
         let mut result = Vec::with_capacity(hits.len());
         for hit in hits {
             let node = state.dcmdb.node(hit.node_id).ok_or(HeartError::NotFound)?;
-            let mut ids = node.event_ids.clone();
-            ids.sort_by_key(|event_id| positions.get(event_id).copied().unwrap_or_default());
-            ids.reverse();
+            let mut ids = max_depth.map_or_else(
+                || node.event_ids.clone(),
+                |depth| {
+                    state.dcmdb.subtree_event_ids(
+                        hit.node_id,
+                        depth.min(3),
+                        32,
+                        max_events_per_node,
+                    )
+                },
+            );
+            if max_depth.is_none() {
+                ids.sort_by_key(|event_id| positions.get(event_id).copied().unwrap_or_default());
+                ids.reverse();
+            }
             ids.truncate(max_events_per_node);
             let events = ids
                 .into_iter()

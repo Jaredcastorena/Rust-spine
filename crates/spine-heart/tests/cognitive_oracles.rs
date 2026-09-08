@@ -114,6 +114,35 @@ fn thymos_matches_python_fixed_tensor_oracle() {
 }
 
 #[test]
+fn per_observation_learning_multiplier_matches_scaled_python_eta_without_scaling_decay() {
+    let config = ThymosConfig::new(3, 2).unwrap();
+    let tensor = vec![0.2, -0.1, 0.05, -0.3, 0.4, 0.1];
+    for multiplier in [1.0, 1.5, 2.0] {
+        let mut actual = Thymos::with_tensor(config.clone(), tensor.clone(), None).unwrap();
+        let mut scaled_config = config.clone();
+        scaled_config.learning_rate *= multiplier;
+        let mut oracle = Thymos::with_tensor(scaled_config, tensor.clone(), None).unwrap();
+        let eligibility = actual
+            .compute_valence(&[1.0, 0.0, 0.0], &[0.0, 1.0, 0.0])
+            .unwrap();
+        actual
+            .update_scaled(&[1.0, 2.0, 3.0], &eligibility, multiplier)
+            .unwrap();
+        oracle.update(&[1.0, 2.0, 3.0], &eligibility).unwrap();
+        assert_eq!(actual.tensor(), oracle.tensor());
+        assert_eq!(actual.channel_mass(), oracle.channel_mass());
+        assert_eq!(actual.config.learning_rate, config.learning_rate);
+        let before = actual.clone();
+        assert!(
+            actual
+                .update_scaled(&[1.0, 2.0, 3.0], &eligibility, f32::NAN)
+                .is_err()
+        );
+        assert_eq!(actual, before);
+    }
+}
+
+#[test]
 fn risk_field_learns_toward_positive_outcomes() {
     let mut risk = RiskField::new(3, 0, 0);
     close(

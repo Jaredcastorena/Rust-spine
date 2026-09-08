@@ -70,6 +70,13 @@ pub struct HostModulation {
     pub max_tool_rounds: Option<NonZeroU64>,
 }
 
+impl HostModulation {
+    /// Python's deterministic absorbed-subtree expansion depth, bounded to 1..3.
+    pub fn recall_expansion_depth(&self) -> usize {
+        1 + (2.0 * finite_or(self.expansion_probability, 0.3).clamp(0.0, 1.0)) as usize
+    }
+}
+
 impl ModulationConfig {
     /// Compute the deterministic surprise, tension, and risk policy.
     ///
@@ -245,17 +252,20 @@ mod tests {
         assert_eq!(low.recall_top_k, 5);
         assert!((low.coverage_threshold - 0.5).abs() < f32::EPSILON);
         assert!((low.expansion_probability - 0.3).abs() < f32::EPSILON);
+        assert_eq!(low.recall_expansion_depth(), 1);
 
         let moderate = config.compute(input(0.0, 0.0, 0.0, 0.5));
         assert_eq!((moderate.recall_top_k, moderate.max_actions), (7, 1));
         assert!((moderate.coverage_threshold - 0.65).abs() < f32::EPSILON);
         assert!((moderate.expansion_probability - 0.65).abs() < f32::EPSILON);
+        assert_eq!(moderate.recall_expansion_depth(), 2);
         assert!((moderate.provider_temperature - 0.6).abs() < f32::EPSILON);
 
         let high = config.compute(input(0.0, 0.0, 0.0, 1.0));
         assert_eq!((high.recall_top_k, high.max_actions), (10, 1));
         assert!((high.coverage_threshold - 0.8).abs() < f32::EPSILON);
         assert_eq!(high.expansion_probability, 1.0);
+        assert_eq!(high.recall_expansion_depth(), 3);
         assert!((high.provider_temperature - 0.45).abs() < f32::EPSILON);
     }
 
