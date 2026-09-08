@@ -66,7 +66,11 @@ impl DiagnosticHistory {
             }
             let samples = self.agents.entry(sample.agent.clone()).or_default();
             if samples.iter().any(|known| {
-                known.update_count == sample.update_count && known.state_hash == sample.state_hash
+                known.update_count == sample.update_count
+                    && known.state_hash == sample.state_hash
+                    && known.event_id == sample.event_id
+                    && known.valence == sample.valence
+                    && known.arousal == sample.arousal
             }) {
                 continue;
             }
@@ -148,6 +152,41 @@ pub(crate) fn thymos_hash(thymos: &Thymos) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duplicate_identity_includes_observed_evidence_and_feeling() {
+        let agent = AgentId::new("main").unwrap();
+        let mut history = DiagnosticHistory::default();
+        let first = FeelingObservation {
+            agent: agent.clone(),
+            event_id: EventId::from_bytes([1; 32]),
+            update_count: 5,
+            valence: 0.1,
+            arousal: 0.2,
+            state_hash: [2; 32],
+            predecessor_hash: [1; 32],
+        };
+        let mut replacement = first.clone();
+        replacement.event_id = EventId::from_bytes([3; 32]);
+        history.add(&[first, replacement.clone()]).unwrap();
+        let live = BTreeSet::from([replacement.event_id]);
+        assert_eq!(
+            history.summary(&agent, 5, &live, [2; 32]).unwrap()["history_length"],
+            1
+        );
+        replacement.valence = 0.75;
+        history.add(&[replacement.clone()]).unwrap();
+        assert_eq!(
+            history.summary(&agent, 5, &live, [2; 32]).unwrap()["valence_trend"],
+            0.75
+        );
+        replacement.arousal = 0.5;
+        history.add(&[replacement]).unwrap();
+        assert_eq!(
+            history.summary(&agent, 5, &live, [2; 32]).unwrap()["arousal_trend"],
+            0.5
+        );
+    }
 
     #[test]
     fn bounded_history_matches_ten_sample_mean_and_rejects_stale_evidence() {
