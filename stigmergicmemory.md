@@ -46,7 +46,7 @@ Important accepted review findings:
   resume; unknown markers fail closed. Saved unlimited tool policy stays
   unlimited across restart. Grounding repair preserves cumulative budgets and
   evidence, and cannot continue a gracefully stopped run.
-- Fact schema 3 backfills user facts and removes document-source contamination
+- Fact schema 4 backfills user facts and removes document-source contamination
   while preserving non-fact cognitive state. Both chat and one-shot harness
   startup perform suffix recovery followed by fact upgrade.
 - Released risk models used raw affect and count/empty features. Atomic migration
@@ -59,7 +59,7 @@ Important accepted review findings:
   bounded 100-sample retention and last-ten means. Missing legacy samples stay
   unknown; tensor replacement must break diagnostic continuity explicitly.
 
-The completed implementation passes 201 combined Rust tests and the 149-test
+The reviewed correction passes 206 combined Rust tests and the 149-test
 isolated Python oracle. Actual native model tests, strict Clippy, formatting,
 optimized build, fuzz compilation, license freshness, hygiene and dependency
 audits pass. The release CLI completes two native tool rounds against a local
@@ -70,3 +70,25 @@ and adds each known observation once across failure, retry and reopen.
 Use PR #16's checks for current remote CI status. Review and merge remain normal
 repository acceptance steps; do not silently change the locked architecture or
 reinterpret missing historical diagnostics as known data.
+
+## 2026-09-08 user review corrections
+
+The prior passing suite missed three real defects; it was not proof of complete
+parity. Each now has a regression that failed before its correction:
+
+- Missing checkpoint policy stays distinguishable from an explicitly saved
+  unlimited policy. Only the legacy missing-policy case inherits the configured
+  total-round ceiling, including already completed rounds. Persist/reload keeps
+  that distinction; resume introspection shows the same resolved effective policy.
+- Partner names require explicit `is named` / `is called` constructions. Ordinary
+  partner sentences cannot supersede an existing name. This deliberately avoids
+  the same permissive-regex defect present in the Python oracle.
+- Numeric age validation is independent of the text-length minimum, preserving
+  both single- and double-digit ages across the supported constructions.
+- Schema 4 atomically repairs existing schema 1–3 fact projections from canonical
+  evidence, including schema 3's stored false names and omitted ages. It preserves
+  learned risk, affect, DCMDb, triangles and frontiers without replaying cognition.
+  Missing retained provenance still fails visibly without installing a partial
+  upgrade; successful upgrades are idempotent across reopening.
+
+Reacceptance of this correction is recorded in PR #16 and the production Forum.

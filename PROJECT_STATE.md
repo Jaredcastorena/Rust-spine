@@ -49,7 +49,7 @@ Legacy Python DCMDb/Thymos state is not queried by the native runtime. Running t
 
 ## Accepted verification
 
-- The combined parity implementation passes 201 locked Rust workspace tests and
+- The reviewed parity corrections pass 206 locked Rust workspace tests and
   all 149 Python oracle tests from an isolated source-only copy. `PARITY.md`
   records the behavior map, independent review and migration boundaries.
 - Strict workspace Clippy with all targets and features.

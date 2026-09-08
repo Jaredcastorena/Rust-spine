@@ -613,8 +613,10 @@ coverage requirement. Surprise also scales reflection learning through a
 per-observation multiplier stored in the signed event. Risk expands exact
 evidence from absorbed DCMDb nodes to a bounded depth of one to three levels.
 A positive `--max-tool-rounds` ceiling can expand under risk; omitting it remains
-unlimited, including after checkpoint resume. Triangle-context rehydration keeps
-its fixed bounded topology.
+unlimited. Checkpoints retain their explicitly saved effective policy, including
+unlimited rounds. Legacy checkpoints with no saved policy inherit the current
+harness ceiling, counting rounds already completed. Triangle-context rehydration
+keeps its fixed bounded topology.
 
 Risk training uses Python's normalized affect and all six retrieval statistics:
 top score, score margin, mean confidence, tension fraction, hierarchy depth, and
