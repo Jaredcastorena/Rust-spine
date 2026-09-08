@@ -5,11 +5,11 @@
 - Standalone Rust workspace with no Python runtime imports.
 - One encrypted heart contains the signed canonical event log and its versioned cognitive projection.
 - The projection unifies DCMDb, per-agent Thymos, typed facts, learned risk, and context triangles.
-- Interactive chat registers the complete native cognition/action surface, persistent history, grounding repair, operator guidance, safe stopping, resumable checkpoints, host-tracked tasks, and curated temporary subagents.
+- Interactive chat registers the complete native cognition/action surface, persistent history, grounding repair, operator guidance, safe stopping, restart-persistent resumable checkpoints, host-tracked tasks, and curated temporary subagents.
 - Multi-step work uses a host-owned plan cursor. Tool-free promises trigger another turn, steps advance only after evidence, and open plans survive graceful-stop checkpoints.
 - Native OpenAI tool calls and the reference fenced-JSON/Laguna fallback forms share one bounded parser and execution path.
 - Tool rounds are unlimited by default and remain configurable with a positive ceiling.
-- The llama.cpp/OpenAI-compatible provider uses retry/backoff, explicit context budgeting, TCP keepalive, fresh request connections, and causal transport diagnostics.
+- The llama.cpp/OpenAI-compatible provider uses retry/backoff, explicit context budgeting, TCP keepalive, fresh request connections, causal transport diagnostics, and the standard JSON-string wire format for multi-round function arguments. Optional provider-specific reasoning effort is sent only when configured.
 - Provider startup combines `/props` and `/v1/models` discovery to adopt the
   active model ID and allocated context window; explicit operator settings take
   precedence, and tool schemas are included in the context budget. Compaction
@@ -45,11 +45,13 @@
 
 ## Known boundary
 
-Legacy Python DCMDb/Thymos state is not queried by the native runtime. Running the legacy process beside this harness does not create shared recall. Continuity requires either a one-time verified import or an explicit dual-read adapter.
+Legacy Python DCMDb/Thymos state is not queried by the native runtime. Running the legacy process beside this harness does not create shared recall. Legacy import is an intentional separate project, not a runtime-parity requirement. See `PARITY.md` for restored behavior and compatibility decisions.
 
 ## Accepted verification
 
-- `cargo test --workspace --locked`: 104 tests.
+- The reviewed parity corrections pass 206 locked Rust workspace tests and
+  all 149 Python oracle tests from an isolated source-only copy. `PARITY.md`
+  records the behavior map, independent review and migration boundaries.
 - Strict workspace Clippy with all targets and features.
 - Formatting checks across the workspace and standalone fuzz package.
 - Locked fuzz-target compilation.

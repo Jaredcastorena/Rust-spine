@@ -22,6 +22,7 @@ struct Turn {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct LongMemChunk {
     pub session_id: String,
+    pub session_index: usize,
     pub date: String,
     pub chunk_index: usize,
     pub has_answer: bool,
@@ -63,7 +64,20 @@ fn build(items: Vec<DatasetItem>) -> Result<LongMemCorpus, Box<dyn std::error::E
             if !seen.insert(session_id.clone()) {
                 continue;
             }
-            for (chunk_index, pair) in turns.chunks(2).enumerate() {
+            let session_index = seen.len() - 1;
+            let mut turn_index = 0;
+            let mut chunk_index = 0;
+            while turn_index < turns.len() {
+                let pair_end = if turns[turn_index].role.eq_ignore_ascii_case("user")
+                    && turns
+                        .get(turn_index + 1)
+                        .is_some_and(|turn| turn.role.eq_ignore_ascii_case("assistant"))
+                {
+                    turn_index + 2
+                } else {
+                    turn_index + 1
+                };
+                let pair = &turns[turn_index..pair_end];
                 let text = pair
                     .iter()
                     .map(|turn| format!("[{}]: {}", turn.role, turn.content))
@@ -71,11 +85,14 @@ fn build(items: Vec<DatasetItem>) -> Result<LongMemCorpus, Box<dyn std::error::E
                     .join("\n");
                 chunks.push(LongMemChunk {
                     session_id: session_id.clone(),
+                    session_index,
                     date: date.clone(),
                     chunk_index,
                     has_answer: pair.iter().any(|turn| turn.has_answer.unwrap_or(false)),
                     text: format!("[date: {date}] {text}"),
                 });
+                chunk_index += 1;
+                turn_index = pair_end;
             }
         }
     }
@@ -122,6 +139,35 @@ mod tests {
             "[date: 2025/01/01] [user]: hello\n[assistant]: hi"
         );
         assert!(corpus.chunks[0].has_answer);
+        assert_eq!(corpus.chunks[0].session_index, 0);
         assert_eq!(corpus.chunks[1].chunk_index, 1);
+    }
+
+    #[test]
+    fn only_pairs_user_turns_with_the_following_assistant_turn() {
+        let items = r#"[{
+          "question_id":"q1",
+          "haystack_dates":["2025/01/01"],
+          "haystack_session_ids":["s1"],
+          "haystack_sessions":[[
+            {"role":"assistant","content":"preface"},
+            {"role":"user","content":"first"},
+            {"role":"user","content":"second"},
+            {"role":"assistant","content":"reply"}
+          ]]
+        }]"#;
+        let parsed: Vec<DatasetItem> = serde_json::from_str(items).unwrap();
+        let corpus = build(parsed).unwrap();
+
+        assert_eq!(corpus.chunks.len(), 3);
+        assert_eq!(
+            corpus.chunks[0].text,
+            "[date: 2025/01/01] [assistant]: preface"
+        );
+        assert_eq!(corpus.chunks[1].text, "[date: 2025/01/01] [user]: first");
+        assert_eq!(
+            corpus.chunks[2].text,
+            "[date: 2025/01/01] [user]: second\n[assistant]: reply"
+        );
     }
 }

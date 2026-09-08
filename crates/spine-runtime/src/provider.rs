@@ -63,6 +63,8 @@ pub struct CompletionRequest {
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSpec>,
     pub allow_tool_calls: bool,
+    /// Per-request sampling override selected by host policy.
+    pub temperature: Option<f32>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

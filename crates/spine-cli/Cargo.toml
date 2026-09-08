@@ -24,6 +24,7 @@ reqwest.workspace = true
 rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 spine-heart = { version = "0.1.0", path = "../spine-heart" }
 spine-models = { version = "0.1.0", path = "../spine-models" }
 spine-runtime = { version = "0.1.0", path = "../spine-runtime" }

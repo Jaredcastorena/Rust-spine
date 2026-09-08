@@ -1,11 +1,16 @@
 #![forbid(unsafe_code)]
 
 mod agent_tools;
+#[cfg(test)]
+mod checkpoint_recovery_tests;
 mod cognition_tools;
+mod document_ingest;
 mod grounding;
 mod longmem;
 mod onboarding;
 mod partner_tools;
+mod resilience;
+mod terminal_input;
 #[cfg(test)]
 mod tool_smoke_tests;
 mod web_server;
@@ -13,27 +18,30 @@ mod web_server;
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
-    io::{self, BufRead, IsTerminal, Write},
+    io::{self, IsTerminal, Write},
     num::{NonZeroU64, NonZeroUsize},
     path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    thread,
     time::{Duration, Instant},
 };
 
 use clap::{Parser, Subcommand};
 use spine_heart::{
-    AgentId, CognitiveConfig, Content, ContextLeaf, EventKind, HeartConfig, InteractionInput,
-    KeySource, ParticipantRole, Provenance, SemanticEncoder, SpineHeart, ThreadId, ToolExchange,
+    AgentId, CognitiveConfig, Content, ContextLeaf, Embedding, EventId, EventKind, HeartConfig,
+    InteractionInput, KeySource, ParticipantRole, Provenance, SemanticEncoder, SignedEvent,
+    SpineHeart, ThreadId, ToolExchange,
 };
 use spine_models::{MiniLmAssets, MiniLmEncoder};
 use spine_runtime::{
-    Harness, HarnessCheckpoint, HarnessConfig, HarnessEvent, LlamaCppConfig, LlamaCppProvider,
-    Message, MessageRole, RunOutcome, ToolCall, ToolRegistry,
+    Harness, HarnessCheckpoint, HarnessConfig, HarnessEvent, HarnessPolicy, LlamaCppConfig,
+    LlamaCppProvider, Message, MessageRole, ModulationConfig, ModulationInput, RunOutcome,
+    ToolCall, ToolRegistry,
 };
+
+use resilience::{CircuitBreaker, ResilienceChannel};
 
 #[derive(Parser)]
 #[command(
@@ -213,6 +221,13 @@ enum Command {
             help = "Provider model name when the endpoint requires one"
         )]
         server_model: Option<String>,
+        #[arg(
+            long,
+            env = "SPINE_REASONING_EFFORT",
+            hide_env_values = true,
+            help = "Optional provider reasoning-effort value"
+        )]
+        reasoning_effort: Option<String>,
         #[arg(long, default_value = "main")]
         agent: String,
         #[arg(long, default_value = "interactive")]
@@ -282,6 +297,13 @@ enum Command {
         api_key: Option<String>,
         #[arg(long, env = "SPINE_LLM_MODEL", hide_env_values = true)]
         server_model: Option<String>,
+        #[arg(
+            long,
+            env = "SPINE_REASONING_EFFORT",
+            hide_env_values = true,
+            help = "Optional provider reasoning-effort value"
+        )]
+        reasoning_effort: Option<String>,
         #[arg(long, default_value = "main")]
         agent: String,
         #[arg(long, default_value = "harness")]
@@ -500,7 +522,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut metadata = BTreeMap::new();
                 metadata.insert("dataset".into(), "LongMemEval".into());
                 metadata.insert("session_id".into(), chunk.session_id.clone());
-                metadata.insert("date".into(), chunk.date);
+                metadata.insert("session_index".into(), chunk.session_index.to_string());
+                metadata.insert("date".into(), chunk.date.clone());
+                metadata.insert("session_time".into(), chunk.date.replace('/', "-"));
                 metadata.insert("chunk_index".into(), chunk.chunk_index.to_string());
                 metadata.insert("has_answer".into(), chunk.has_answer.to_string());
                 let source_uri = format!("longmemeval://session/{}", chunk.session_id);
@@ -562,6 +586,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             server_url,
             api_key,
             server_model,
+            reasoning_effort,
             agent,
             thread,
             max_tool_rounds,
@@ -620,6 +645,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 (created.heart, true)
             };
+            if catch_up_stale_cognition(&heart, encoder.as_ref())? {
+                eprintln!("[caught up stale cognitive projection from the canonical event log]");
+            }
+            if heart.upgrade_fact_projection()? {
+                eprintln!("[upgraded typed facts from the canonical event log]");
+            }
             let heart = Arc::new(heart);
             let heart_was_empty = heart.stats()?.events == 0;
             let agent_id = AgentId::new(agent)?;
@@ -647,6 +678,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut provider_config = LlamaCppConfig::new(server_url);
             provider_config.api_key = resolved_api_key;
             provider_config.model = server_model;
+            provider_config.reasoning_effort = reasoning_effort;
             provider_config.max_tokens = max_tokens;
             provider_config.temperature = temperature;
             provider_config.timeout = Duration::from_secs(timeout_seconds);
@@ -690,7 +722,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cognitive_config.model.dimension,
                 cognitive_config.thymos_channels,
             )?;
-            let harness = Harness::new(
+            let mut harness = Harness::new(
                 provider.clone(),
                 registry,
                 HarnessConfig {
@@ -767,15 +799,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             });
 
-            let stdin_sender = line_sender.clone();
-            thread::spawn(move || {
-                let stdin = io::stdin();
-                for line in stdin.lock().lines() {
-                    if stdin_sender.send(line).is_err() {
-                        break;
-                    }
-                }
-            });
+            terminal_input::spawn(line_sender.clone());
 
             let onboarding_state = onboarding::OnboardingState::inspect(&heart.events_canonical()?);
             let should_onboard =
@@ -818,9 +842,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 onboarding::profile_context(interaction_profile.as_ref())
             );
 
+            let restored_checkpoint =
+                discover_persisted_checkpoint(&heart.events_canonical()?, &agent_id, &thread_id);
+            let mut checkpoint = match restored_checkpoint {
+                CheckpointDiscovery::Available(resumable) => Some(resumable),
+                CheckpointDiscovery::None => None,
+                CheckpointDiscovery::Rejected(reason) => {
+                    eprintln!("[persisted checkpoint ignored: {reason}]");
+                    if let Some(web) = &web_ui {
+                        web.notice(format!("Persisted checkpoint ignored: {reason}"));
+                    }
+                    None
+                }
+            };
+            if let Some(web) = &web_ui {
+                web.set_checkpoint_available(checkpoint.is_some());
+            }
+
             if !quit_after_onboarding {
                 println!(
-                    "Spine ready: Rust heart={} events={} tools={} grounding={} (/tasks, /stop, /interrupt, /resume, /quit)",
+                    "Spine ready: Rust heart={} events={} tools={} grounding={} (/tasks, /circuit, /stop, /interrupt, /resume, /quit)",
                     path.display(),
                     heart.stats()?.events,
                     harness.registry().len(),
@@ -830,10 +871,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "disabled"
                     },
                 );
+                if checkpoint.is_some() {
+                    println!("[resumable checkpoint restored; use /resume to continue]");
+                }
             }
             let mut history = Vec::<Message>::new();
-            let mut checkpoint = None::<HarnessCheckpoint>;
             let mut completed_turns = 0_u64;
+            let mut circuit_breaker = CircuitBreaker::default();
             if !quit_after_onboarding {
                 loop {
                     print!("you> ");
@@ -850,11 +894,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if task.is_empty() {
                         continue;
                     }
+                    if matches!(task, "reset" | "reset cb" | "reset circuit breaker") {
+                        circuit_breaker.reset_all();
+                        println!("[circuit breakers reset]");
+                        if let Some(web) = &web_ui {
+                            web.complete_command("Circuit breakers reset", checkpoint.is_some());
+                        }
+                        continue;
+                    }
+                    if let Some(channel) =
+                        task.strip_prefix("/reset ").and_then(|name| {
+                            match name.trim().to_ascii_lowercase().as_str() {
+                                "llm" => Some(ResilienceChannel::Llm),
+                                "thymos" => Some(ResilienceChannel::Thymos),
+                                "dcmdb" | "memory" => Some(ResilienceChannel::Dcmdb),
+                                _ => None,
+                            }
+                        })
+                    {
+                        circuit_breaker.reset(channel);
+                        println!(
+                            "[circuit breaker reset: {}]",
+                            task.trim_start_matches("/reset ")
+                        );
+                        if let Some(web) = &web_ui {
+                            web.complete_command(
+                                format!(
+                                    "Circuit breaker reset: {}",
+                                    task.trim_start_matches("/reset ")
+                                ),
+                                checkpoint.is_some(),
+                            );
+                        }
+                        continue;
+                    }
+                    if task == "/circuit" {
+                        let summary = circuit_breaker.status_summary();
+                        println!("{summary}");
+                        if let Some(web) = &web_ui {
+                            web.complete_command(summary, checkpoint.is_some());
+                        }
+                        continue;
+                    }
                     if task == "/tasks" {
                         let tasks = running_tasks.format();
                         println!("{tasks}");
                         if let Some(web) = &web_ui {
-                            web.notice(tasks);
+                            web.complete_command(tasks, checkpoint.is_some());
                         }
                         continue;
                     }
@@ -862,7 +948,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let result = running_tasks.cancel(task_id.trim());
                         println!("{result}");
                         if let Some(web) = &web_ui {
-                            web.notice(result);
+                            web.complete_command(result, checkpoint.is_some());
                         }
                         continue;
                     }
@@ -875,31 +961,80 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         continue;
                     }
+                    if !circuit_breaker.available(ResilienceChannel::Llm, Instant::now()) {
+                        let notice = format!(
+                            "LLM circuit is open; retry after cooldown or use /reset llm ({})",
+                            circuit_breaker.status_summary()
+                        );
+                        eprintln!("[{notice}]");
+                        if let Some(web) = &web_ui {
+                            web.complete_command(notice, checkpoint.is_some());
+                        }
+                        continue;
+                    }
+                    if !circuit_breaker.available(ResilienceChannel::Dcmdb, Instant::now()) {
+                        let notice = format!(
+                            "memory circuit is open; retry after cooldown or use /reset dcmdb ({})",
+                            circuit_breaker.status_summary()
+                        );
+                        eprintln!("[{notice}]");
+                        if let Some(web) = &web_ui {
+                            web.complete_command(notice, checkpoint.is_some());
+                        }
+                        continue;
+                    }
                     if !is_resume {
                         if let Some(web) = &web_ui {
                             web.begin_turn(task);
                         }
                         status.begin("Checking memory");
-                        let recalled = if heart.stats()?.events == 0 {
-                            "[]".into()
-                        } else {
-                            cognition_tools::recall_context(&heart, encoder.as_ref(), task, 5)?
+                        let task_embedding = match encoder.encode(task) {
+                            Ok(embedding) => embedding,
+                            Err(error) => {
+                                circuit_breaker
+                                    .record_failure(ResilienceChannel::Dcmdb, Instant::now());
+                                let notice = format!(
+                                    "task embedding unavailable: {error}; turn was not sent"
+                                );
+                                eprintln!("[{notice}]");
+                                if let Some(web) = &web_ui {
+                                    web.fail(&notice);
+                                }
+                                status.end();
+                                continue;
+                            }
                         };
-                        let recalled_count =
-                            serde_json::from_str::<Vec<serde_json::Value>>(&recalled)
-                                .map_or(0, |items| items.len());
-                        let retrieval_stats = [
-                            (recalled_count as f32 / 10.0).min(1.0),
-                            if recalled_count == 0 { 1.0 } else { 0.0 },
-                            0.0,
-                            0.0,
-                        ];
-                        let task_embedding = encoder.encode(task)?;
-                        let triangle_context =
-                            cognition_tools::rehydrate_triangle_context(&heart, &task_embedding)?;
-                        let risk =
-                            heart.predict_risk(&agent_id, &task_embedding, &retrieval_stats)?;
-                        let user_commit = commit_text(
+                        let triangle_context = if circuit_breaker
+                            .allow(ResilienceChannel::Dcmdb, Instant::now())
+                        {
+                            match cognition_tools::rehydrate_triangle_context(
+                                &heart,
+                                &task_embedding,
+                            ) {
+                                Ok(context) => {
+                                    circuit_breaker.record_success(ResilienceChannel::Dcmdb);
+                                    context
+                                }
+                                Err(error) => {
+                                    circuit_breaker
+                                        .record_failure(ResilienceChannel::Dcmdb, Instant::now());
+                                    eprintln!("[triangle context unavailable: {error}]");
+                                    "[]".into()
+                                }
+                            }
+                        } else {
+                            "[]".into()
+                        };
+                        if !circuit_breaker.allow(ResilienceChannel::Dcmdb, Instant::now()) {
+                            let notice = "memory circuit opened during recall; turn was not sent";
+                            eprintln!("[{notice}]");
+                            if let Some(web) = &web_ui {
+                                web.fail(notice);
+                            }
+                            status.end();
+                            continue;
+                        }
+                        let user_commit = match commit_text(
                             &heart,
                             &encoder,
                             &agent_id,
@@ -908,16 +1043,119 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             EventKind::Message,
                             task,
                             None,
-                        )?;
-                        let feeling = heart.feel(&agent_id, &task_embedding)?.map_or_else(
-                            || "unavailable".into(),
-                            |value| {
-                                serde_json::to_string(&value)
-                                    .unwrap_or_else(|_| "unavailable".into())
-                            },
+                        ) {
+                            Ok(commit) => {
+                                circuit_breaker.record_success(ResilienceChannel::Dcmdb);
+                                commit
+                            }
+                            Err(error) => {
+                                circuit_breaker
+                                    .record_failure(ResilienceChannel::Dcmdb, Instant::now());
+                                let recovered = catch_up_stale_cognition(&heart, encoder.as_ref())
+                                    .unwrap_or(false);
+                                let notice = format!(
+                                    "memory write failed: {error}; projection_caught_up={recovered}; turn was not sent",
+                                );
+                                eprintln!("[{notice}]");
+                                if let Some(web) = &web_ui {
+                                    web.fail(&notice);
+                                }
+                                status.end();
+                                continue;
+                            }
+                        };
+                        let modulation_config = ModulationConfig::default();
+                        let preliminary_policy = modulation_config.compute(ModulationInput {
+                            surprise: user_commit.1.trajectory.surprise,
+                            valence: user_commit.1.feeling.valence,
+                            arousal: user_commit.1.feeling.arousal,
+                            risk: 0.0,
+                            tensions: 0,
+                            base_temperature: temperature,
+                            configured_tool_rounds: max_tool_rounds,
+                        });
+                        let mut automatic_recall = resilient_automatic_recall(
+                            &heart,
+                            &task_embedding,
+                            task,
+                            preliminary_policy.recall_top_k,
+                            user_commit.1.event_id,
+                            preliminary_policy.recall_expansion_depth(),
+                            &mut circuit_breaker,
                         );
+                        let risk_estimate = if circuit_breaker
+                            .allow(ResilienceChannel::Thymos, Instant::now())
+                        {
+                            match heart.predict_risk(
+                                &agent_id,
+                                &task_embedding,
+                                &automatic_recall.risk_stats(),
+                            ) {
+                                Ok(risk) if risk.is_finite() => {
+                                    circuit_breaker.record_success(ResilienceChannel::Thymos);
+                                    Some(risk)
+                                }
+                                result => {
+                                    circuit_breaker
+                                        .record_failure(ResilienceChannel::Thymos, Instant::now());
+                                    eprintln!("[host risk estimate unavailable: {result:?}]");
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        let risk = risk_estimate.unwrap_or(1.0);
+                        let risk_context = risk_estimate.map_or_else(
+                            || "unavailable; conservative high-risk policy enforced".into(),
+                            |risk| format!("{risk:.3}"),
+                        );
+                        let policy = modulation_config.compute(ModulationInput {
+                            surprise: user_commit.1.trajectory.surprise,
+                            valence: user_commit.1.feeling.valence,
+                            arousal: user_commit.1.feeling.arousal,
+                            risk,
+                            tensions: automatic_recall.tension_count(),
+                            base_temperature: temperature,
+                            configured_tool_rounds: max_tool_rounds,
+                        });
+                        if policy.recall_top_k > preliminary_policy.recall_top_k
+                            || policy.recall_expansion_depth()
+                                > preliminary_policy.recall_expansion_depth()
+                        {
+                            automatic_recall = resilient_automatic_recall(
+                                &heart,
+                                &task_embedding,
+                                task,
+                                policy.recall_top_k,
+                                user_commit.1.event_id,
+                                policy.recall_expansion_depth(),
+                                &mut circuit_breaker,
+                            );
+                        }
+                        let retrieval_stats = automatic_recall.risk_stats();
+                        let recalled = automatic_recall.context;
+                        let feeling = serde_json::to_string(&user_commit.1.feeling)
+                            .unwrap_or_else(|_| "unavailable".into());
+                        let harness_policy = HarnessPolicy {
+                            temperature: Some(policy.provider_temperature),
+                            max_action_calls: NonZeroUsize::new(policy.max_actions),
+                            max_tool_rounds: policy.max_tool_rounds,
+                        };
+                        harness.set_tool_metadata(turn_introspection_metadata(
+                            &user_commit.1,
+                            &policy,
+                            temperature,
+                            grounding.is_some(),
+                            risk_estimate,
+                        )?)?;
                         let system_prompt = format!(
-                            "{partner_system_prompt}\n\nCurrent Thymos proprioception: {feeling}\nHost risk estimate for this memory region: {risk:.3}. At higher risk, deepen recall and avoid unsupported certainty.\n\nAutomatically recalled canonical evidence for this turn (it may be irrelevant; verify before using):\n{recalled}\n\nBudgeted triangle-context rehydration:\n{triangle_context}\n\nRunning/recent host tasks:\n{}",
+                            "{partner_system_prompt}\n\nCurrent committed Thymos proprioception: {feeling}\nCommitted trajectory surprise: {:.3}. Host risk estimate for this memory region: {risk_context}. Host policy is enforced at recall_k={}, temperature={:.3}, action_budget={}, and coverage_threshold={:.3}. At higher or unavailable risk, deepen recall and avoid unsupported certainty.\n\nAutomatically recalled canonical evidence for this turn (it may be irrelevant; verify before using):\n{recalled}\n\nBudgeted triangle-context rehydration:\n{triangle_context}\n\nRunning/recent host tasks:\n{}",
+                            user_commit.1.trajectory.surprise,
+                            policy.recall_top_k,
+                            policy.provider_temperature,
+                            policy.max_actions,
+                            policy.coverage_threshold,
                             running_tasks.format()
                         );
                         let persist_start = history.len() + 2;
@@ -925,8 +1163,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             node_id: user_commit.1.node_id,
                             chronology: user_commit.0.event.body.device_sequence,
                         }];
-                        let run = Box::pin(harness.run_with_history(system_prompt, &history, task))
+                        let run = Box::pin(harness.run_with_history_policy(
+                            system_prompt,
+                            &history,
+                            task,
+                            harness_policy,
+                        ))
                             as std::pin::Pin<Box<dyn Future<Output = _>>>;
+                        assert!(
+                            circuit_breaker.allow(ResilienceChannel::Llm, Instant::now()),
+                            "an available LLM circuit accepts its pending call"
+                        );
                         status.show("Thinking");
                         let controlled = run_with_operator_controls(
                             &harness,
@@ -936,8 +1183,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         )
                         .await;
                         let outcome = match controlled.outcome {
-                            Ok(outcome) => outcome,
+                            Ok(Some(outcome)) => {
+                                circuit_breaker.record_success(ResilienceChannel::Llm);
+                                Some(outcome)
+                            }
+                            Ok(None) => {
+                                circuit_breaker
+                                    .record_cancelled(ResilienceChannel::Llm, Instant::now());
+                                None
+                            }
                             Err(error) => {
+                                circuit_breaker
+                                    .record_failure(ResilienceChannel::Llm, Instant::now());
                                 commit_control_text(
                                     &heart,
                                     &encoder,
@@ -976,16 +1233,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             continue;
                         };
-                        turn_leaves.extend(persist_harness_messages(
-                            &heart,
-                            &encoder,
-                            &agent_id,
-                            &thread_id,
-                            &outcome.messages[persist_start.min(outcome.messages.len())..],
-                        )?);
+                        if circuit_breaker.allow(ResilienceChannel::Dcmdb, Instant::now()) {
+                            match persist_harness_messages(
+                                &heart,
+                                &encoder,
+                                &agent_id,
+                                &thread_id,
+                                &outcome.messages[persist_start.min(outcome.messages.len())..],
+                            ) {
+                                Ok(leaves) => {
+                                    circuit_breaker.record_success(ResilienceChannel::Dcmdb);
+                                    turn_leaves.extend(leaves);
+                                }
+                                Err(error) => {
+                                    circuit_breaker
+                                        .record_failure(ResilienceChannel::Dcmdb, Instant::now());
+                                    let recovered =
+                                        catch_up_stale_cognition(&heart, encoder.as_ref())
+                                            .unwrap_or(false);
+                                    eprintln!(
+                                        "[turn-message persistence incomplete: {error}; projection_caught_up={recovered}]"
+                                    );
+                                }
+                            }
+                        } else {
+                            eprintln!("[turn-message persistence deferred: DCMDB circuit is open]");
+                        }
                         let mut quit_after = controlled.quit_after;
                         if let Some(gate) = &grounding
                             && !outcome.response.trim().is_empty()
+                            && !outcome.stopped_gracefully
                         {
                             status.show("Verifying answer");
                             if let Some(web) = &web_ui {
@@ -995,7 +1272,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 &recalled,
                                 &outcome.messages,
                             );
-                            let decision = gate.verify(&outcome.response, &evidence);
+                            let decision = gate.verify(
+                                &outcome.response,
+                                &evidence,
+                                policy.coverage_threshold,
+                            );
                             if let Err(error) = &decision {
                                 commit_control_text(
                                     &heart,
@@ -1011,31 +1292,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                             if let Ok(decision) = decision {
-                                let tension = (0.6 * (1.0 - decision.report.coverage)
-                                    + 0.4 * decision.report.contradiction)
-                                    .clamp(0.0, 1.0);
-                                heart.update_risk(
-                                    &agent_id,
-                                    &task_embedding,
-                                    &retrieval_stats,
-                                    tension,
-                                )?;
+                                if let Some(tension) = decision.risk_target()
+                                    && circuit_breaker
+                                        .allow(ResilienceChannel::Thymos, Instant::now())
+                                {
+                                    match heart.update_risk(
+                                        &agent_id,
+                                        &task_embedding,
+                                        &retrieval_stats,
+                                        tension,
+                                    ) {
+                                        Ok(_) => circuit_breaker
+                                            .record_success(ResilienceChannel::Thymos),
+                                        Err(error) => {
+                                            circuit_breaker.record_failure(
+                                                ResilienceChannel::Thymos,
+                                                Instant::now(),
+                                            );
+                                            eprintln!("[risk update unavailable: {error}]");
+                                        }
+                                    }
+                                }
                                 if decision.needs_repair {
                                     status.show("Repairing answer");
                                     if let Some(web) = &web_ui {
                                         web.activity("Repairing answer");
                                     }
-                                    let repair_history = outcome.messages[1..].to_vec();
-                                    let repair_start = repair_history.len() + 2;
+                                    let repair_start = outcome.messages.len() + 1;
                                     let repair_task = format!(
                                         "[HOST GROUNDING REPAIR] The draft's factual coverage was {:.3} and contradiction risk was {:.3}. Re-check the supplied evidence and tool results. Use more recall/tools if needed, correct unsupported claims, and abstain explicitly where evidence remains insufficient. Return the corrected final answer.",
                                         decision.report.coverage, decision.report.contradiction
                                     );
-                                    let repair = Box::pin(harness.run_with_history(
-                                        partner_system_prompt.clone(),
-                                        &repair_history,
-                                        repair_task,
-                                    ))
+                                    assert!(
+                                        circuit_breaker
+                                            .allow(ResilienceChannel::Llm, Instant::now()),
+                                        "a successful draft leaves the LLM circuit available for repair"
+                                    );
+                                    let repair = Box::pin(harness.repair(&outcome, repair_task))
                                         as std::pin::Pin<Box<dyn Future<Output = _>>>;
                                     let repaired = run_with_operator_controls(
                                         &harness,
@@ -1047,6 +1340,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     quit_after |= repaired.quit_after;
                                     match repaired.outcome {
                                         Ok(Some(mut repaired_outcome)) => {
+                                            circuit_breaker.record_success(ResilienceChannel::Llm);
                                             let repaired_evidence =
                                                 grounding::evidence_from_recall_and_messages(
                                                     &recalled,
@@ -1056,6 +1350,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 .verify(
                                                     &repaired_outcome.response,
                                                     &repaired_evidence,
+                                                    policy.coverage_threshold,
                                                 )
                                                 .map_or(true, |decision| decision.needs_repair);
                                             if still_unverified {
@@ -1071,17 +1366,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 ));
                                                 }
                                             }
-                                            turn_leaves.extend(persist_harness_messages(
-                                                &heart,
-                                                &encoder,
-                                                &agent_id,
-                                                &thread_id,
-                                                &repaired_outcome.messages[repair_start
-                                                    .min(repaired_outcome.messages.len())..],
-                                            )?);
+                                            if circuit_breaker
+                                                .allow(ResilienceChannel::Dcmdb, Instant::now())
+                                            {
+                                                match persist_harness_messages(
+                                                    &heart,
+                                                    &encoder,
+                                                    &agent_id,
+                                                    &thread_id,
+                                                    &repaired_outcome.messages[repair_start
+                                                        .min(repaired_outcome.messages.len())..],
+                                                ) {
+                                                    Ok(leaves) => {
+                                                        circuit_breaker.record_success(
+                                                            ResilienceChannel::Dcmdb,
+                                                        );
+                                                        turn_leaves.extend(leaves);
+                                                    }
+                                                    Err(error) => {
+                                                        circuit_breaker.record_failure(
+                                                            ResilienceChannel::Dcmdb,
+                                                            Instant::now(),
+                                                        );
+                                                        let recovered = catch_up_stale_cognition(
+                                                            &heart,
+                                                            encoder.as_ref(),
+                                                        )
+                                                        .unwrap_or(false);
+                                                        eprintln!(
+                                                            "[repair-message persistence incomplete: {error}; projection_caught_up={recovered}]"
+                                                        );
+                                                    }
+                                                }
+                                            } else {
+                                                eprintln!(
+                                                    "[repair-message persistence deferred: DCMDB circuit is open]"
+                                                );
+                                            }
                                             outcome = repaired_outcome;
                                         }
                                         Ok(None) => {
+                                            circuit_breaker.record_cancelled(
+                                                ResilienceChannel::Llm,
+                                                Instant::now(),
+                                            );
                                             commit_control_text(
                                                 &heart,
                                                 &encoder,
@@ -1096,6 +1424,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             }
                                         }
                                         Err(error) => {
+                                            circuit_breaker.record_failure(
+                                                ResilienceChannel::Llm,
+                                                Instant::now(),
+                                            );
                                             commit_control_text(
                                                 &heart,
                                                 &encoder,
@@ -1122,7 +1454,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if let Some(web) = &web_ui {
                                 web.activity("Saving context");
                             }
-                            heart.compact_context(turn_leaves, 6)?;
+                            if circuit_breaker.allow(ResilienceChannel::Dcmdb, Instant::now()) {
+                                if let Err(error) = heart.compact_context(turn_leaves, 6) {
+                                    circuit_breaker
+                                        .record_failure(ResilienceChannel::Dcmdb, Instant::now());
+                                    eprintln!("[context compaction deferred: {error}]");
+                                } else {
+                                    circuit_breaker.record_success(ResilienceChannel::Dcmdb);
+                                }
+                            } else {
+                                eprintln!("[context compaction deferred: DCMDB circuit is open]");
+                            }
                         }
                         completed_turns = completed_turns.saturating_add(1);
                         if completed_turns.is_multiple_of(10) {
@@ -1130,16 +1472,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if let Some(web) = &web_ui {
                                 web.activity("Maintaining memory");
                             }
-                            heart.maintain_cognition(4)?;
+                            if circuit_breaker.allow(ResilienceChannel::Dcmdb, Instant::now()) {
+                                if let Err(error) = heart.maintain_cognition(4) {
+                                    circuit_breaker
+                                        .record_failure(ResilienceChannel::Dcmdb, Instant::now());
+                                    eprintln!("[memory maintenance deferred: {error}]");
+                                } else {
+                                    circuit_breaker.record_success(ResilienceChannel::Dcmdb);
+                                }
+                            } else {
+                                eprintln!("[memory maintenance deferred: DCMDB circuit is open]");
+                            }
                         }
-                        checkpoint_from_outcome(
+                        if let Err(error) = checkpoint_from_outcome(
                             &heart,
-                            &encoder,
+                            encoder.as_ref(),
                             &agent_id,
                             &thread_id,
                             &outcome,
                             &mut checkpoint,
-                        )?;
+                            &mut circuit_breaker,
+                        ) {
+                            checkpoint = None;
+                            outcome.checkpoint = None;
+                            let notice = format!(
+                                "checkpoint persistence could not be confirmed: {error}; do not rely on /resume until restart"
+                            );
+                            eprintln!("[{notice}]");
+                            if let Some(web) = &web_ui {
+                                web.notice(notice);
+                            }
+                        }
                         history.push(Message::new(MessageRole::User, task));
                         status.end();
                         if let Some(web) = &web_ui {
@@ -1163,8 +1526,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     let persist_start;
                     let run = if is_resume {
-                        let resumable = checkpoint.take().expect("checkpoint exists");
+                        let resumable = match prepare_checkpoint_resume(
+                            &heart,
+                            encoder.as_ref(),
+                            &agent_id,
+                            &thread_id,
+                            &mut checkpoint,
+                            &mut circuit_breaker,
+                        ) {
+                            Ok(resumable) => resumable,
+                            Err(error) => {
+                                let notice = format!("Checkpoint resume was not started: {error}");
+                                eprintln!("[{notice}]");
+                                if let Some(web) = &web_ui {
+                                    web.complete_command(notice, checkpoint.is_some());
+                                }
+                                continue;
+                            }
+                        };
                         persist_start = resumable.messages.len() + 1;
+                        // A different turn may have replaced the host snapshot since
+                        // this checkpoint was saved. Only its effective policy is known.
+                        harness.set_tool_metadata(BTreeMap::from([(
+                            "spine_modulation".into(),
+                            serde_json::to_string(&harness.policy_for_checkpoint(&resumable))?,
+                        )]))?;
+                        assert!(
+                            circuit_breaker.allow(ResilienceChannel::Llm, Instant::now()),
+                            "an available LLM circuit accepts its pending resume"
+                        );
                         Box::pin(harness.resume(resumable))
                             as std::pin::Pin<Box<dyn Future<Output = _>>>
                     } else {
@@ -1182,8 +1572,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     )
                     .await;
                     let outcome = match controlled.outcome {
-                        Ok(outcome) => outcome,
+                        Ok(Some(outcome)) => {
+                            circuit_breaker.record_success(ResilienceChannel::Llm);
+                            Some(outcome)
+                        }
+                        Ok(None) => {
+                            circuit_breaker
+                                .record_cancelled(ResilienceChannel::Llm, Instant::now());
+                            None
+                        }
                         Err(error) => {
+                            circuit_breaker.record_failure(ResilienceChannel::Llm, Instant::now());
                             commit_control_text(
                                 &heart,
                                 &encoder,
@@ -1203,7 +1602,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             continue;
                         }
                     };
-                    let Some(outcome) = outcome else {
+                    let Some(mut outcome) = outcome else {
                         commit_control_text(
                             &heart,
                             &encoder,
@@ -1222,25 +1621,67 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         continue;
                     };
-                    let leaves = persist_harness_messages(
-                        &heart,
-                        &encoder,
-                        &agent_id,
-                        &thread_id,
-                        &outcome.messages[persist_start.min(outcome.messages.len())..],
-                    )?;
+                    let leaves = if circuit_breaker.allow(ResilienceChannel::Dcmdb, Instant::now())
+                    {
+                        match persist_harness_messages(
+                            &heart,
+                            &encoder,
+                            &agent_id,
+                            &thread_id,
+                            &outcome.messages[persist_start.min(outcome.messages.len())..],
+                        ) {
+                            Ok(leaves) => {
+                                circuit_breaker.record_success(ResilienceChannel::Dcmdb);
+                                leaves
+                            }
+                            Err(error) => {
+                                circuit_breaker
+                                    .record_failure(ResilienceChannel::Dcmdb, Instant::now());
+                                let recovered = catch_up_stale_cognition(&heart, encoder.as_ref())
+                                    .unwrap_or(false);
+                                eprintln!(
+                                    "[resumed-message persistence incomplete: {error}; projection_caught_up={recovered}]"
+                                );
+                                Vec::new()
+                            }
+                        }
+                    } else {
+                        eprintln!("[resumed-message persistence deferred: DCMDB circuit is open]");
+                        Vec::new()
+                    };
                     if !leaves.is_empty() {
                         status.show("Saving context");
-                        heart.compact_context(leaves, 6)?;
+                        if circuit_breaker.allow(ResilienceChannel::Dcmdb, Instant::now()) {
+                            if let Err(error) = heart.compact_context(leaves, 6) {
+                                circuit_breaker
+                                    .record_failure(ResilienceChannel::Dcmdb, Instant::now());
+                                eprintln!("[context compaction deferred: {error}]");
+                            } else {
+                                circuit_breaker.record_success(ResilienceChannel::Dcmdb);
+                            }
+                        } else {
+                            eprintln!("[context compaction deferred: DCMDB circuit is open]");
+                        }
                     }
-                    checkpoint_from_outcome(
+                    if let Err(error) = checkpoint_from_outcome(
                         &heart,
-                        &encoder,
+                        encoder.as_ref(),
                         &agent_id,
                         &thread_id,
                         &outcome,
                         &mut checkpoint,
-                    )?;
+                        &mut circuit_breaker,
+                    ) {
+                        checkpoint = None;
+                        outcome.checkpoint = None;
+                        let notice = format!(
+                            "checkpoint persistence could not be confirmed: {error}; do not rely on /resume until restart"
+                        );
+                        eprintln!("[{notice}]");
+                        if let Some(web) = &web_ui {
+                            web.notice(notice);
+                        }
+                    }
                     status.end();
                     if let Some(web) = &web_ui {
                         web.capture_messages(&outcome.messages);
@@ -1279,6 +1720,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             server_url,
             api_key,
             server_model,
+            reasoning_effort,
             agent,
             thread,
             max_tool_rounds,
@@ -1298,6 +1740,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 MiniLmAssets::from_directory(model_dir),
                 256,
             )?);
+            catch_up_stale_cognition(&heart, encoder.as_ref())?;
+            heart.upgrade_fact_projection()?;
             let agent_id = AgentId::new(agent)?;
             let thread_id = ThreadId::new(thread)?;
             let mut provider_config = LlamaCppConfig::new(server_url);
@@ -1307,6 +1751,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .filter(|value| !value.is_empty())
             });
             provider_config.model = server_model;
+            provider_config.reasoning_effort = reasoning_effort;
             provider_config.max_tokens = max_tokens;
             provider_config.temperature = temperature;
             provider_config.timeout = Duration::from_secs(timeout_seconds);
@@ -1347,7 +1792,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cognitive_config.model.dimension,
                 cognitive_config.thymos_channels,
             )?;
-            let harness = Harness::new(
+            let mut harness = Harness::new(
                 provider,
                 registry,
                 HarnessConfig {
@@ -1357,7 +1802,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?
             .with_agent_id(agent_id.clone());
 
-            commit_text(
+            let task_embedding = encoder.encode(&task)?;
+            let triangle_context =
+                cognition_tools::rehydrate_triangle_context(&heart, &task_embedding)?;
+            let user_commit = commit_text(
                 &heart,
                 &encoder,
                 &agent_id,
@@ -1367,7 +1815,76 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &task,
                 None,
             )?;
-            let outcome = harness.run(partner_system_prompt, &task).await?;
+            let modulation_config = ModulationConfig::default();
+            let preliminary_policy = modulation_config.compute(ModulationInput {
+                surprise: user_commit.1.trajectory.surprise,
+                valence: user_commit.1.feeling.valence,
+                arousal: user_commit.1.feeling.arousal,
+                risk: 0.0,
+                tensions: 0,
+                base_temperature: temperature,
+                configured_tool_rounds: max_tool_rounds,
+            });
+            let mut automatic_recall = cognition_tools::automatic_recall_context(
+                &heart,
+                &task_embedding,
+                &task,
+                preliminary_policy.recall_top_k,
+                user_commit.1.event_id,
+                preliminary_policy.recall_expansion_depth(),
+            )?;
+            let risk =
+                heart.predict_risk(&agent_id, &task_embedding, &automatic_recall.risk_stats())?;
+            let policy = modulation_config.compute(ModulationInput {
+                surprise: user_commit.1.trajectory.surprise,
+                valence: user_commit.1.feeling.valence,
+                arousal: user_commit.1.feeling.arousal,
+                risk,
+                tensions: automatic_recall.tension_count(),
+                base_temperature: temperature,
+                configured_tool_rounds: max_tool_rounds,
+            });
+            if policy.recall_top_k > preliminary_policy.recall_top_k
+                || policy.recall_expansion_depth() > preliminary_policy.recall_expansion_depth()
+            {
+                automatic_recall = cognition_tools::automatic_recall_context(
+                    &heart,
+                    &task_embedding,
+                    &task,
+                    policy.recall_top_k,
+                    user_commit.1.event_id,
+                    policy.recall_expansion_depth(),
+                )?;
+            }
+            harness.set_tool_metadata(turn_introspection_metadata(
+                &user_commit.1,
+                &policy,
+                temperature,
+                false,
+                Some(risk),
+            )?)?;
+            let system_prompt = format!(
+                "{partner_system_prompt}\n\nCurrent committed Thymos proprioception: {}\nCommitted trajectory surprise: {:.3}. Host risk estimate: {risk:.3}. Host policy is enforced at recall_k={}, temperature={:.3}, and action_budget={}.\n\nAutomatically recalled canonical evidence:\n{}\n\nBudgeted triangle-context rehydration:\n{triangle_context}",
+                serde_json::to_string(&user_commit.1.feeling)
+                    .unwrap_or_else(|_| "unavailable".into()),
+                user_commit.1.trajectory.surprise,
+                policy.recall_top_k,
+                policy.provider_temperature,
+                policy.max_actions,
+                automatic_recall.context,
+            );
+            let outcome = harness
+                .run_with_history_policy(
+                    system_prompt,
+                    &[],
+                    &task,
+                    HarnessPolicy {
+                        temperature: Some(policy.provider_temperature),
+                        max_action_calls: NonZeroUsize::new(policy.max_actions),
+                        max_tool_rounds: policy.max_tool_rounds,
+                    },
+                )
+                .await?;
             persist_harness_messages(
                 &heart,
                 &encoder,
@@ -2122,17 +2639,246 @@ fn finish_visible_turn(
         trim_history(history, maximum_turns, maximum_chars);
         println!("spine> {}", outcome.response);
     } else if outcome.stopped_gracefully {
-        println!("[stopped safely; use /resume to continue]");
+        if outcome.checkpoint.is_some() {
+            println!("[stopped safely; use /resume to continue]");
+        } else {
+            println!("[stopped; no confirmed resumable checkpoint]");
+        }
     }
+}
+
+const CHECKPOINT_CONSUMED_RECORD_TYPE: &str = "harness_checkpoint_consumed";
+const CHECKPOINT_CONSUMED_OUTCOME: &str = "harness_checkpoint_consumed";
+
+#[derive(Clone, Debug, PartialEq)]
+struct PersistedHarnessCheckpoint {
+    checkpoint: HarnessCheckpoint,
+    event_id: EventId,
+}
+
+#[derive(Debug, PartialEq)]
+enum CheckpointDiscovery {
+    Available(PersistedHarnessCheckpoint),
+    None,
+    Rejected(String),
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointConsumption {
+    schema: u32,
+    checkpoint_event_id: String,
+}
+
+fn discover_persisted_checkpoint(
+    events: &[SignedEvent],
+    agent_id: &AgentId,
+    thread_id: &ThreadId,
+) -> CheckpointDiscovery {
+    let mut consumed = BTreeSet::new();
+    for event in events.iter().rev() {
+        let interaction = &event.body.interaction;
+        if &interaction.agent_id != agent_id || &interaction.thread_id != thread_id {
+            continue;
+        }
+        match interaction
+            .provenance
+            .metadata
+            .get("record_type")
+            .map(String::as_str)
+        {
+            Some(CHECKPOINT_CONSUMED_RECORD_TYPE) => {
+                let checkpoint_id = match consumed_checkpoint_id(interaction) {
+                    Ok(id) => id,
+                    Err(reason) => return CheckpointDiscovery::Rejected(reason),
+                };
+                consumed.insert(checkpoint_id);
+            }
+            Some(HarnessCheckpoint::RECORD_TYPE) => {
+                if consumed.contains(&event.id) {
+                    return CheckpointDiscovery::None;
+                }
+                return match HarnessCheckpoint::from_interaction(interaction) {
+                    Ok(checkpoint) => CheckpointDiscovery::Available(PersistedHarnessCheckpoint {
+                        checkpoint,
+                        event_id: event.id,
+                    }),
+                    Err(error) => CheckpointDiscovery::Rejected(format!(
+                        "checkpoint {} failed validation: {error}",
+                        event.id
+                    )),
+                };
+            }
+            _ => {}
+        }
+    }
+    CheckpointDiscovery::None
+}
+
+fn consumed_checkpoint_id(interaction: &InteractionInput) -> Result<EventId, String> {
+    if interaction.role != ParticipantRole::Operator
+        || interaction.kind != EventKind::Control
+        || interaction.outcome.as_deref() != Some(CHECKPOINT_CONSUMED_OUTCOME)
+        || interaction.tool.is_some()
+        || !interaction.attachments.is_empty()
+    {
+        return Err("checkpoint consumption record has an invalid envelope".into());
+    }
+    let metadata_id = interaction
+        .provenance
+        .metadata
+        .get("checkpoint_event_id")
+        .ok_or_else(|| "checkpoint consumption record is missing its event id".to_owned())?;
+    let Content::Inline(content) = &interaction.content else {
+        return Err("checkpoint consumption record is not inline JSON".into());
+    };
+    let record: CheckpointConsumption = serde_json::from_str(content)
+        .map_err(|error| format!("invalid checkpoint consumption JSON: {error}"))?;
+    if record.schema != 1 || record.checkpoint_event_id != *metadata_id {
+        return Err("checkpoint consumption metadata does not match its payload".into());
+    }
+    metadata_id
+        .parse()
+        .map_err(|_| "checkpoint consumption event id is invalid".into())
+}
+
+fn checkpoint_consumption_interaction(
+    resumable: &PersistedHarnessCheckpoint,
+    agent_id: AgentId,
+    thread_id: ThreadId,
+) -> spine_runtime::Result<InteractionInput> {
+    let checkpoint_event_id = resumable.event_id.to_string();
+    let record = CheckpointConsumption {
+        schema: 1,
+        checkpoint_event_id: checkpoint_event_id.clone(),
+    };
+    let mut metadata = BTreeMap::new();
+    metadata.insert("record_type".into(), CHECKPOINT_CONSUMED_RECORD_TYPE.into());
+    metadata.insert("checkpoint_event_id".into(), checkpoint_event_id);
+    Ok(InteractionInput {
+        agent_id,
+        thread_id,
+        role: ParticipantRole::Operator,
+        kind: EventKind::Control,
+        content: Content::Inline(serde_json::to_string(&record)?),
+        causal_parents: Vec::new(),
+        provenance: Provenance {
+            metadata,
+            ..Provenance::default()
+        },
+        tool: None,
+        attachments: Vec::new(),
+        outcome: Some(CHECKPOINT_CONSUMED_OUTCOME.into()),
+    })
+}
+
+fn mark_checkpoint_consumed(
+    heart: &SpineHeart,
+    encoder: &dyn SemanticEncoder,
+    agent_id: &AgentId,
+    thread_id: &ThreadId,
+    resumable: &PersistedHarnessCheckpoint,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let interaction =
+        checkpoint_consumption_interaction(resumable, agent_id.clone(), thread_id.clone())?;
+    let Content::Inline(text) = &interaction.content else {
+        unreachable!("checkpoint consumption records are always inline")
+    };
+    let embedding = encoder.encode(text)?;
+    heart.commit_embedded(interaction, embedding)?;
+    Ok(())
+}
+
+/// Consume the exact persisted checkpoint before any resumed work can start.
+/// A failed projection write may already have committed its canonical marker.
+fn prepare_checkpoint_resume(
+    heart: &SpineHeart,
+    encoder: &dyn SemanticEncoder,
+    agent_id: &AgentId,
+    thread_id: &ThreadId,
+    checkpoint: &mut Option<PersistedHarnessCheckpoint>,
+    circuit_breaker: &mut CircuitBreaker,
+) -> Result<HarnessCheckpoint, String> {
+    let resumable = checkpoint.take().ok_or("no resumable checkpoint")?;
+    if !circuit_breaker.allow(ResilienceChannel::Dcmdb, Instant::now()) {
+        *checkpoint = Some(resumable);
+        return Err("memory circuit is open; checkpoint remains available after recovery".into());
+    }
+    match mark_checkpoint_consumed(heart, encoder, agent_id, thread_id, &resumable) {
+        Ok(()) => {
+            circuit_breaker.record_success(ResilienceChannel::Dcmdb);
+            Ok(resumable.checkpoint)
+        }
+        Err(error) => {
+            circuit_breaker.record_failure(ResilienceChannel::Dcmdb, Instant::now());
+            let recovery = catch_up_stale_cognition(heart, encoder);
+            if let Err(recovery_error) = &recovery {
+                circuit_breaker.record_failure(ResilienceChannel::Dcmdb, Instant::now());
+                eprintln!("[checkpoint projection recovery unavailable: {recovery_error}]");
+            }
+            let consumed = heart
+                .events_canonical()
+                .map_err(|error| error.to_string())
+                .and_then(|events| {
+                    exact_checkpoint_consumed(&events, agent_id, thread_id, resumable.event_id)
+                });
+            match consumed {
+                Ok(true) => {
+                    if recovery.is_ok() {
+                        circuit_breaker.record_success(ResilienceChannel::Dcmdb);
+                    }
+                    eprintln!(
+                        "[checkpoint consumption confirmed in canonical events after write error; resuming once]"
+                    );
+                    Ok(resumable.checkpoint)
+                }
+                Ok(false) => {
+                    *checkpoint = Some(resumable);
+                    Err(format!(
+                        "{error}; no consumption marker was committed; checkpoint remains available"
+                    ))
+                }
+                Err(canonical_error) => Err(format!(
+                    "{error}; checkpoint consumption is indeterminate ({canonical_error}); local resume disabled"
+                )),
+            }
+        }
+    }
+}
+
+fn exact_checkpoint_consumed(
+    events: &[SignedEvent],
+    agent_id: &AgentId,
+    thread_id: &ThreadId,
+    checkpoint_id: EventId,
+) -> Result<bool, String> {
+    let mut consumed = false;
+    for event in events {
+        let interaction = &event.body.interaction;
+        if &interaction.agent_id == agent_id
+            && &interaction.thread_id == thread_id
+            && interaction
+                .provenance
+                .metadata
+                .get("record_type")
+                .map(String::as_str)
+                == Some(CHECKPOINT_CONSUMED_RECORD_TYPE)
+        {
+            // Validate every candidate: a malformed record makes absence uncertain.
+            consumed |= consumed_checkpoint_id(interaction)? == checkpoint_id;
+        }
+    }
+    Ok(consumed)
 }
 
 fn checkpoint_from_outcome(
     heart: &SpineHeart,
-    encoder: &MiniLmEncoder,
+    encoder: &dyn SemanticEncoder,
     agent_id: &AgentId,
     thread_id: &ThreadId,
     outcome: &RunOutcome,
-    checkpoint: &mut Option<HarnessCheckpoint>,
+    checkpoint: &mut Option<PersistedHarnessCheckpoint>,
+    circuit_breaker: &mut CircuitBreaker,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(resumable) = outcome.checkpoint.clone() {
         let interaction = resumable.to_interaction(agent_id.clone(), thread_id.clone())?;
@@ -2140,8 +2886,25 @@ fn checkpoint_from_outcome(
             Content::Inline(text) => text.clone(),
             Content::ColdBlob(_) | Content::Redacted => String::new(),
         };
-        heart.commit_embedded(interaction, encoder.encode(&text)?)?;
-        *checkpoint = Some(resumable);
+        if !circuit_breaker.allow(ResilienceChannel::Dcmdb, Instant::now()) {
+            return Err("checkpoint was not saved: DCMDB circuit is open".into());
+        }
+        let commit = (|| -> Result<EventId, Box<dyn std::error::Error>> {
+            let (receipt, _) = heart.commit_embedded(interaction, encoder.encode(&text)?)?;
+            Ok(receipt.event.id)
+        })();
+        let event_id = match commit {
+            Ok(id) => id,
+            Err(error) => {
+                circuit_breaker.record_failure(ResilienceChannel::Dcmdb, Instant::now());
+                return Err(error);
+            }
+        };
+        circuit_breaker.record_success(ResilienceChannel::Dcmdb);
+        *checkpoint = Some(PersistedHarnessCheckpoint {
+            checkpoint: resumable,
+            event_id,
+        });
     }
     Ok(())
 }
@@ -2154,22 +2917,115 @@ fn commit_control_text(
     text: &str,
     outcome: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    heart.commit_embedded(
-        InteractionInput {
-            agent_id: agent_id.clone(),
-            thread_id: thread_id.clone(),
-            role: ParticipantRole::Operator,
-            kind: EventKind::Control,
-            content: Content::Inline(text.to_owned()),
-            causal_parents: Vec::new(),
-            provenance: Provenance::default(),
-            tool: None,
-            attachments: Vec::new(),
-            outcome: Some(outcome.into()),
-        },
-        encoder.encode(text)?,
-    )?;
+    let commit = (|| -> Result<(), Box<dyn std::error::Error>> {
+        heart.commit_embedded(
+            InteractionInput {
+                agent_id: agent_id.clone(),
+                thread_id: thread_id.clone(),
+                role: ParticipantRole::Operator,
+                kind: EventKind::Control,
+                content: Content::Inline(text.to_owned()),
+                causal_parents: Vec::new(),
+                provenance: Provenance::default(),
+                tool: None,
+                attachments: Vec::new(),
+                outcome: Some(outcome.into()),
+            },
+            encoder.encode(text)?,
+        )?;
+        Ok(())
+    })();
+    if let Err(error) = commit {
+        let recovered = catch_up_stale_cognition(heart, encoder).unwrap_or(false);
+        eprintln!(
+            "[control-event persistence unavailable: {error}; projection_caught_up={recovered}]"
+        );
+    }
     Ok(())
+}
+
+fn resilient_automatic_recall(
+    heart: &SpineHeart,
+    query: &Embedding,
+    task: &str,
+    top_k: usize,
+    excluded_event: EventId,
+    expansion_depth: usize,
+    circuit_breaker: &mut CircuitBreaker,
+) -> cognition_tools::AutomaticRecall {
+    if circuit_breaker.allow(ResilienceChannel::Dcmdb, Instant::now()) {
+        match cognition_tools::automatic_recall_context(
+            heart,
+            query,
+            task,
+            top_k,
+            excluded_event,
+            expansion_depth,
+        ) {
+            Ok(recall) => {
+                circuit_breaker.record_success(ResilienceChannel::Dcmdb);
+                return recall;
+            }
+            Err(error) => {
+                circuit_breaker.record_failure(ResilienceChannel::Dcmdb, Instant::now());
+                eprintln!("[memory recall unavailable: {error}]");
+            }
+        }
+    } else {
+        eprintln!("[memory recall skipped: DCMDB circuit is open]");
+    }
+    let layout = heart
+        .cognition()
+        .ok()
+        .flatten()
+        .map_or(6, |state| state.config.retrieval_stat_dimensions);
+    cognition_tools::AutomaticRecall::empty_for_layout(layout)
+}
+
+fn turn_introspection_metadata(
+    receipt: &spine_heart::MemoryReceipt,
+    policy: &spine_runtime::HostModulation,
+    base_temperature: f32,
+    nli_enabled: bool,
+    risk_estimate: Option<f32>,
+) -> Result<BTreeMap<String, String>, serde_json::Error> {
+    let mut modulation = serde_json::to_value(policy)?;
+    modulation["reason_temp_modifier"] =
+        serde_json::json!((base_temperature - policy.provider_temperature).max(0.0));
+    Ok(BTreeMap::from([
+        (
+            "spine_trajectory".into(),
+            serde_json::to_string(&receipt.trajectory)?,
+        ),
+        (
+            "spine_modulation".into(),
+            serde_json::to_string(&modulation)?,
+        ),
+        (
+            "spine_risk_policy".into(),
+            serde_json::json!({
+                "risk_estimate": risk_estimate,
+                "available": risk_estimate.is_some(),
+                "effective_risk": policy.risk,
+                "coverage_threshold": policy.coverage_threshold,
+                "expansion_probability": policy.expansion_probability,
+                "nli_enabled": nli_enabled,
+                "risk_enabled": true,
+            })
+            .to_string(),
+        ),
+    ]))
+}
+
+fn catch_up_stale_cognition(
+    heart: &SpineHeart,
+    encoder: &dyn SemanticEncoder,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    if heart.cognition_is_current()? {
+        return Ok(false);
+    }
+    heart.catch_up_cognition(encoder)?;
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2183,6 +3039,14 @@ fn commit_text(
     text: &str,
     tool: Option<ToolExchange>,
 ) -> Result<(spine_heart::CommitReceipt, spine_heart::MemoryReceipt), Box<dyn std::error::Error>> {
+    let embedding = encoder.encode(text)?;
+    let mut metadata = BTreeMap::new();
+    if role == ParticipantRole::User {
+        metadata.insert(
+            "thymos_learning_multiplier".into(),
+            cognition_tools::reflection_multiplier(heart, agent_id, &embedding)?.to_string(),
+        );
+    }
     Ok(heart.commit_embedded(
         InteractionInput {
             agent_id: agent_id.clone(),
@@ -2193,13 +3057,14 @@ fn commit_text(
             causal_parents: Vec::new(),
             provenance: Provenance {
                 provider: Some("llama.cpp".into()),
+                metadata,
                 ..Provenance::default()
             },
             tool,
             attachments: Vec::new(),
             outcome: None,
         },
-        encoder.encode(text)?,
+        embedding,
     )?)
 }
 
@@ -2294,8 +3159,331 @@ fn persist_harness_messages(
 mod cli_tests {
     use super::*;
 
+    #[test]
+    fn host_introspection_exposes_committed_signals_and_honest_unknown_risk() {
+        let receipt = spine_heart::MemoryReceipt {
+            event_id: EventId::from_bytes([1; 32]),
+            node_id: spine_heart::NodeId::from_bytes([2; 32]),
+            feeling: spine_heart::FeelingVector {
+                raw: vec![0.0; 2],
+                activated: vec![0.0; 2],
+                valence: 0.0,
+                arousal: 0.0,
+                dominant_channel: 0,
+                dominant_label: None,
+                input_norm: 1.0,
+            },
+            trajectory: spine_heart::TrajectoryStep {
+                surprise: 1.2,
+                speed: 0.4,
+                heading_norm: 0.8,
+            },
+        };
+        let policy = ModulationConfig::default().compute(ModulationInput {
+            surprise: receipt.trajectory.surprise,
+            valence: 0.0,
+            arousal: 0.0,
+            risk: 1.0,
+            tensions: 0,
+            base_temperature: 0.7,
+            configured_tool_rounds: None,
+        });
+        let values = turn_introspection_metadata(&receipt, &policy, 0.7, true, None).unwrap();
+        let trajectory: serde_json::Value =
+            serde_json::from_str(&values["spine_trajectory"]).unwrap();
+        let modulation: serde_json::Value =
+            serde_json::from_str(&values["spine_modulation"]).unwrap();
+        let risk: serde_json::Value = serde_json::from_str(&values["spine_risk_policy"]).unwrap();
+        assert!(
+            (trajectory["surprise"].as_f64().unwrap() - f64::from(receipt.trajectory.surprise))
+                .abs()
+                < 1e-6
+        );
+        assert_eq!(modulation["max_actions"], 1);
+        assert!(modulation["max_tool_rounds"].is_null());
+        assert_eq!(risk["available"], false);
+        assert!(risk["risk_estimate"].is_null());
+        assert_eq!(risk["effective_risk"], 1.0);
+        assert_eq!(risk["nli_enabled"], true);
+    }
+
+    fn checkpoint(harness_id: &str, task: &str) -> HarnessCheckpoint {
+        HarnessCheckpoint {
+            schema: 1,
+            harness_id: harness_id.into(),
+            messages: vec![
+                Message::new(MessageRole::System, "system"),
+                Message::new(MessageRole::User, task),
+                Message::new(MessageRole::Assistant, "paused safely"),
+            ],
+            completed_tool_calls: 0,
+            completed_tool_rounds: 0,
+            pending_task: task.into(),
+            host_plan: None,
+            completed_action_calls: 0,
+            policy: Some(spine_runtime::HarnessPolicy::default()),
+        }
+    }
+
+    fn test_event(seed: u8, interaction: InteractionInput) -> SignedEvent {
+        SignedEvent {
+            id: EventId::from_bytes([seed; 32]),
+            body: spine_heart::EventBody {
+                schema: 1,
+                device_id: spine_heart::DeviceId::from_bytes([9; 32]),
+                authorization_epoch: 0,
+                device_sequence: u64::from(seed),
+                timestamp: spine_heart::HybridTimestamp {
+                    wall_millis: u64::from(seed),
+                    counter: 0,
+                },
+                interaction,
+            },
+            signer_public_key: [0; 32],
+            signature: Vec::new(),
+        }
+    }
+
+    fn ids() -> (AgentId, ThreadId) {
+        (
+            AgentId::new("main").unwrap(),
+            ThreadId::new("interactive").unwrap(),
+        )
+    }
+
+    fn ordinary_interaction(
+        agent_id: AgentId,
+        thread_id: ThreadId,
+        text: &str,
+    ) -> InteractionInput {
+        InteractionInput {
+            agent_id,
+            thread_id,
+            role: ParticipantRole::User,
+            kind: EventKind::Message,
+            content: Content::Inline(text.into()),
+            causal_parents: Vec::new(),
+            provenance: Provenance::default(),
+            tool: None,
+            attachments: Vec::new(),
+            outcome: None,
+        }
+    }
+
     fn incognito_args(flag: &str) -> Vec<&str> {
         vec!["spine", "chat", flag, "--model-dir", "models"]
+    }
+
+    #[test]
+    fn persisted_checkpoint_is_discovered_after_heart_reopen() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("checkpoint.spine");
+        let (agent_id, thread_id) = ids();
+        let created = SpineHeart::create(HeartConfig::new(&path), "secret").unwrap();
+        let checkpoint = checkpoint("harness-restart", "inspect the repository");
+        let receipt = created
+            .heart
+            .commit_interaction(
+                checkpoint
+                    .to_interaction(agent_id.clone(), thread_id.clone())
+                    .unwrap(),
+            )
+            .unwrap();
+        drop(created.heart);
+
+        let reopened = SpineHeart::open(
+            HeartConfig::new(path),
+            KeySource::Passphrase("secret".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            discover_persisted_checkpoint(
+                &reopened.events_canonical().unwrap(),
+                &agent_id,
+                &thread_id,
+            ),
+            CheckpointDiscovery::Available(PersistedHarnessCheckpoint {
+                checkpoint,
+                event_id: receipt.event.id,
+            })
+        );
+    }
+
+    #[test]
+    fn consumed_checkpoint_stays_unavailable_after_heart_reopen() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("consumed-checkpoint.spine");
+        let (agent_id, thread_id) = ids();
+        let created = SpineHeart::create(HeartConfig::new(&path), "secret").unwrap();
+        let checkpoint = checkpoint("harness-restart", "inspect the repository");
+        let receipt = created
+            .heart
+            .commit_interaction(
+                checkpoint
+                    .to_interaction(agent_id.clone(), thread_id.clone())
+                    .unwrap(),
+            )
+            .unwrap();
+        let persisted = PersistedHarnessCheckpoint {
+            checkpoint,
+            event_id: receipt.event.id,
+        };
+        created
+            .heart
+            .commit_interaction(
+                checkpoint_consumption_interaction(&persisted, agent_id.clone(), thread_id.clone())
+                    .unwrap(),
+            )
+            .unwrap();
+        drop(created.heart);
+
+        let reopened = SpineHeart::open(
+            HeartConfig::new(path),
+            KeySource::Passphrase("secret".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            discover_persisted_checkpoint(
+                &reopened.events_canonical().unwrap(),
+                &agent_id,
+                &thread_id,
+            ),
+            CheckpointDiscovery::None
+        );
+    }
+
+    #[test]
+    fn consumed_checkpoint_is_stale_but_a_newer_checkpoint_is_available() {
+        let (agent_id, thread_id) = ids();
+        let first = checkpoint("harness-one", "first task");
+        let first_event = test_event(
+            1,
+            first
+                .to_interaction(agent_id.clone(), thread_id.clone())
+                .unwrap(),
+        );
+        let persisted = PersistedHarnessCheckpoint {
+            checkpoint: first,
+            event_id: first_event.id,
+        };
+        let consumed = test_event(
+            2,
+            checkpoint_consumption_interaction(&persisted, agent_id.clone(), thread_id.clone())
+                .unwrap(),
+        );
+        assert_eq!(
+            discover_persisted_checkpoint(
+                &[first_event.clone(), consumed.clone()],
+                &agent_id,
+                &thread_id,
+            ),
+            CheckpointDiscovery::None
+        );
+
+        let second = checkpoint("harness-one", "second task");
+        let second_event = test_event(
+            3,
+            second
+                .to_interaction(agent_id.clone(), thread_id.clone())
+                .unwrap(),
+        );
+        assert_eq!(
+            discover_persisted_checkpoint(
+                &[first_event, consumed, second_event.clone()],
+                &agent_id,
+                &thread_id,
+            ),
+            CheckpointDiscovery::Available(PersistedHarnessCheckpoint {
+                checkpoint: second,
+                event_id: second_event.id,
+            })
+        );
+    }
+
+    #[test]
+    fn normal_later_events_do_not_invalidate_an_open_checkpoint() {
+        let (agent_id, thread_id) = ids();
+        let checkpoint = checkpoint("harness-open", "paused task");
+        let checkpoint_event = test_event(
+            1,
+            checkpoint
+                .to_interaction(agent_id.clone(), thread_id.clone())
+                .unwrap(),
+        );
+        let later = test_event(
+            2,
+            ordinary_interaction(agent_id.clone(), thread_id.clone(), "unrelated later turn"),
+        );
+        assert_eq!(
+            discover_persisted_checkpoint(
+                &[checkpoint_event.clone(), later],
+                &agent_id,
+                &thread_id,
+            ),
+            CheckpointDiscovery::Available(PersistedHarnessCheckpoint {
+                checkpoint,
+                event_id: checkpoint_event.id,
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_newest_checkpoint_and_consumption_records_fail_closed() {
+        let (agent_id, thread_id) = ids();
+        let valid = checkpoint("harness-valid", "valid task");
+        let valid_event = test_event(
+            1,
+            valid
+                .to_interaction(agent_id.clone(), thread_id.clone())
+                .unwrap(),
+        );
+        let mut malformed_checkpoint = checkpoint("harness-malformed", "new task")
+            .to_interaction(agent_id.clone(), thread_id.clone())
+            .unwrap();
+        malformed_checkpoint.content = Content::Inline("{not-json".into());
+        assert!(matches!(
+            discover_persisted_checkpoint(
+                &[valid_event.clone(), test_event(2, malformed_checkpoint)],
+                &agent_id,
+                &thread_id,
+            ),
+            CheckpointDiscovery::Rejected(_)
+        ));
+
+        let persisted = PersistedHarnessCheckpoint {
+            checkpoint: valid,
+            event_id: valid_event.id,
+        };
+        let mut malformed_consumption =
+            checkpoint_consumption_interaction(&persisted, agent_id.clone(), thread_id.clone())
+                .unwrap();
+        malformed_consumption.content = Content::Inline("{}".into());
+        assert!(matches!(
+            discover_persisted_checkpoint(
+                &[valid_event, test_event(3, malformed_consumption)],
+                &agent_id,
+                &thread_id,
+            ),
+            CheckpointDiscovery::Rejected(_)
+        ));
+    }
+
+    #[test]
+    fn checkpoint_discovery_is_scoped_to_the_selected_agent_and_thread() {
+        let (agent_id, thread_id) = ids();
+        let event = test_event(
+            1,
+            checkpoint("other", "other task")
+                .to_interaction(
+                    AgentId::new("other-agent").unwrap(),
+                    ThreadId::new("other-thread").unwrap(),
+                )
+                .unwrap(),
+        );
+        assert_eq!(
+            discover_persisted_checkpoint(&[event], &agent_id, &thread_id),
+            CheckpointDiscovery::None
+        );
     }
 
     #[test]
@@ -2344,6 +3532,26 @@ mod cli_tests {
             cli.command,
             Command::Chat {
                 skip_onboarding: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn provider_reasoning_effort_is_optional_and_configurable() {
+        let cli = Cli::try_parse_from(["spine", "chat", "--reasoning-effort", "high"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Chat {
+                reasoning_effort: Some(value),
+                ..
+            } if value == "high"
+        ));
+        let cli = Cli::try_parse_from(["spine", "chat"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Chat {
+                reasoning_effort: None,
                 ..
             }
         ));

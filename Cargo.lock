@@ -2458,6 +2458,7 @@ dependencies = [
  "rpassword",
  "serde",
  "serde_json",
+ "sha2",
  "spine-heart",
  "spine-models",
  "spine-runtime",
