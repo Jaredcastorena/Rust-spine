@@ -179,7 +179,7 @@ impl SpineHeart {
         let previous = self.current_cognition()?;
         match previous.schema {
             CognitiveState::CURRENT_SCHEMA => return Ok(false),
-            1 => {}
+            1 | 2 => {}
             found => {
                 return Err(HeartError::UnsupportedSchema {
                     found,
@@ -834,7 +834,7 @@ mod fact_upgrade_tests {
         .unwrap();
         assert!(reopened.upgrade_fact_projection().unwrap());
         let upgraded = reopened.cognition().unwrap().unwrap();
-        assert_eq!(upgraded.schema, 2);
+        assert_eq!(upgraded.schema, 3);
         let facts: Vec<_> = upgraded.facts.facts().collect();
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].event_id, commit.event.id);
@@ -842,7 +842,7 @@ mod fact_upgrade_tests {
         assert_eq!(facts[0].value, FactValue::Integer(3));
         assert_eq!(facts[0].event_time.as_deref(), Some("2025-02-03"));
         let mut expected = legacy;
-        expected.schema = 2;
+        expected.schema = 3;
         expected.facts = upgraded.facts.clone();
         assert_eq!(
             upgraded, expected,
@@ -906,6 +906,75 @@ mod fact_upgrade_tests {
             Err(HeartError::ProjectionStale)
         ));
         assert_eq!(heart.cognition().unwrap().unwrap(), concurrent);
+    }
+
+    #[test]
+    fn document_first_person_claims_are_excluded_and_removed_by_fact_backfill() {
+        let temp = tempfile::tempdir().unwrap();
+        let heart = heart(&temp.path().join("document-facts.spine"));
+        let vector = Embedding::normalized(vec![1.0, 0.0, 0.0], 3).unwrap();
+        let (user, _) = heart
+            .commit_embedded(input("I attended 2 weddings."), vector.clone())
+            .unwrap();
+        let mut documents = Vec::new();
+        for provider_marker in [true, false] {
+            let text = "[user]: I attended 99 weddings.";
+            let mut document = input(text);
+            if provider_marker {
+                document.provenance.provider = Some("spine-document-ingest".into());
+            } else {
+                document
+                    .provenance
+                    .metadata
+                    .insert("record_schema".into(), "spine-document-chunk".into());
+            }
+            document.provenance.source_uri = Some(format!("file://document-{provider_marker}.md"));
+            documents.push(heart.commit_embedded(document, vector.clone()).unwrap());
+        }
+        let mut legacy = heart.cognition().unwrap().unwrap();
+        assert_eq!(legacy.facts.facts().count(), 1);
+        assert_eq!(legacy.facts.facts().next().unwrap().event_id, user.event.id);
+        assert_eq!(
+            heart.events_canonical().unwrap().len(),
+            3,
+            "documents remain in canonical memory"
+        );
+        legacy.schema = 2;
+        let extractor = crate::FactExtractor::new().unwrap();
+        for (commit, memory) in &documents {
+            legacy.facts.add_candidates(
+                commit.event.id,
+                memory.node_id,
+                extractor.extract(
+                    CognitiveState::inline_text(&commit.event).unwrap(),
+                    None,
+                    None,
+                    1,
+                    [0, 1],
+                ),
+            );
+        }
+        assert_eq!(legacy.facts.facts().count(), 3);
+        heart.store.put_projection(1, &legacy).unwrap();
+        assert!(heart.upgrade_fact_projection().unwrap());
+        let upgraded = heart.cognition().unwrap().unwrap();
+        assert_eq!(upgraded.facts.facts().count(), 1);
+        assert_eq!(
+            upgraded.facts.facts().next().unwrap().event_id,
+            user.event.id
+        );
+        assert_eq!(
+            upgraded
+                .facts
+                .aggregate("attended.weddings", "count")
+                .unwrap(),
+            crate::FactAggregation::Count(2)
+        );
+        let mut expected = legacy;
+        expected.schema = 3;
+        expected.facts = upgraded.facts.clone();
+        assert_eq!(upgraded, expected);
+        assert!(!heart.upgrade_fact_projection().unwrap());
     }
 }
 

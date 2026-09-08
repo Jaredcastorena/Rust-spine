@@ -929,9 +929,9 @@ async fn ingestion_and_cognition_tools_round_trip_real_heart_state() {
             .expect("stats JSON")
             .get("events")
             .and_then(Value::as_u64),
-        Some(4)
+        Some(5)
     );
-    assert_eq!(fixture.heart.stats().expect("heart stats").events, 4);
+    assert_eq!(fixture.heart.stats().expect("heart stats").events, 5);
 
     let maintained = execute(
         &fixture.registry,

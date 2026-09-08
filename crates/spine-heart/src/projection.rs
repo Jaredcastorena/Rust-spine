@@ -62,7 +62,7 @@ pub struct MemoryReceipt {
 }
 
 impl CognitiveState {
-    pub(crate) const CURRENT_SCHEMA: u32 = 2;
+    pub(crate) const CURRENT_SCHEMA: u32 = 3;
 
     pub fn upgrade_risk_layout(&mut self) -> Result<bool> {
         let changed = self.risk.upgrade_retrieval_layout(
@@ -279,7 +279,15 @@ impl CognitiveState {
 
 fn extract_event_facts(event: &SignedEvent) -> Result<Vec<FactCandidate>> {
     let interaction = &event.body.interaction;
-    if interaction.role != ParticipantRole::User {
+    if interaction.role != ParticipantRole::User
+        || interaction.provenance.provider.as_deref() == Some("spine-document-ingest")
+        || interaction
+            .provenance
+            .metadata
+            .get("record_schema")
+            .map(String::as_str)
+            == Some("spine-document-chunk")
+    {
         return Ok(Vec::new());
     }
     let Some(text) = CognitiveState::inline_text(event) else {
