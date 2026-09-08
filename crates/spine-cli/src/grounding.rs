@@ -129,6 +129,8 @@ mod tests {
             checkpoint: None,
             completed_tool_calls: 0,
             completed_tool_rounds: 0,
+            completed_action_calls: 0,
+            policy: spine_runtime::HarnessPolicy::default(),
             usage: spine_runtime::TokenUsage::default(),
             messages: vec![spine_runtime::Message::new(
                 spine_runtime::MessageRole::Assistant,

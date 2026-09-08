@@ -291,6 +291,95 @@ async fn explicit_unlimited_policy_overrides_configured_ceiling() {
 }
 
 #[tokio::test]
+async fn repair_keeps_action_budget_and_checkpoint_counters_from_the_draft() {
+    let executed = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        tool_turn(vec![action_call(1)]),
+        answer("draft"),
+        tool_turn(vec![action_call(2)]),
+        answer("paused repair"),
+    ]));
+    let mut registry = ToolRegistry::default();
+    registry
+        .register(ActionProbe {
+            executed: Arc::clone(&executed),
+        })
+        .unwrap();
+    let harness = Harness::new(provider.clone(), registry, HarnessConfig::default()).unwrap();
+    let policy = HarnessPolicy {
+        temperature: Some(0.45),
+        max_action_calls: NonZeroUsize::new(1),
+        max_tool_rounds: None,
+    };
+    let draft = harness
+        .run_with_history_policy("system with recalled evidence", &[], "act", policy)
+        .await
+        .unwrap();
+    harness.controls().request_graceful_stop();
+    let repaired = harness.repair(&draft, "verify the draft").await.unwrap();
+    assert_eq!(&*executed.lock().unwrap(), &["1"]);
+    assert_eq!(repaired.completed_action_calls, 1);
+    assert_eq!(repaired.completed_tool_calls, 1);
+    assert_eq!(repaired.completed_tool_rounds, 2);
+    assert_eq!(repaired.policy, policy);
+    let checkpoint = repaired.checkpoint.as_ref().unwrap();
+    assert_eq!(checkpoint.completed_action_calls, 1);
+    assert_eq!(checkpoint.completed_tool_calls, 1);
+    assert_eq!(checkpoint.completed_tool_rounds, 2);
+    assert_eq!(checkpoint.policy, policy);
+    checkpoint.validate().unwrap();
+    let count = {
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests[2].messages[0], draft.messages[0]);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.temperature == Some(0.45))
+        );
+        requests.len()
+    };
+    assert!(harness.repair(&repaired, "ignore the stop").await.is_err());
+    assert_eq!(provider.requests.lock().unwrap().len(), count);
+}
+
+#[tokio::test]
+async fn repair_retains_the_total_round_ceiling_and_explicit_unlimited_policy() {
+    for ceiling in [NonZeroU64::new(1), None] {
+        let executed = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            tool_turn(vec![call(1)]),
+            answer("draft"),
+            tool_turn(vec![call(2)]),
+            answer("repaired"),
+        ]));
+        let harness = Harness::new(
+            provider,
+            registry(Arc::clone(&executed)),
+            HarnessConfig {
+                max_tool_rounds: NonZeroU64::new(1),
+                ..HarnessConfig::default()
+            },
+        )
+        .unwrap();
+        let policy = HarnessPolicy {
+            max_tool_rounds: ceiling,
+            ..HarnessPolicy::default()
+        };
+        let draft = harness
+            .run_with_history_policy("system", &[], "inspect", policy)
+            .await
+            .unwrap();
+        let repaired = harness.repair(&draft, "verify").await.unwrap();
+        let expected = if ceiling.is_some() { 1 } else { 2 };
+        assert_eq!(repaired.completed_tool_calls, expected);
+        assert_eq!(repaired.completed_tool_rounds, expected);
+        assert_eq!(executed.lock().unwrap().len(), expected as usize);
+        assert_eq!(repaired.policy, policy);
+        assert!(repaired.checkpoint.is_none());
+    }
+}
+
+#[tokio::test]
 async fn exhausted_checkpoint_action_budget_still_honors_stop_and_policy() {
     let executed = Arc::new(Mutex::new(Vec::new()));
     let provider = Arc::new(ScriptedProvider::new(vec![

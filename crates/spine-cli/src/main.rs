@@ -1255,6 +1255,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let mut quit_after = controlled.quit_after;
                         if let Some(gate) = &grounding
                             && !outcome.response.trim().is_empty()
+                            && !outcome.stopped_gracefully
                         {
                             status.show("Verifying answer");
                             if let Some(web) = &web_ui {
@@ -1310,8 +1311,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     if let Some(web) = &web_ui {
                                         web.activity("Repairing answer");
                                     }
-                                    let repair_history = outcome.messages[1..].to_vec();
-                                    let repair_start = repair_history.len() + 2;
+                                    let repair_start = outcome.messages.len() + 1;
                                     let repair_task = format!(
                                         "[HOST GROUNDING REPAIR] The draft's factual coverage was {:.3} and contradiction risk was {:.3}. Re-check the supplied evidence and tool results. Use more recall/tools if needed, correct unsupported claims, and abstain explicitly where evidence remains insufficient. Return the corrected final answer.",
                                         decision.report.coverage, decision.report.contradiction
@@ -1321,12 +1321,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             .allow(ResilienceChannel::Llm, Instant::now()),
                                         "a successful draft leaves the LLM circuit available for repair"
                                     );
-                                    let repair = Box::pin(harness.run_with_history_policy(
-                                        partner_system_prompt.clone(),
-                                        &repair_history,
-                                        repair_task,
-                                        harness_policy,
-                                    ))
+                                    let repair = Box::pin(harness.repair(&outcome, repair_task))
                                         as std::pin::Pin<Box<dyn Future<Output = _>>>;
                                     let repaired = run_with_operator_controls(
                                         &harness,

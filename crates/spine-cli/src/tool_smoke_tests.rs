@@ -122,7 +122,11 @@ fn checkpoint_persistence_respects_the_memory_breaker() {
         checkpoint: Some(HarnessCheckpoint {
             schema: 1,
             harness_id: "test".into(),
-            messages: vec![],
+            messages: vec![
+                spine_runtime::Message::new(spine_runtime::MessageRole::System, "system"),
+                spine_runtime::Message::new(spine_runtime::MessageRole::User, "continue"),
+                spine_runtime::Message::new(spine_runtime::MessageRole::Assistant, "paused safely"),
+            ],
             completed_tool_calls: 0,
             completed_tool_rounds: 0,
             pending_task: "continue".into(),
@@ -133,6 +137,8 @@ fn checkpoint_persistence_respects_the_memory_breaker() {
         completed_tool_calls: 0,
         completed_tool_rounds: 0,
         usage: Default::default(),
+        completed_action_calls: 0,
+        policy: spine_runtime::HarnessPolicy::default(),
         messages: vec![],
         host_plan: None,
     };
@@ -662,6 +668,37 @@ async fn ingestion_and_cognition_tools_round_trip_real_heart_state() {
             "{recall_name}"
         );
     }
+
+    // Retrieved documents are evidence, not personal claims from the user.
+    assert_eq!(
+        fixture
+            .heart
+            .cognition()
+            .unwrap()
+            .unwrap()
+            .facts
+            .facts()
+            .count(),
+        0
+    );
+    fixture
+        .heart
+        .commit_embedded(
+            InteractionInput {
+                agent_id: AgentId::new("main").unwrap(),
+                thread_id: ThreadId::new("tool-smoke").unwrap(),
+                role: ParticipantRole::User,
+                kind: EventKind::Message,
+                content: Content::Inline(document.into()),
+                causal_parents: Vec::new(),
+                provenance: Provenance::default(),
+                tool: None,
+                attachments: Vec::new(),
+                outcome: None,
+            },
+            TinyEncoder::new().encode(document).unwrap(),
+        )
+        .unwrap();
 
     let fact = execute(
         &fixture.registry,

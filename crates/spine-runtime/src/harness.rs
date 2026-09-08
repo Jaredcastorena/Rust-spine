@@ -377,6 +377,8 @@ pub struct RunOutcome {
     pub checkpoint: Option<HarnessCheckpoint>,
     pub completed_tool_calls: u64,
     pub completed_tool_rounds: u64,
+    pub completed_action_calls: usize,
+    pub policy: HarnessPolicy,
     pub usage: TokenUsage,
     pub messages: Vec<Message>,
     pub host_plan: Option<HostPlan>,
@@ -503,6 +505,38 @@ impl Harness {
         }
     }
 
+    /// Continue a completed draft for host verification without refreshing its budgets.
+    /// Graceful stops require an explicit checkpoint resume instead.
+    pub async fn repair(
+        &self,
+        previous: &RunOutcome,
+        task: impl Into<String>,
+    ) -> Result<RunOutcome> {
+        if previous.stopped_gracefully || previous.checkpoint.is_some() {
+            return Err(RuntimeError::InvalidConfig(
+                "a stopped outcome requires explicit checkpoint resume".into(),
+            ));
+        }
+        let task = task.into();
+        let mut messages = previous.messages.clone();
+        messages.push(Message::new(MessageRole::User, task.clone()));
+        let mut outcome = self
+            .run_messages(
+                messages,
+                task,
+                CompletedWork {
+                    tool_calls: previous.completed_tool_calls,
+                    tool_rounds: previous.completed_tool_rounds,
+                    action_calls: previous.completed_action_calls,
+                },
+                previous.host_plan.clone(),
+                previous.policy,
+            )
+            .await?;
+        outcome.usage.add(previous.usage);
+        Ok(outcome)
+    }
+
     pub async fn resume(&self, checkpoint: HarnessCheckpoint) -> Result<RunOutcome> {
         checkpoint.validate()?;
         let mut messages = checkpoint.messages;
@@ -589,6 +623,8 @@ impl Harness {
                         checkpoint: None,
                         completed_tool_calls: completed.tool_calls,
                         completed_tool_rounds: completed.tool_rounds,
+                        completed_action_calls: completed.action_calls,
+                        policy,
                         usage,
                         messages,
                         host_plan,
@@ -639,6 +675,8 @@ impl Harness {
                     checkpoint: None,
                     completed_tool_calls: completed.tool_calls,
                     completed_tool_rounds: completed.tool_rounds,
+                    completed_action_calls: completed.action_calls,
+                    policy,
                     usage,
                     messages,
                     host_plan,
@@ -899,6 +937,8 @@ impl Harness {
             checkpoint,
             completed_tool_calls: completed.tool_calls,
             completed_tool_rounds: completed.tool_rounds,
+            completed_action_calls: completed.action_calls,
+            policy,
             usage,
             messages,
             host_plan,
