@@ -33,18 +33,40 @@ parity lane; update it after accepted milestones and when the next action change
 5. Run the combined workspace tests, strict Clippy, formatting, release build,
    fuzz compilation, release hygiene, and license checks before PR acceptance.
 
-## 2026-09-07 integration in progress
+## 2026-09-07 parity integration
 
-Provider wire compatibility, multiline terminal input, restart checkpoint
-discovery, and source-aware document ingestion are integrated. Typed-fact and
-host-modulation lanes are undergoing independent review. Resilience fixes include
-subsystem breakers, browser command completion, suffix projection catch-up, and
-protection of context coordinates during pruning.
+Current work is PR #16, `fix/python-parity`, based on current main `d8299d1`.
+Provider/input/checkpoints, typed facts/aggregation, source-aware documents,
+resilience, host modulation, introspection, and web fallback are integrated and
+reviewed. `PARITY.md` maps each behavior to regression evidence.
 
-Integration must reconcile ambiguous checkpoint-consumption writes using the
-exact checkpoint event ID in canonical records. Unavailable risk must select a
-conservative policy and remain visibly unavailable. Saved unlimited tool policy
-must remain unlimited after restart, regardless of a new harness default.
+Important accepted review findings:
 
-The integrated branch is not yet accepted as parity-complete; combined gates and
-final review remain pending.
+- Exact canonical consume markers reconcile ambiguous writes before retry or
+  resume; unknown markers fail closed. Saved unlimited tool policy stays
+  unlimited across restart. Grounding repair preserves cumulative budgets and
+  evidence, and cannot continue a gracefully stopped run.
+- Fact schema 3 backfills user facts and removes document-source contamination
+  while preserving non-fact cognitive state. Both chat and one-shot harness
+  startup perform suffix recovery followed by fact upgrade.
+- Released risk models used raw affect and count/empty features. Atomic migration
+  preserves their weights in explicit compatibility segments and adds normalized
+  affect plus six oracle inputs with zero initial weights. Fresh hearts use only
+  the Python layout; unsupported layouts fail visibly.
+- Unavailable risk is labeled unknown and selects conservative policy. Turn
+  introspection is host-owned and bounded; resume clears unrelated turn metadata.
+- Diagnostic history is a separate encrypted projection with known observations,
+  bounded 100-sample retention and last-ten means. Missing legacy samples stay
+  unknown; tensor replacement must break diagnostic continuity explicitly.
+
+The completed implementation passes 201 combined Rust tests and the 149-test
+isolated Python oracle. Actual native model tests, strict Clippy, formatting,
+optimized build, fuzz compilation, license freshness, hygiene and dependency
+audits pass. The release CLI completes two native tool rounds against a local
+test endpoint using genuine MiniLM weights and cleans up its incognito heart.
+Diagnostic suffix recovery is atomic, preserves learned state and context links,
+and adds each known observation once across failure, retry and reopen.
+
+Use PR #16's checks for current remote CI status. Review and merge remain normal
+repository acceptance steps; do not silently change the locked architecture or
+reinterpret missing historical diagnostics as known data.

@@ -45,12 +45,13 @@
 
 ## Known boundary
 
-Legacy Python DCMDb/Thymos state is not queried by the native runtime. Running the legacy process beside this harness does not create shared recall. Continuity requires either a one-time verified import or an explicit dual-read adapter.
+Legacy Python DCMDb/Thymos state is not queried by the native runtime. Running the legacy process beside this harness does not create shared recall. Legacy import is an intentional separate project, not a runtime-parity requirement. See `PARITY.md` for restored behavior and compatibility decisions.
 
 ## Accepted verification
 
-- Individual parity lanes pass locked workspace tests; the combined test count
-  is recorded after integration verification.
+- The combined parity implementation passes 201 locked Rust workspace tests and
+  all 149 Python oracle tests from an isolated source-only copy. `PARITY.md`
+  records the behavior map, independent review and migration boundaries.
 - Strict workspace Clippy with all targets and features.
 - Formatting checks across the workspace and standalone fuzz package.
 - Locked fuzz-target compilation.

@@ -18,6 +18,7 @@ accept the combined branch.
 | Reflection equations and deterministic signed replay | Fixed-tensor cognitive oracles and encrypted reopen/rebuild |
 | Six retrieval features and normalized affect | Risk oracle and learned-state-preserving migration tests |
 | Feel and memory-distribution introspection | Host metadata isolation and real-heart introspection tests |
+| Persisted last-ten feeling trends and bounded history | Diagnostic identity, atomic install, divergence and suffix retry/reopen tests |
 | Degraded operation and exact durable checkpoint consumption | Circuit-breaker and actual partial-failure recovery tests |
 | Source-safe context coordinates and bounded rehydration | Protected pruning, triangle and property tests |
 | Filesystem, shell, browser, tasks and temporary agents | Full registered-tool smoke tests and local HTTP regressions |
@@ -45,9 +46,19 @@ port: no synthetic triangle scaffold or periodic three-to-one folding, no Python
 production dependency, and no legacy Python state import requirement. New device
 revocation and smaller-model selection remain separate projects.
 
-## Final acceptance
+## Acceptance evidence
 
-Final acceptance is pending persisted diagnostic-history integration and the
-complete checks on the final PR head. Required checks are workspace tests, actual
-native-model tests, strict Clippy, formatting, optimized build, fuzz compilation,
-dependency audit, license freshness, release hygiene, and independent review.
+The completed implementation passes 201 Rust workspace tests and all 149 Python
+oracle regression tests from an isolated source-only copy. Independent review
+covered each lane; coordinator review covered fixes authored by a lane reviewer.
+
+Actual MiniLM/NLI model tests, strict all-target/all-feature Clippy, formatting,
+optimized build, fuzz compilation, license freshness, release hygiene, and both
+dependency audits pass. The only advisory is the pre-existing allowed
+unmaintained `paste` warning. A release-CLI acceptance run with genuine MiniLM and
+a local scripted provider verifies two native tool rounds, JSON-string arguments,
+applied temperature, optional reasoning omission, and incognito cleanup.
+
+PR #16 contains the current integrated changes. Its checks are the authoritative
+remote acceptance status. No merge or production rollout is implied by this
+checklist; the intentional architecture boundaries above remain in force.
