@@ -127,6 +127,8 @@ fn checkpoint_persistence_respects_the_memory_breaker() {
             completed_tool_rounds: 0,
             pending_task: "continue".into(),
             host_plan: None,
+            completed_action_calls: 0,
+            policy: spine_runtime::HarnessPolicy::default(),
         }),
         completed_tool_calls: 0,
         completed_tool_rounds: 0,

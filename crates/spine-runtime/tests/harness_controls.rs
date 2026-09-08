@@ -217,6 +217,127 @@ async fn per_run_policy_can_expand_a_positive_tool_ceiling() {
 }
 
 #[tokio::test]
+async fn checkpoint_preserves_effective_tool_ceiling_across_new_harness_config() {
+    for original_ceiling in [None, NonZeroU64::new(2)] {
+        let executed = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            tool_turn(vec![call(1)]),
+            answer("paused"),
+        ]));
+        let harness = Harness::new(
+            provider,
+            registry(Arc::clone(&executed)),
+            HarnessConfig {
+                max_tool_rounds: original_ceiling,
+                ..HarnessConfig::default()
+            },
+        )
+        .unwrap();
+        harness.controls().request_graceful_stop();
+        let checkpoint = harness
+            .run("system", "inspect")
+            .await
+            .unwrap()
+            .checkpoint
+            .unwrap();
+        let checkpoint: HarnessCheckpoint =
+            serde_json::from_str(&serde_json::to_string(&checkpoint).unwrap()).unwrap();
+        assert_eq!(checkpoint.policy.max_tool_rounds, original_ceiling);
+
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            tool_turn(vec![call(2)]),
+            tool_turn(vec![call(3)]),
+            answer("finished"),
+        ]));
+        let resumed = Harness::new(
+            provider,
+            registry(Arc::clone(&executed)),
+            HarnessConfig {
+                max_tool_rounds: NonZeroU64::new(1),
+                ..HarnessConfig::default()
+            },
+        )
+        .unwrap();
+        let result = resumed.resume(checkpoint).await.unwrap();
+        assert_eq!(
+            result.completed_tool_calls,
+            if original_ceiling.is_some() { 2 } else { 3 }
+        );
+    }
+}
+
+#[tokio::test]
+async fn explicit_unlimited_policy_overrides_configured_ceiling() {
+    let executed = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        tool_turn(vec![call(1)]),
+        tool_turn(vec![call(2)]),
+        answer("finished"),
+    ]));
+    let harness = Harness::new(
+        provider,
+        registry(Arc::clone(&executed)),
+        HarnessConfig {
+            max_tool_rounds: NonZeroU64::new(1),
+            ..HarnessConfig::default()
+        },
+    )
+    .unwrap();
+    let result = harness
+        .run_with_history_policy("system", &[], "inspect", HarnessPolicy::default())
+        .await
+        .unwrap();
+    assert_eq!(result.completed_tool_calls, 2);
+}
+
+#[tokio::test]
+async fn exhausted_checkpoint_action_budget_still_honors_stop_and_policy() {
+    let executed = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        tool_turn(vec![action_call(1)]),
+        answer("paused"),
+        tool_turn(vec![action_call(2), action_call(3)]),
+        answer("still paused"),
+    ]));
+    let mut registry = ToolRegistry::default();
+    registry
+        .register(ActionProbe {
+            executed: Arc::clone(&executed),
+        })
+        .unwrap();
+    let harness = Harness::new(provider.clone(), registry, HarnessConfig::default()).unwrap();
+    let policy = HarnessPolicy {
+        temperature: Some(0.45),
+        max_action_calls: NonZeroUsize::new(1),
+        max_tool_rounds: None,
+    };
+    harness.controls().request_graceful_stop();
+    let checkpoint = harness
+        .run_with_history_policy("system", &[], "act", policy)
+        .await
+        .unwrap()
+        .checkpoint
+        .unwrap();
+    let checkpoint: HarnessCheckpoint =
+        serde_json::from_str(&serde_json::to_string(&checkpoint).unwrap()).unwrap();
+    harness.controls().request_graceful_stop();
+    let resumed = harness.resume(checkpoint).await.unwrap();
+    assert!(resumed.stopped_gracefully);
+    assert_eq!(&*executed.lock().unwrap(), &["1"]);
+    let checkpoint = resumed.checkpoint.unwrap();
+    assert_eq!(checkpoint.completed_action_calls, 1);
+    assert_eq!(checkpoint.policy, policy);
+    assert!(
+        provider
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| request.temperature == Some(0.45))
+    );
+}
+
+#[tokio::test]
 async fn per_run_policy_enforces_temperature_and_total_action_budget() {
     let executed = Arc::new(Mutex::new(Vec::new()));
     let provider = Arc::new(ScriptedProvider::new(vec![

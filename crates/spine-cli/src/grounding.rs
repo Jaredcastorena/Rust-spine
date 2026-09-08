@@ -43,6 +43,15 @@ pub struct GroundingDecision {
     pub needs_repair: bool,
 }
 
+impl GroundingDecision {
+    /// Claim-free output has no factual training label, rather than zero coverage.
+    pub fn risk_target(&self) -> Option<f32> {
+        (self.claim_count > 0).then(|| {
+            (0.6 * (1.0 - self.report.coverage) + 0.4 * self.report.contradiction).clamp(0.0, 1.0)
+        })
+    }
+}
+
 impl GroundingGate {
     pub fn load(directory: impl AsRef<Path>) -> spine_heart::Result<Self> {
         Ok(Self {
@@ -135,6 +144,21 @@ mod tests {
                 .response
                 .contains("could not verify every factual claim")
         );
+    }
+
+    #[test]
+    fn claim_free_output_does_not_train_the_risk_field() {
+        let mut decision = GroundingDecision {
+            claim_count: 0,
+            report: NliReport::default(),
+            needs_repair: false,
+        };
+        assert_eq!(decision.risk_target(), None);
+        decision.claim_count = 1;
+        decision.report.coverage = 0.0;
+        assert_eq!(decision.risk_target(), Some(0.6));
+        decision.report.coverage = 1.0;
+        assert_eq!(decision.risk_target(), Some(0.0));
     }
 
     #[test]

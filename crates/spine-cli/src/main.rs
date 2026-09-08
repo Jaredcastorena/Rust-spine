@@ -1274,10 +1274,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                             if let Ok(decision) = decision {
-                                let tension = (0.6 * (1.0 - decision.report.coverage)
-                                    + 0.4 * decision.report.contradiction)
-                                    .clamp(0.0, 1.0);
-                                if circuit_breaker.allow(ResilienceChannel::Thymos, Instant::now())
+                                if let Some(tension) = decision.risk_target()
+                                    && circuit_breaker.allow(ResilienceChannel::Thymos, Instant::now())
                                 {
                                     match heart.update_risk(
                                         &agent_id,
@@ -2618,7 +2616,7 @@ fn finish_visible_turn(
 const CHECKPOINT_CONSUMED_RECORD_TYPE: &str = "harness_checkpoint_consumed";
 const CHECKPOINT_CONSUMED_OUTCOME: &str = "harness_checkpoint_consumed";
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct PersistedHarnessCheckpoint {
     checkpoint: HarnessCheckpoint,
     event_id: EventId,
@@ -3004,6 +3002,8 @@ mod cli_tests {
             completed_tool_rounds: 0,
             pending_task: task.into(),
             host_plan: None,
+            completed_action_calls: 0,
+            policy: spine_runtime::HarnessPolicy::default(),
         }
     }
 

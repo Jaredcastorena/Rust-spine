@@ -45,6 +45,7 @@ impl Default for HarnessConfig {
 pub struct HarnessPolicy {
     pub temperature: Option<f32>,
     pub max_action_calls: Option<NonZeroUsize>,
+    /// Effective ceiling for this run; `None` explicitly means unlimited.
     pub max_tool_rounds: Option<NonZeroU64>,
 }
 
@@ -441,7 +442,7 @@ impl Harness {
             task,
             CompletedWork::default(),
             None,
-            HarnessPolicy::default(),
+            self.default_policy(),
         )
         .await
     }
@@ -462,7 +463,7 @@ impl Harness {
             task,
             CompletedWork::default(),
             None,
-            HarnessPolicy::default(),
+            self.default_policy(),
         )
         .await
     }
@@ -481,6 +482,13 @@ impl Harness {
         messages.push(Message::new(MessageRole::User, task.clone()));
         self.run_messages(messages, task, CompletedWork::default(), None, policy)
             .await
+    }
+
+    fn default_policy(&self) -> HarnessPolicy {
+        HarnessPolicy {
+            max_tool_rounds: self.config.max_tool_rounds,
+            ..HarnessPolicy::default()
+        }
     }
 
     pub async fn resume(&self, checkpoint: HarnessCheckpoint) -> Result<RunOutcome> {
@@ -630,7 +638,6 @@ impl Harness {
 
             if policy
                 .max_tool_rounds
-                .or(self.config.max_tool_rounds)
                 .is_some_and(|ceiling| completed.tool_rounds >= ceiling.get())
             {
                 messages.push(Message::new(MessageRole::Assistant, turn.content));
@@ -671,20 +678,22 @@ impl Harness {
                         &call.id,
                         "[skipped: host action budget for this run was reached]",
                     ));
-                    continue;
+                } else {
+                    if is_action {
+                        completed.action_calls = completed.action_calls.saturating_add(1);
+                    }
+                    let result = self.execute_tool(call, &task).await;
+                    plan_evidence |= self.registry.get(&call.name).is_some_and(|tool| {
+                        tool.spec().category != ToolCategory::Action || result.success
+                    });
+                    completed.tool_calls = completed.tool_calls.saturating_add(1);
+                    messages.push(Message::tool(
+                        &call.id,
+                        result.model_text(self.config.max_tool_result_chars),
+                    ));
                 }
-                if is_action {
-                    completed.action_calls = completed.action_calls.saturating_add(1);
-                }
-                let result = self.execute_tool(call, &task).await;
-                plan_evidence |= self.registry.get(&call.name).is_some_and(|tool| {
-                    tool.spec().category != ToolCategory::Action || result.success
-                });
-                completed.tool_calls = completed.tool_calls.saturating_add(1);
-                messages.push(Message::tool(
-                    &call.id,
-                    result.model_text(self.config.max_tool_result_chars),
-                ));
+                // A rejected action is also a safe boundary. Otherwise an
+                // exhausted budget could starve queued guidance/stop forever.
                 let controls = self.controls.drain();
                 if !controls.is_empty() {
                     for skipped in &calls[index + 1..] {
