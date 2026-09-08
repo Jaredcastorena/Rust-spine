@@ -162,7 +162,7 @@ fn suffix_catch_up_preserves_projection_only_learning_and_context() {
         .update_risk(
             &AgentId::new("main").unwrap(),
             &risk_context,
-            &[0.8, 0.2, 0.1, 0.3],
+            &[0.8, 0.2, 0.1, 0.3, 0.0, 0.0],
             0.9,
         )
         .unwrap();
@@ -222,6 +222,108 @@ fn catch_up_rejects_imports_that_reorder_the_projected_prefix() {
         Err(HeartError::ProjectionStale)
     ));
     assert_eq!(first.cognition().unwrap().unwrap(), before);
+}
+
+#[test]
+fn heart_risk_calls_use_normalized_affect_for_fresh_six_feature_fields() {
+    let directory = tempfile::tempdir().unwrap();
+    let encoder = TinyEncoder::new();
+    let heart = SpineHeart::create(
+        HeartConfig::new(directory.path().join("normalized.spine")),
+        "normal-pass",
+    )
+    .unwrap()
+    .heart;
+    heart
+        .initialize_cognition(CognitiveConfig::new(1, encoder.manifest.clone(), 2).unwrap())
+        .unwrap();
+    let embedding = encoder.encode("new observation").unwrap();
+    heart
+        .commit_embedded(interaction("new observation"), embedding.clone())
+        .unwrap();
+    let agent = AgentId::new("main").unwrap();
+    let activated = heart.feel(&agent, &embedding).unwrap().unwrap().activated;
+    let norm = activated
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt();
+    let normalized: Vec<_> = activated
+        .iter()
+        .map(|value| value / (norm + 1e-8))
+        .collect();
+    let stats = [0.9, 0.2, 0.7, 0.5, 0.6, 0.46051702];
+    let mut expected = heart.cognition().unwrap().unwrap().risk;
+    let predicted = expected
+        .update(embedding.as_slice(), &normalized, &stats, 1.0)
+        .unwrap();
+    assert_eq!(
+        heart.update_risk(&agent, &embedding, &stats, 1.0).unwrap(),
+        predicted
+    );
+    assert_eq!(heart.cognition().unwrap().unwrap().risk, expected);
+    assert_eq!(
+        heart.predict_risk(&agent, &embedding, &stats).unwrap(),
+        expected
+            .predict(embedding.as_slice(), &normalized, &stats)
+            .unwrap()
+    );
+}
+
+#[test]
+fn opening_legacy_risk_projection_preserves_learned_cognition_and_is_idempotent() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("risk-upgrade.spine");
+    let encoder = TinyEncoder::new();
+    let mut config = CognitiveConfig::new(1, encoder.manifest.clone(), 2).unwrap();
+    assert_eq!(config.retrieval_stat_dimensions, 6);
+    config.retrieval_stat_dimensions = 4;
+    let created = SpineHeart::create(HeartConfig::new(&path), "risk-pass").unwrap();
+    created.heart.initialize_cognition(config).unwrap();
+    let embedding = encoder.encode("remember this").unwrap();
+    created
+        .heart
+        .commit_embedded(interaction("remember this"), embedding.clone())
+        .unwrap();
+    let agent = AgentId::new("main").unwrap();
+    let legacy = [0.3, 0.0, 0.0, 0.0];
+    created
+        .heart
+        .update_risk(&agent, &embedding, &legacy, 1.0)
+        .unwrap();
+    let prediction = created
+        .heart
+        .predict_risk(&agent, &embedding, &legacy)
+        .unwrap();
+    let mut expected = created.heart.cognition().unwrap().unwrap();
+    let events = created.heart.events_canonical().unwrap();
+    expected.upgrade_risk_layout().unwrap();
+    drop(created);
+    let reopened = SpineHeart::open(
+        HeartConfig::new(&path),
+        KeySource::Passphrase("risk-pass".into()),
+    )
+    .unwrap();
+    assert_eq!(reopened.cognition().unwrap().unwrap(), expected);
+    assert_eq!(reopened.events_canonical().unwrap(), events);
+    assert_eq!(
+        reopened
+            .predict_risk(
+                &agent,
+                &embedding,
+                &[0.9, 0.2, 0.7, 0.5, 0.6, 0.46, 0.3, 0.0, 0.0, 0.0]
+            )
+            .unwrap(),
+        prediction
+    );
+    assert!(!reopened.upgrade_risk_projection().unwrap());
+    drop(reopened);
+    let reopened = SpineHeart::open(
+        HeartConfig::new(&path),
+        KeySource::Passphrase("risk-pass".into()),
+    )
+    .unwrap();
+    assert_eq!(reopened.cognition().unwrap().unwrap(), expected);
 }
 
 #[test]

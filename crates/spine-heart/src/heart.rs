@@ -73,7 +73,9 @@ impl SpineHeart {
 
     pub fn open(config: HeartConfig, keys: KeySource) -> Result<Self> {
         let store = Store::open(&config.path, keys)?;
-        Ok(Self { config, store })
+        let heart = Self { config, store };
+        heart.upgrade_risk_projection()?;
+        Ok(heart)
     }
 
     pub fn create_replica(
@@ -134,6 +136,31 @@ impl SpineHeart {
 
     pub fn cognition(&self) -> Result<Option<CognitiveState>> {
         self.store.get_projection(self.config.projection_generation)
+    }
+
+    /// Add all Python retrieval features while retaining released legacy weights
+    /// in a distinct segment. CAS prevents overwriting concurrent learned state.
+    pub fn upgrade_risk_projection(&self) -> Result<bool> {
+        let Some(previous) = self.cognition()? else {
+            return Ok(false);
+        };
+        let mut replacement = previous.clone();
+        if !replacement.upgrade_risk_layout()? {
+            return Ok(false);
+        }
+        let event_ids: Vec<_> = self
+            .store
+            .events_canonical()?
+            .iter()
+            .map(|event| event.id)
+            .collect();
+        self.store.replace_projection_if_unchanged(
+            self.config.projection_generation,
+            &previous,
+            &event_ids,
+            &replacement,
+        )?;
+        Ok(true)
     }
 
     pub fn cognition_is_current(&self) -> Result<bool> {
@@ -426,6 +453,7 @@ impl SpineHeart {
             || vec![0.0; state.config.thymos_channels],
             |item| item.activated,
         );
+        let feeling = state.risk.affect_features(&feeling)?;
         state
             .risk
             .predict(context.as_slice(), &feeling, retrieval_stats)
@@ -443,6 +471,7 @@ impl SpineHeart {
             || vec![0.0; state.config.thymos_channels],
             |item| item.activated,
         );
+        let feeling = state.risk.affect_features(&feeling)?;
         let previous = state
             .risk
             .update(context.as_slice(), &feeling, retrieval_stats, tension)?;
@@ -780,7 +809,7 @@ mod fact_upgrade_tests {
             vector.clone(),
         ).unwrap();
         heart
-            .update_risk(&AgentId::new("main").unwrap(), &vector, &[0.0; 4], 0.8)
+            .update_risk(&AgentId::new("main").unwrap(), &vector, &[0.0; 6], 0.8)
             .unwrap();
         heart
             .compact_context(
@@ -877,5 +906,103 @@ mod fact_upgrade_tests {
             Err(HeartError::ProjectionStale)
         ));
         assert_eq!(heart.cognition().unwrap().unwrap(), concurrent);
+    }
+}
+
+#[cfg(test)]
+mod risk_upgrade_tests {
+    use super::*;
+
+    fn legacy_config() -> CognitiveConfig {
+        let mut config = CognitiveConfig::new(
+            1,
+            crate::ModelManifest {
+                schema: 1,
+                model_name: "risk-upgrade-test".into(),
+                artifact_hash: [1; 32],
+                tokenizer_hash: [2; 32],
+                dimension: 3,
+                normalized: true,
+                quantization: None,
+            },
+            2,
+        )
+        .unwrap();
+        config.retrieval_stat_dimensions = 4;
+        config
+    }
+
+    #[test]
+    fn risk_upgrade_cas_rejects_concurrent_learning_or_new_events() {
+        for event_conflict in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let heart = SpineHeart::create(
+                HeartConfig::new(directory.path().join("cas.spine")),
+                "cas-pass",
+            )
+            .unwrap()
+            .heart;
+            heart.initialize_cognition(legacy_config()).unwrap();
+            let previous = heart.cognition().unwrap().unwrap();
+            let mut replacement = previous.clone();
+            replacement.upgrade_risk_layout().unwrap();
+            let agent = AgentId::new("main").unwrap();
+            if event_conflict {
+                heart
+                    .commit_interaction(InteractionInput {
+                        agent_id: agent,
+                        thread_id: crate::ThreadId::new("test").unwrap(),
+                        role: crate::ParticipantRole::User,
+                        kind: crate::EventKind::Message,
+                        content: Content::Inline("concurrent observation".into()),
+                        causal_parents: Vec::new(),
+                        provenance: crate::Provenance::default(),
+                        tool: None,
+                        attachments: Vec::new(),
+                        outcome: None,
+                    })
+                    .unwrap();
+            } else {
+                heart
+                    .update_risk(
+                        &agent,
+                        &Embedding::normalized(vec![1.0, 0.0, 0.0], 3).unwrap(),
+                        &[0.3, 0.0, 0.0, 0.0],
+                        1.0,
+                    )
+                    .unwrap();
+            }
+            let concurrent = heart.cognition().unwrap().unwrap();
+            assert!(matches!(
+                heart
+                    .store
+                    .replace_projection_if_unchanged(1, &previous, &[], &replacement),
+                Err(HeartError::ProjectionStale)
+            ));
+            assert_eq!(heart.cognition().unwrap().unwrap(), concurrent);
+        }
+    }
+
+    #[test]
+    fn unknown_persisted_risk_layout_is_rejected_without_resetting_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("unknown.spine");
+        let heart = SpineHeart::create(HeartConfig::new(&path), "unknown-pass")
+            .unwrap()
+            .heart;
+        let mut config = legacy_config();
+        config.retrieval_stat_dimensions = 5;
+        heart.initialize_cognition(config).unwrap();
+        let before = heart.cognition().unwrap().unwrap();
+        assert!(heart.upgrade_risk_projection().is_err());
+        assert_eq!(heart.cognition().unwrap().unwrap(), before);
+        drop(heart);
+        assert!(
+            SpineHeart::open(
+                HeartConfig::new(&path),
+                KeySource::Passphrase("unknown-pass".into())
+            )
+            .is_err()
+        );
     }
 }

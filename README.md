@@ -616,6 +616,13 @@ A positive `--max-tool-rounds` ceiling can expand under risk; omitting it remain
 unlimited, including after checkpoint resume. Triangle-context rehydration keeps
 its fixed bounded topology.
 
+Risk training uses Python's normalized affect and all six retrieval statistics:
+top score, score margin, mean confidence, tension fraction, hierarchy depth, and
+corpus size. Existing released hearts upgrade atomically on open. Their learned
+raw-affect and count/empty-evidence contributions remain in separate compatibility
+segments, while the new oracle coordinates start with zero weights. Unknown or
+inconsistent layouts are rejected without resetting learned state.
+
 ## Developer reference
 
 ### What is in this repository

@@ -35,7 +35,7 @@ impl CognitiveConfig {
             generation,
             model,
             thymos_channels,
-            retrieval_stat_dimensions: 4,
+            retrieval_stat_dimensions: 6,
         })
     }
 }
@@ -63,6 +63,18 @@ pub struct MemoryReceipt {
 
 impl CognitiveState {
     pub(crate) const CURRENT_SCHEMA: u32 = 2;
+
+    pub fn upgrade_risk_layout(&mut self) -> Result<bool> {
+        let changed = self.risk.upgrade_retrieval_layout(
+            self.config.model.dimension,
+            self.config.thymos_channels,
+            self.config.retrieval_stat_dimensions,
+        )?;
+        if changed {
+            self.config.retrieval_stat_dimensions = self.risk.retrieval_stat_dimensions();
+        }
+        Ok(changed)
+    }
 
     pub fn new(config: CognitiveConfig) -> Result<Self> {
         let dcmdb = Dcmdb::new(DcmdbConfig::dense(config.model.dimension))?;

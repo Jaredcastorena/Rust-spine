@@ -120,17 +120,48 @@ impl Tool for SaveMemoryTool {
 pub struct AutomaticRecall {
     pub context: String,
     pub hits: Vec<RecallHit>,
+    pub hierarchy_depth: u32,
+    pub total_nodes: usize,
+    pub retrieval_stat_dimensions: usize,
 }
 
 impl AutomaticRecall {
+    pub fn empty_for_layout(retrieval_stat_dimensions: usize) -> Self {
+        Self {
+            context: "[]".into(),
+            hits: Vec::new(),
+            hierarchy_depth: 0,
+            total_nodes: 0,
+            retrieval_stat_dimensions,
+        }
+    }
+
     pub fn tension_count(&self) -> usize {
         self.hits.iter().filter(|hit| hit.tensioned).count()
     }
 
-    /// The four retrieval features persisted by Rust's risk-field projection.
-    pub fn risk_stats(&self) -> [f32; 4] {
+    /// Python's six-feature oracle plus a released legacy segment when needed.
+    pub fn risk_stats(&self) -> Vec<f32> {
+        let oracle = self.oracle_risk_stats();
+        if self.retrieval_stat_dimensions == 10 {
+            let count = serde_json::from_str::<Vec<serde_json::Value>>(&self.context)
+                .map_or(0, |events| events.len());
+            let mut features = oracle.to_vec();
+            features.extend([
+                (count as f32 / 10.0).min(1.0),
+                if count == 0 { 1.0 } else { 0.0 },
+                0.0,
+                0.0,
+            ]);
+            features
+        } else {
+            oracle.to_vec()
+        }
+    }
+
+    fn oracle_risk_stats(&self) -> [f32; 6] {
         if self.hits.is_empty() {
-            return [0.0; 4];
+            return [0.0; 6];
         }
         let count = self.hits.len() as f32;
         let top_score = self
@@ -146,6 +177,8 @@ impl AutomaticRecall {
             top_score - mean_score,
             mean_confidence,
             tension_fraction,
+            self.hierarchy_depth as f32 / 5.0,
+            ((self.total_nodes as f64 + 1.0).ln() / 10.0) as f32,
         ]
     }
 }
@@ -461,9 +494,21 @@ fn hybrid_recall(
         }
     }
     results.truncate(top_k.saturating_mul(2));
+    let cognition = heart
+        .cognition()?
+        .ok_or(spine_heart::HeartError::NotFound)?;
     Ok(AutomaticRecall {
         context: serde_json::to_string(&results)?,
         hits,
+        hierarchy_depth: cognition
+            .dcmdb
+            .nodes
+            .values()
+            .map(|node| node.level)
+            .max()
+            .unwrap_or(0),
+        total_nodes: cognition.dcmdb.nodes.len(),
+        ..AutomaticRecall::empty_for_layout(cognition.config.retrieval_stat_dimensions)
     })
 }
 
@@ -980,6 +1025,9 @@ mod tests {
     fn automatic_recall_builds_python_compatible_risk_features() {
         let recall = AutomaticRecall {
             context: "[]".into(),
+            hierarchy_depth: 3,
+            total_nodes: 99,
+            retrieval_stat_dimensions: 6,
             hits: vec![
                 RecallHit {
                     node_id: spine_heart::NodeId::from_bytes([1; 32]),
@@ -1006,6 +1054,27 @@ mod tests {
         assert!((stats[1] - 0.2).abs() < f32::EPSILON);
         assert!((stats[2] - 0.7).abs() < f32::EPSILON);
         assert!((stats[3] - 0.5).abs() < f32::EPSILON);
+        assert!((stats[4] - 0.6).abs() < f32::EPSILON);
+        assert!((stats[5] - 0.46051702).abs() < f32::EPSILON);
+        let mut legacy = recall;
+        legacy.retrieval_stat_dimensions = 10;
+        legacy.context = "[{}, {}, {}]".into();
+        assert_eq!(&legacy.risk_stats()[..6], stats.as_slice());
+        assert_eq!(&legacy.risk_stats()[6..], &[0.3, 0.0, 0.0, 0.0]);
+        legacy.context = "[]".into();
+        legacy.hits.clear();
+        assert_eq!(
+            legacy.risk_stats(),
+            vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+        );
+        assert_eq!(
+            AutomaticRecall::empty_for_layout(6).risk_stats(),
+            vec![0.0; 6]
+        );
+        assert_eq!(
+            AutomaticRecall::empty_for_layout(10).risk_stats(),
+            legacy.risk_stats()
+        );
     }
 
     #[test]
