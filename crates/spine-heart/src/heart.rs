@@ -180,7 +180,7 @@ impl SpineHeart {
         let previous = self.current_cognition()?;
         match previous.schema {
             CognitiveState::CURRENT_SCHEMA => return Ok(false),
-            1 | 2 => {}
+            1..=3 => {}
             found => {
                 return Err(HeartError::UnsupportedSchema {
                     found,
@@ -991,7 +991,7 @@ mod fact_upgrade_tests {
         .unwrap();
         assert!(reopened.upgrade_fact_projection().unwrap());
         let upgraded = reopened.cognition().unwrap().unwrap();
-        assert_eq!(upgraded.schema, 3);
+        assert_eq!(upgraded.schema, CognitiveState::CURRENT_SCHEMA);
         let facts: Vec<_> = upgraded.facts.facts().collect();
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].event_id, commit.event.id);
@@ -999,7 +999,7 @@ mod fact_upgrade_tests {
         assert_eq!(facts[0].value, FactValue::Integer(3));
         assert_eq!(facts[0].event_time.as_deref(), Some("2025-02-03"));
         let mut expected = legacy;
-        expected.schema = 3;
+        expected.schema = CognitiveState::CURRENT_SCHEMA;
         expected.facts = upgraded.facts.clone();
         assert_eq!(
             upgraded, expected,
@@ -1128,10 +1128,109 @@ mod fact_upgrade_tests {
             crate::FactAggregation::Count(2)
         );
         let mut expected = legacy;
-        expected.schema = 3;
+        expected.schema = CognitiveState::CURRENT_SCHEMA;
         expected.facts = upgraded.facts.clone();
         assert_eq!(upgraded, expected);
         assert!(!heart.upgrade_fact_projection().unwrap());
+    }
+
+    #[test]
+    fn schema_three_fact_upgrade_repairs_partner_and_age_without_resetting_cognition() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("schema-three-facts.spine");
+        let heart = heart(&path);
+        let vector = Embedding::normalized(vec![1.0, 0.0, 0.0], 3).unwrap();
+        let (partner, partner_memory) = heart
+            .commit_embedded(input("My wife is named Ana."), vector.clone())
+            .unwrap();
+        let (ordinary, ordinary_memory) = heart
+            .commit_embedded(input("My wife is feeling better."), vector.clone())
+            .unwrap();
+        let (age, age_memory) = heart
+            .commit_embedded(input("I am 9 years old."), vector.clone())
+            .unwrap();
+        heart
+            .update_risk(&AgentId::new("main").unwrap(), &vector, &[0.0; 6], 0.8)
+            .unwrap();
+        heart
+            .compact_context(
+                [ContextLeaf {
+                    node_id: partner_memory.node_id,
+                    chronology: 1,
+                }],
+                1,
+            )
+            .unwrap();
+
+        // Recreate schema 3's stored mistakes without depending on the fixed
+        // extractor to continue producing them: a newer false name supersedes
+        // Ana, and the single-digit age is absent from the projection.
+        let extractor = crate::FactExtractor::new().unwrap();
+        let mut legacy = heart.cognition().unwrap().unwrap();
+        legacy.schema = 3;
+        legacy.facts = FactStore::default();
+        let correct = extractor.extract("My wife is named Ana.", None, None, 1, [0, 1]);
+        legacy
+            .facts
+            .add_candidates(partner.event.id, partner_memory.node_id, correct.clone());
+        let mut false_name = correct[0].clone();
+        false_name.value = FactValue::Text("feeling".into());
+        false_name.excerpt = "My wife is feeling better.".into();
+        false_name.ingest_millis = 2;
+        false_name.arrival_order = [0, 2];
+        legacy
+            .facts
+            .add_candidates(ordinary.event.id, ordinary_memory.node_id, vec![false_name]);
+        assert!(legacy.facts.facts().any(|fact| {
+            fact.value == FactValue::Text("feeling".into()) && fact.superseded_by.is_none()
+        }));
+        assert!(legacy.facts.facts().any(|fact| {
+            fact.value == FactValue::Text("Ana".into()) && fact.superseded_by.is_some()
+        }));
+        heart.store.put_projection(1, &legacy).unwrap();
+        let canonical = heart.events_canonical().unwrap();
+        drop(heart);
+
+        let reopened = SpineHeart::open(
+            HeartConfig::new(&path),
+            KeySource::Passphrase("upgrade-pass".into()),
+        )
+        .unwrap();
+        assert!(reopened.upgrade_fact_projection().unwrap());
+        let upgraded = reopened.cognition().unwrap().unwrap();
+        assert_eq!(upgraded.schema, 4);
+        let facts: Vec<_> = upgraded.facts.facts().collect();
+        assert_eq!(facts.len(), 2);
+        let partner_fact = facts
+            .iter()
+            .find(|fact| fact.attribute == "partner_name")
+            .unwrap();
+        assert_eq!(partner_fact.value, FactValue::Text("Ana".into()));
+        assert_eq!(partner_fact.event_id, partner.event.id);
+        assert_eq!(partner_fact.node_id, partner_memory.node_id);
+        assert!(partner_fact.superseded_by.is_none());
+        let age_fact = facts.iter().find(|fact| fact.attribute == "age").unwrap();
+        assert_eq!(age_fact.value, FactValue::Integer(9));
+        assert_eq!(age_fact.event_id, age.event.id);
+        assert_eq!(age_fact.node_id, age_memory.node_id);
+
+        let mut expected = legacy;
+        expected.schema = 4;
+        expected.facts = upgraded.facts.clone();
+        assert_eq!(
+            upgraded, expected,
+            "all non-fact state must survive exactly"
+        );
+        assert_eq!(reopened.events_canonical().unwrap(), canonical);
+        assert!(!reopened.upgrade_fact_projection().unwrap());
+        drop(reopened);
+        let reopened = SpineHeart::open(
+            HeartConfig::new(&path),
+            KeySource::Passphrase("upgrade-pass".into()),
+        )
+        .unwrap();
+        assert_eq!(reopened.cognition().unwrap().unwrap(), upgraded);
+        assert!(!reopened.upgrade_fact_projection().unwrap());
     }
 
     #[test]

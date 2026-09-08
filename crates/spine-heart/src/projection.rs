@@ -62,7 +62,7 @@ pub struct MemoryReceipt {
 }
 
 impl CognitiveState {
-    pub(crate) const CURRENT_SCHEMA: u32 = 3;
+    pub(crate) const CURRENT_SCHEMA: u32 = 4;
 
     pub fn upgrade_risk_layout(&mut self) -> Result<bool> {
         let changed = self.risk.upgrade_retrieval_layout(

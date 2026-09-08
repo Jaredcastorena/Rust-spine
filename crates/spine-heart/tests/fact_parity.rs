@@ -11,6 +11,83 @@ fn one(extractor: &FactExtractor, text: &str) -> spine_heart::FactCandidate {
     facts.into_iter().next().unwrap()
 }
 
+#[test]
+fn partner_names_require_explicit_naming_statements() {
+    let extractor = FactExtractor::new().unwrap();
+    for (text, name) in [
+        ("My wife is named Ana.", "Ana"),
+        ("My husband is called Alex.", "Alex"),
+        ("MY PARTNER IS NAMED sam.", "sam"),
+    ] {
+        let fact = one(&extractor, text);
+        assert_eq!(fact.attribute, "partner_name");
+        assert_eq!(fact.value, FactValue::Text(name.into()));
+    }
+    for text in [
+        "My wife is feeling better.",
+        "My wife loves hiking.",
+        "My husband is going to work.",
+        "My partner called yesterday.",
+        "MY WIFE IS FEELING BETTER.",
+        "My girlfriend is a teacher.",
+    ] {
+        assert!(
+            extractor
+                .extract(text, None, None, 1, [0, 1])
+                .iter()
+                .all(|fact| fact.slot_key != "profile.partner"),
+            "ordinary predicate became a partner name: {text}"
+        );
+    }
+}
+
+#[test]
+fn ordinary_partner_updates_do_not_supersede_a_known_name() {
+    let extractor = FactExtractor::new().unwrap();
+    let mut store = FactStore::default();
+    for (index, text) in [
+        "My wife is named Ana.",
+        "My wife is feeling better.",
+        "My wife loves hiking.",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        store.add_candidates(
+            EventId::from_bytes([index as u8 + 1; 32]),
+            NodeId::from_bytes([index as u8 + 11; 32]),
+            extractor.extract(text, None, None, index as u64, [0, index as u64]),
+        );
+    }
+    let partners: Vec<_> = store
+        .active()
+        .filter(|fact| fact.slot_key == "profile.partner")
+        .collect();
+    assert_eq!(partners.len(), 1);
+    assert_eq!(partners[0].value, FactValue::Text("Ana".into()));
+    assert_eq!(partners[0].event_id, EventId::from_bytes([1; 32]));
+}
+
+#[test]
+fn single_and_double_digit_ages_work_across_all_age_forms() {
+    let extractor = FactExtractor::new().unwrap();
+    for age in [9, 32] {
+        for text in [
+            format!("I'm {age} years old."),
+            format!("I am {age} years old."),
+            format!("I am currently {age} years old."),
+            format!("I'm now {age}."),
+            format!("I just turned {age}."),
+            format!("I turned {age}."),
+            format!("My age is {age}."),
+        ] {
+            let fact = one(&extractor, &text);
+            assert_eq!(fact.value, FactValue::Integer(age), "{text}");
+            assert_eq!(fact.slot_key, "profile.age");
+        }
+    }
+}
+
 fn amount_candidate(label: &str, value: f64, arrival: u64) -> spine_heart::FactCandidate {
     spine_heart::FactCandidate {
         entity: "USER".into(),

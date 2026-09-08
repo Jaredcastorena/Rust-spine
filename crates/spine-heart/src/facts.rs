@@ -794,7 +794,9 @@ impl FactExtractor {
                 0.90,
             ),
             (
-                r"(?i)\bmy (?:wife|husband|partner|girlfriend|boyfriend|fiancee?|spouse) (?:is(?:\s+named|\s+called)?\s+)?([A-Z][a-z]+)\b",
+                // A partner predicate is not necessarily a naming statement:
+                // "my wife is feeling better" must never supersede her name.
+                r"(?i)\bmy (?:wife|husband|partner|girlfriend|boyfriend|fiancee?|spouse) is\s+(?:named|called)\s+([A-Z][a-z]+)\b",
                 Single {
                     attribute: "partner_name",
                     slot_type: FactSlotType::State,
@@ -1160,14 +1162,15 @@ impl FactExtractor {
                         let Some(raw) = capture.get(1).map(|value| clean(value.as_str())) else {
                             continue;
                         };
-                        if raw.chars().count() < 2 {
-                            continue;
-                        }
                         let value = if numeric {
-                            raw.parse::<i64>()
-                                .map(FactValue::Integer)
-                                .unwrap_or_else(|_| FactValue::Text(raw.clone()))
+                            let Ok(number) = raw.parse::<i64>() else {
+                                continue;
+                            };
+                            FactValue::Integer(number)
                         } else {
+                            if raw.chars().count() < 2 {
+                                continue;
+                            }
                             FactValue::Text(raw)
                         };
                         push(
