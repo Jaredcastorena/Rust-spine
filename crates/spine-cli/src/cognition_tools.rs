@@ -7,8 +7,8 @@ use std::{
 use async_trait::async_trait;
 use spine_heart::{
     AgentId, Content, Embedding, EventId, EventKind, Fact, FactAggregation, FactQueryAggregation,
-    FactSlotType, FactValue, InteractionInput, ParticipantRole, Provenance, RehydrateBudget,
-    RecallHit, SemanticEncoder, SpineHeart, ThreadId,
+    FactSlotType, FactValue, InteractionInput, ParticipantRole, Provenance, RecallHit,
+    RehydrateBudget, SemanticEncoder, SpineHeart, ThreadId,
 };
 use spine_runtime::{
     Tool, ToolCall, ToolCategory, ToolContext, ToolRegistry, ToolResult, ToolRisk, ToolSpec,
