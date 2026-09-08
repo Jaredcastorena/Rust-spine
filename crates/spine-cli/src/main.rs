@@ -1549,7 +1549,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // this checkpoint was saved. Only its effective policy is known.
                         harness.set_tool_metadata(BTreeMap::from([(
                             "spine_modulation".into(),
-                            serde_json::to_string(&resumable.policy)?,
+                            serde_json::to_string(&harness.policy_for_checkpoint(&resumable))?,
                         )]))?;
                         assert!(
                             circuit_breaker.allow(ResilienceChannel::Llm, Instant::now()),
@@ -3221,7 +3221,7 @@ mod cli_tests {
             pending_task: task.into(),
             host_plan: None,
             completed_action_calls: 0,
-            policy: spine_runtime::HarnessPolicy::default(),
+            policy: Some(spine_runtime::HarnessPolicy::default()),
         }
     }
 

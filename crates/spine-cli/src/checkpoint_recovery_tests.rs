@@ -52,7 +52,7 @@ fn seed(heart: &SpineHeart, encoder: &TestEncoder) -> PersistedHarnessCheckpoint
         completed_action_calls: 0,
         pending_task: "continue".into(),
         host_plan: None,
-        policy: HarnessPolicy::default(),
+        policy: Some(HarnessPolicy::default()),
     };
     let (receipt, _) = heart
         .commit_embedded(

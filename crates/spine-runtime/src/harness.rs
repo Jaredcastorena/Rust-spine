@@ -124,8 +124,9 @@ pub struct HarnessCheckpoint {
     pub pending_task: String,
     #[serde(default)]
     pub host_plan: Option<HostPlan>,
-    #[serde(default)]
-    pub policy: HarnessPolicy,
+    /// Legacy records omitted policy; an explicit saved policy may be unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<HarnessPolicy>,
 }
 
 impl HarnessCheckpoint {
@@ -212,12 +213,12 @@ impl HarnessCheckpoint {
         }
         if self
             .policy
-            .temperature
+            .and_then(|policy| policy.temperature)
             .is_some_and(|value| !value.is_finite() || value < 0.0)
             || self.completed_action_calls as u128 > u128::from(self.completed_tool_calls)
             || self
                 .policy
-                .max_action_calls
+                .and_then(|policy| policy.max_action_calls)
                 .is_some_and(|limit| self.completed_action_calls > limit.get())
         {
             return Err(invalid_checkpoint(
@@ -532,6 +533,11 @@ impl Harness {
         }
     }
 
+    /// Only pre-policy checkpoints inherit this harness's configured ceiling.
+    pub fn policy_for_checkpoint(&self, checkpoint: &HarnessCheckpoint) -> HarnessPolicy {
+        checkpoint.policy.unwrap_or_else(|| self.default_policy())
+    }
+
     /// Continue a completed draft for host verification without refreshing its budgets.
     /// Graceful stops require an explicit checkpoint resume instead.
     pub async fn repair(
@@ -566,13 +572,13 @@ impl Harness {
 
     pub async fn resume(&self, checkpoint: HarnessCheckpoint) -> Result<RunOutcome> {
         checkpoint.validate()?;
+        let policy = self.policy_for_checkpoint(&checkpoint);
         let mut messages = checkpoint.messages;
         messages.push(Message::new(
             MessageRole::User,
             "[RESUME FROM SAFE CHECKPOINT] Continue the open task from the retained tool results and obligations.",
         ));
         let host_plan = checkpoint.host_plan;
-        let policy = checkpoint.policy;
         self.append_open_plan_prompt(&mut messages, host_plan.as_ref());
         self.run_messages(
             messages,
@@ -956,7 +962,7 @@ impl Harness {
             completed_action_calls: completed.action_calls,
             pending_task: task,
             host_plan: host_plan.clone(),
-            policy,
+            policy: Some(policy),
         });
         Ok(RunOutcome {
             response,

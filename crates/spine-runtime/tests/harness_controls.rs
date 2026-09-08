@@ -301,6 +301,61 @@ async fn per_run_policy_can_expand_a_positive_tool_ceiling() {
 }
 
 #[tokio::test]
+async fn legacy_checkpoint_without_policy_inherits_configured_total_round_limit() {
+    let executed = Arc::new(Mutex::new(Vec::new()));
+    let initial = Harness::new(
+        Arc::new(ScriptedProvider::new(vec![
+            tool_turn(vec![call(1)]),
+            answer("paused"),
+        ])),
+        registry(Arc::clone(&executed)),
+        HarnessConfig::default(),
+    )
+    .unwrap();
+    initial.controls().request_graceful_stop();
+    let saved = initial
+        .run("system", "inspect")
+        .await
+        .unwrap()
+        .checkpoint
+        .unwrap();
+    let mut legacy_json = serde_json::to_value(&saved).unwrap();
+    legacy_json.as_object_mut().unwrap().remove("policy");
+    let legacy: HarnessCheckpoint = serde_json::from_value(legacy_json).unwrap();
+    let record = legacy
+        .to_interaction(
+            AgentId::new("main").unwrap(),
+            ThreadId::new("interactive").unwrap(),
+        )
+        .unwrap();
+    let restored = HarnessCheckpoint::from_interaction(&record).unwrap();
+    assert!(
+        restored.policy.is_none(),
+        "persistence must not convert a missing legacy policy into explicit unlimited"
+    );
+    let resumed = Harness::new(
+        Arc::new(ScriptedProvider::new(vec![
+            tool_turn(vec![call(2)]),
+            answer("at ceiling"),
+        ])),
+        registry(Arc::clone(&executed)),
+        HarnessConfig {
+            max_tool_rounds: NonZeroU64::new(1),
+            ..HarnessConfig::default()
+        },
+    )
+    .unwrap();
+    let outcome = resumed.resume(restored).await.unwrap();
+    assert_eq!(
+        &*executed.lock().unwrap(),
+        &["1"],
+        "legacy resume must not execute past the configured total ceiling"
+    );
+    assert_eq!(outcome.completed_tool_rounds, 1);
+    assert_eq!(outcome.policy.max_tool_rounds, NonZeroU64::new(1));
+}
+
+#[tokio::test]
 async fn checkpoint_preserves_effective_tool_ceiling_across_new_harness_config() {
     for original_ceiling in [None, NonZeroU64::new(2)] {
         let executed = Arc::new(Mutex::new(Vec::new()));
@@ -324,9 +379,14 @@ async fn checkpoint_preserves_effective_tool_ceiling_across_new_harness_config()
             .unwrap()
             .checkpoint
             .unwrap();
-        let checkpoint: HarnessCheckpoint =
-            serde_json::from_str(&serde_json::to_string(&checkpoint).unwrap()).unwrap();
-        assert_eq!(checkpoint.policy.max_tool_rounds, original_ceiling);
+        let record = checkpoint
+            .to_interaction(
+                AgentId::new("main").unwrap(),
+                ThreadId::new("interactive").unwrap(),
+            )
+            .unwrap();
+        let checkpoint = HarnessCheckpoint::from_interaction(&record).unwrap();
+        assert_eq!(checkpoint.policy.unwrap().max_tool_rounds, original_ceiling);
 
         let provider = Arc::new(ScriptedProvider::new(vec![
             tool_turn(vec![call(2)]),
@@ -410,7 +470,7 @@ async fn repair_keeps_action_budget_and_checkpoint_counters_from_the_draft() {
     assert_eq!(checkpoint.completed_action_calls, 1);
     assert_eq!(checkpoint.completed_tool_calls, 1);
     assert_eq!(checkpoint.completed_tool_rounds, 2);
-    assert_eq!(checkpoint.policy, policy);
+    assert_eq!(checkpoint.policy, Some(policy));
     checkpoint.validate().unwrap();
     let count = {
         let requests = provider.requests.lock().unwrap();
@@ -499,7 +559,7 @@ async fn exhausted_checkpoint_action_budget_still_honors_stop_and_policy() {
     assert_eq!(&*executed.lock().unwrap(), &["1"]);
     let checkpoint = resumed.checkpoint.unwrap();
     assert_eq!(checkpoint.completed_action_calls, 1);
-    assert_eq!(checkpoint.policy, policy);
+    assert_eq!(checkpoint.policy, Some(policy));
     assert_eq!(checkpoint.completed_tool_rounds, 2);
     assert_eq!(checkpoint.completed_tool_calls, 1);
     checkpoint
@@ -740,7 +800,7 @@ async fn resume_restores_and_prompts_the_open_host_plan_step() {
         completed_action_calls: 0,
         pending_task: "inspect".into(),
         host_plan: Some(plan),
-        policy: spine_runtime::HarnessPolicy::default(),
+        policy: Some(spine_runtime::HarnessPolicy::default()),
     };
 
     let result = harness.resume(checkpoint).await.unwrap();
@@ -770,7 +830,7 @@ fn checkpoint_interactions_round_trip_only_after_strict_validation() {
         pending_task: "inspect".into(),
         host_plan: None,
         completed_action_calls: 0,
-        policy: spine_runtime::HarnessPolicy::default(),
+        policy: Some(spine_runtime::HarnessPolicy::default()),
     };
     let mut interaction = checkpoint
         .to_interaction(
@@ -805,7 +865,7 @@ fn checkpoint_validation_rejects_unsafe_boundaries_and_impossible_counters() {
         pending_task: "inspect".into(),
         host_plan: None,
         completed_action_calls: 0,
-        policy: spine_runtime::HarnessPolicy::default(),
+        policy: Some(spine_runtime::HarnessPolicy::default()),
     };
     checkpoint.messages[2] = Message::assistant("", None, vec![call(1)]);
     assert!(checkpoint.validate().is_err());
@@ -818,11 +878,11 @@ fn checkpoint_validation_rejects_unsafe_boundaries_and_impossible_counters() {
     checkpoint.completed_action_calls = 1;
     assert!(checkpoint.validate().is_err());
     checkpoint.completed_action_calls = 0;
-    checkpoint.policy.temperature = Some(f32::NAN);
+    checkpoint.policy.as_mut().unwrap().temperature = Some(f32::NAN);
     assert!(checkpoint.validate().is_err());
-    checkpoint.policy.temperature = Some(-1.0);
+    checkpoint.policy.as_mut().unwrap().temperature = Some(-1.0);
     assert!(checkpoint.validate().is_err());
-    checkpoint.policy.temperature = None;
+    checkpoint.policy.as_mut().unwrap().temperature = None;
     checkpoint.schema = 2;
     assert!(checkpoint.validate().is_err());
 
