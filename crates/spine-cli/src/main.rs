@@ -722,7 +722,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cognitive_config.model.dimension,
                 cognitive_config.thymos_channels,
             )?;
-            let harness = Harness::new(
+            let mut harness = Harness::new(
                 provider.clone(),
                 registry,
                 HarnessConfig {
@@ -1142,6 +1142,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             max_action_calls: NonZeroUsize::new(policy.max_actions),
                             max_tool_rounds: policy.max_tool_rounds,
                         };
+                        harness.set_tool_metadata(turn_introspection_metadata(
+                            &user_commit.1,
+                            &policy,
+                            temperature,
+                            grounding.is_some(),
+                            risk_estimate,
+                        )?)?;
                         let system_prompt = format!(
                             "{partner_system_prompt}\n\nCurrent committed Thymos proprioception: {feeling}\nCommitted trajectory surprise: {:.3}. Host risk estimate for this memory region: {risk_context}. Host policy is enforced at recall_k={}, temperature={:.3}, action_budget={}, and coverage_threshold={:.3}. At higher or unavailable risk, deepen recall and avoid unsupported certainty.\n\nAutomatically recalled canonical evidence for this turn (it may be irrelevant; verify before using):\n{recalled}\n\nBudgeted triangle-context rehydration:\n{triangle_context}\n\nRunning/recent host tasks:\n{}",
                             user_commit.1.trajectory.surprise,
@@ -1538,6 +1545,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         };
                         persist_start = resumable.messages.len() + 1;
+                        // A different turn may have replaced the host snapshot since
+                        // this checkpoint was saved. Only its effective policy is known.
+                        harness.set_tool_metadata(BTreeMap::from([(
+                            "spine_modulation".into(),
+                            serde_json::to_string(&resumable.policy)?,
+                        )]))?;
                         assert!(
                             circuit_breaker.allow(ResilienceChannel::Llm, Instant::now()),
                             "an available LLM circuit accepts its pending resume"
@@ -1777,7 +1790,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cognitive_config.model.dimension,
                 cognitive_config.thymos_channels,
             )?;
-            let harness = Harness::new(
+            let mut harness = Harness::new(
                 provider,
                 registry,
                 HarnessConfig {
@@ -1841,6 +1854,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     policy.recall_expansion_depth(),
                 )?;
             }
+            harness.set_tool_metadata(turn_introspection_metadata(
+                &user_commit.1,
+                &policy,
+                temperature,
+                false,
+                Some(risk),
+            )?)?;
             let system_prompt = format!(
                 "{partner_system_prompt}\n\nCurrent committed Thymos proprioception: {}\nCommitted trajectory surprise: {:.3}. Host risk estimate: {risk:.3}. Host policy is enforced at recall_k={}, temperature={:.3}, and action_budget={}.\n\nAutomatically recalled canonical evidence:\n{}\n\nBudgeted triangle-context rehydration:\n{triangle_context}",
                 serde_json::to_string(&user_commit.1.feeling)
@@ -2952,10 +2972,47 @@ fn resilient_automatic_recall(
     } else {
         eprintln!("[memory recall skipped: DCMDB circuit is open]");
     }
-    cognition_tools::AutomaticRecall {
-        context: "[]".into(),
-        hits: Vec::new(),
-    }
+    let layout = heart
+        .cognition()
+        .ok()
+        .flatten()
+        .map_or(6, |state| state.config.retrieval_stat_dimensions);
+    cognition_tools::AutomaticRecall::empty_for_layout(layout)
+}
+
+fn turn_introspection_metadata(
+    receipt: &spine_heart::MemoryReceipt,
+    policy: &spine_runtime::HostModulation,
+    base_temperature: f32,
+    nli_enabled: bool,
+    risk_estimate: Option<f32>,
+) -> Result<BTreeMap<String, String>, serde_json::Error> {
+    let mut modulation = serde_json::to_value(policy)?;
+    modulation["reason_temp_modifier"] =
+        serde_json::json!((base_temperature - policy.provider_temperature).max(0.0));
+    Ok(BTreeMap::from([
+        (
+            "spine_trajectory".into(),
+            serde_json::to_string(&receipt.trajectory)?,
+        ),
+        (
+            "spine_modulation".into(),
+            serde_json::to_string(&modulation)?,
+        ),
+        (
+            "spine_risk_policy".into(),
+            serde_json::json!({
+                "risk_estimate": risk_estimate,
+                "available": risk_estimate.is_some(),
+                "effective_risk": policy.risk,
+                "coverage_threshold": policy.coverage_threshold,
+                "expansion_probability": policy.expansion_probability,
+                "nli_enabled": nli_enabled,
+                "risk_enabled": true,
+            })
+            .to_string(),
+        ),
+    ]))
 }
 
 fn catch_up_stale_cognition(
@@ -3099,6 +3156,53 @@ fn persist_harness_messages(
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+
+    #[test]
+    fn host_introspection_exposes_committed_signals_and_honest_unknown_risk() {
+        let receipt = spine_heart::MemoryReceipt {
+            event_id: EventId::from_bytes([1; 32]),
+            node_id: spine_heart::NodeId::from_bytes([2; 32]),
+            feeling: spine_heart::FeelingVector {
+                raw: vec![0.0; 2],
+                activated: vec![0.0; 2],
+                valence: 0.0,
+                arousal: 0.0,
+                dominant_channel: 0,
+                dominant_label: None,
+                input_norm: 1.0,
+            },
+            trajectory: spine_heart::TrajectoryStep {
+                surprise: 1.2,
+                speed: 0.4,
+                heading_norm: 0.8,
+            },
+        };
+        let policy = ModulationConfig::default().compute(ModulationInput {
+            surprise: receipt.trajectory.surprise,
+            valence: 0.0,
+            arousal: 0.0,
+            risk: 1.0,
+            tensions: 0,
+            base_temperature: 0.7,
+            configured_tool_rounds: None,
+        });
+        let values = turn_introspection_metadata(&receipt, &policy, 0.7, true, None).unwrap();
+        let trajectory: serde_json::Value =
+            serde_json::from_str(&values["spine_trajectory"]).unwrap();
+        let modulation: serde_json::Value =
+            serde_json::from_str(&values["spine_modulation"]).unwrap();
+        let risk: serde_json::Value = serde_json::from_str(&values["spine_risk_policy"]).unwrap();
+        assert_eq!(
+            trajectory["surprise"],
+            serde_json::json!(receipt.trajectory.surprise)
+        );
+        assert_eq!(modulation["max_actions"], 1);
+        assert!(modulation["max_tool_rounds"].is_null());
+        assert_eq!(risk["available"], false);
+        assert!(risk["risk_estimate"].is_null());
+        assert_eq!(risk["effective_risk"], 1.0);
+        assert_eq!(risk["nli_enabled"], true);
+    }
 
     fn checkpoint(harness_id: &str, task: &str) -> HarnessCheckpoint {
         HarnessCheckpoint {
