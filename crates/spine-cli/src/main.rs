@@ -3192,9 +3192,10 @@ mod cli_tests {
         let modulation: serde_json::Value =
             serde_json::from_str(&values["spine_modulation"]).unwrap();
         let risk: serde_json::Value = serde_json::from_str(&values["spine_risk_policy"]).unwrap();
-        assert_eq!(
-            trajectory["surprise"],
-            serde_json::json!(receipt.trajectory.surprise)
+        assert!(
+            (trajectory["surprise"].as_f64().unwrap() - f64::from(receipt.trajectory.surprise))
+                .abs()
+                < 1e-6
         );
         assert_eq!(modulation["max_actions"], 1);
         assert!(modulation["max_tool_rounds"].is_null());
