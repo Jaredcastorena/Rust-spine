@@ -388,7 +388,9 @@ impl SpineHeart {
         {
             return Err(HeartError::ProjectionStale);
         }
-        for event in canonical.into_iter().skip(projected_events) {
+        let previous = state.clone();
+        let mut samples = Vec::new();
+        for event in canonical.iter().skip(projected_events) {
             let projected = state
                 .event_frontier
                 .get(&event.body.device_id)
@@ -397,18 +399,32 @@ impl SpineHeart {
                 !projected,
                 "suffix validation rejects projected tail events"
             );
-            if let Some(text) = CognitiveState::inline_text(&event) {
-                state.observe(&event, encoder.encode(text)?)?;
+            if let Some(text) = CognitiveState::inline_text(event) {
+                let before_updates =
+                    agent_observation_frontier(&state, &event.body.interaction.agent_id)?;
+                let memory = state.observe(event, encoder.encode(text)?)?;
+                samples.extend(observed_feeling(
+                    &state,
+                    event,
+                    &memory.feeling,
+                    before_updates,
+                )?);
             } else {
-                state.acknowledge_unembedded(&event);
+                state.acknowledge_unembedded(event);
             }
         }
         if !state.is_current(&canonical_frontier) {
             return Err(HeartError::ProjectionStale);
         }
         state.triangles.verify(&state.dcmdb)?;
-        self.store
-            .put_projection(self.config.projection_generation, &state)?;
+        self.store.put_projection_with_history(
+            self.config.projection_generation,
+            Some(&previous),
+            &state,
+            &samples,
+            false,
+            &canonical.iter().map(|event| event.id).collect::<Vec<_>>(),
+        )?;
         Ok(state)
     }
 
@@ -1188,6 +1204,149 @@ mod fact_upgrade_tests {
             reopened.thymos_diagnostics(&agent),
             Err(HeartError::ProjectionStale)
         ));
+    }
+
+    #[test]
+    fn suffix_history_retry_is_atomic_and_preserves_learned_context_after_reopen() {
+        struct SuffixEncoder {
+            manifest: ModelManifest,
+            fail_second: bool,
+        }
+        impl SemanticEncoder for SuffixEncoder {
+            fn manifest(&self) -> &ModelManifest {
+                &self.manifest
+            }
+            fn encode(&self, text: &str) -> Result<Embedding> {
+                if self.fail_second && text == "suffix-two" {
+                    return Err(HeartError::InvalidInput(
+                        "test suffix encoder failure".into(),
+                    ));
+                }
+                Embedding::normalized(
+                    if text == "suffix-one" {
+                        vec![0.2, 1.0, 0.1]
+                    } else {
+                        vec![1.0, 0.2, 0.4]
+                    },
+                    3,
+                )
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("suffix-diagnostics.spine");
+        let heart = heart(&path);
+        let agent = AgentId::new("main").unwrap();
+        let mut feelings = Vec::new();
+        let mut leaves = Vec::new();
+        for index in 0..12 {
+            let vector = Embedding::normalized(
+                if index % 2 == 0 {
+                    vec![1.0, 0.0, 0.0]
+                } else {
+                    vec![0.82, 0.57, 0.0]
+                },
+                3,
+            )
+            .unwrap();
+            let before = agent_update_count(&heart.cognition().unwrap().unwrap(), &agent);
+            let (commit, memory) = heart
+                .commit_embedded(input(&format!("prefix-{index}")), vector)
+                .unwrap();
+            if agent_update_count(&heart.cognition().unwrap().unwrap(), &agent) > before {
+                feelings.push(memory.feeling);
+            }
+            if index < 2 {
+                leaves.push(ContextLeaf {
+                    node_id: memory.node_id,
+                    chronology: commit.event.body.device_sequence,
+                });
+            }
+        }
+        heart.compact_context(leaves, 1).unwrap();
+        heart
+            .update_risk(
+                &agent,
+                &Embedding::normalized(vec![0.0, 0.0, 1.0], 3).unwrap(),
+                &[0.5; 6],
+                0.9,
+            )
+            .unwrap();
+        let previous = heart.cognition().unwrap().unwrap();
+        assert!(!previous.triangles.triangles.is_empty());
+        let old_summary = heart.thymos_diagnostics(&agent).unwrap().unwrap();
+        let previous_history =
+            postcard::to_allocvec(&heart.store.diagnostic_history(1).unwrap()).unwrap();
+        heart.commit_interaction(input("suffix-one")).unwrap();
+        let mut assistant = input("suffix-assistant");
+        assistant.role = ParticipantRole::Assistant;
+        heart.commit_interaction(assistant).unwrap();
+        heart.commit_interaction(input("suffix-two")).unwrap();
+        let mut encoder = SuffixEncoder {
+            manifest: previous.config.model.clone(),
+            fail_second: true,
+        };
+
+        assert!(heart.catch_up_cognition(&encoder).is_err());
+        assert_eq!(heart.cognition().unwrap().unwrap(), previous);
+        assert_eq!(
+            postcard::to_allocvec(&heart.store.diagnostic_history(1).unwrap()).unwrap(),
+            previous_history
+        );
+
+        encoder.fail_second = false;
+        let mut expected = previous.clone();
+        for event in heart
+            .events_canonical()
+            .unwrap()
+            .iter()
+            .skip(previous.projected_events as usize)
+        {
+            let before = agent_update_count(&expected, &agent);
+            let memory = expected
+                .observe(
+                    event,
+                    encoder
+                        .encode(CognitiveState::inline_text(event).unwrap())
+                        .unwrap(),
+                )
+                .unwrap();
+            if agent_update_count(&expected, &agent) > before {
+                feelings.push(memory.feeling);
+            }
+        }
+        let recovered = heart.catch_up_cognition(&encoder).unwrap();
+        assert_eq!(recovered, expected);
+        assert_eq!(recovered.risk, previous.risk);
+        assert_eq!(recovered.triangles, previous.triangles);
+        let summary = heart.thymos_diagnostics(&agent).unwrap().unwrap();
+        assert_eq!(
+            summary["history_length"].as_u64().unwrap(),
+            old_summary["history_length"].as_u64().unwrap() + 2
+        );
+        assert_eq!(summary["history_current"], true);
+        assert_eq!(summary["trend_window_complete"], true);
+        let expected_trend = feelings
+            .iter()
+            .rev()
+            .take(10)
+            .map(|feeling| f64::from(feeling.valence))
+            .sum::<f64>()
+            / 10.0;
+        assert!((summary["valence_trend"].as_f64().unwrap() - expected_trend).abs() < 1e-9);
+        heart.catch_up_cognition(&encoder).unwrap();
+        assert_eq!(heart.thymos_diagnostics(&agent).unwrap().unwrap(), summary);
+        drop(heart);
+        let reopened = SpineHeart::open(
+            HeartConfig::new(&path),
+            KeySource::Passphrase("upgrade-pass".into()),
+        )
+        .unwrap();
+        assert_eq!(reopened.cognition().unwrap().unwrap(), recovered);
+        assert_eq!(
+            reopened.thymos_diagnostics(&agent).unwrap().unwrap(),
+            summary
+        );
     }
 
     #[test]
