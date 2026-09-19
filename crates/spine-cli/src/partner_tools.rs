@@ -23,7 +23,7 @@ use spine_runtime::{
 use tokio::{process::Command, time::timeout};
 use walkdir::WalkDir;
 
-const MAX_FILE_READ_CHARS: usize = 50_000;
+const MAX_FILE_READ_CHARS: usize = 12_000;
 const MAX_WEB_CHARS: usize = 12_000;
 const MAX_WEB_BODY_BYTES: usize = 2 * 1024 * 1024;
 
@@ -99,12 +99,12 @@ impl Tool for FileReadTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "file_read".into(),
-            description: "Read a UTF-8 text file, returning its path, size, and contents.".into(),
+            description: "Read a text file in bounded pages. offset is a zero-based Unicode character offset; use next_offset to continue. max_chars limits page content.".into(),
             category: ToolCategory::Internal,
             risk: ToolRisk::ReadOnly,
             parameters: serde_json::json!({
                 "type":"object",
-                "properties":{"path":{"type":"string"}},
+                "properties":{"path":{"type":"string"},"offset":{"type":"integer","minimum":0},"max_chars":{"type":"integer","minimum":1,"maximum":12000}},
                 "required":["path"],
                 "additionalProperties":false
             }),
@@ -114,7 +114,7 @@ impl Tool for FileReadTool {
     async fn execute(
         &self,
         call: &ToolCall,
-        _context: &ToolContext,
+        context: &ToolContext,
     ) -> spine_runtime::Result<ToolResult> {
         let Some(path) = string_arg(call, "path").filter(|value| !value.trim().is_empty()) else {
             return Ok(ToolResult::failure("path is required"));
@@ -126,19 +126,73 @@ impl Tool for FileReadTool {
             }
             let bytes = fs::read(&path).map_err(|error| error.to_string())?;
             let text = String::from_utf8_lossy(&bytes);
-            let truncated: String = text.chars().take(MAX_FILE_READ_CHARS).collect();
-            Ok(format!(
-                "File: {}\nSize: {} chars, {} lines\n\n=== Content ===\n{}{}",
-                path.display(),
-                text.chars().count(),
-                text.lines().count().max(1),
-                truncated,
-                if text.chars().count() > MAX_FILE_READ_CHARS {
-                    "\n[truncated]"
-                } else {
-                    ""
+            let integer_arg = |name: &str, default: usize| -> Result<usize, String> {
+                match call.arguments.get(name) {
+                    None => Ok(default),
+                    Some(value) => value
+                        .as_u64()
+                        .and_then(|value| usize::try_from(value).ok())
+                        .ok_or_else(|| format!("{name} must be a nonnegative integer")),
                 }
-            ))
+            };
+            let offset = integer_arg("offset", 0)?;
+            let requested = integer_arg("max_chars", MAX_FILE_READ_CHARS)?;
+            if requested == 0 || requested > MAX_FILE_READ_CHARS {
+                return Err(format!(
+                    "max_chars must be between 1 and {MAX_FILE_READ_CHARS}"
+                ));
+            }
+            let total = text.chars().count();
+            if offset > total {
+                return Err(format!("offset {offset} exceeds file length {total}"));
+            }
+            let budget = context
+                .metadata
+                .get("max_tool_result_chars")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(16_384);
+            let header = |end: usize| {
+                let next = if end < total {
+                    end.to_string()
+                } else {
+                    "null".into()
+                };
+                format!(
+                    "File: {}
+Size: {} chars, {} lines
+Offset: {}
+End offset: {}
+next_offset: {}
+Continue with file_read using offset=next_offset; null means EOF.
+
+=== Content ===
+",
+                    path.display(),
+                    total,
+                    text.lines().count(),
+                    offset,
+                    end,
+                    next
+                )
+            };
+            // Reserve the widest possible cursor header before selecting content.
+            let reserved = header(total)
+                .chars()
+                .count()
+                .max(header(total.saturating_sub(1)).chars().count());
+            let available = budget.checked_sub(reserved).ok_or_else(|| {
+                "file_read output budget is too small for pagination metadata".to_owned()
+            })?;
+            if available == 0 && offset < total {
+                return Err("file_read output budget leaves no room for content".into());
+            }
+            let page: String = text
+                .chars()
+                .skip(offset)
+                .take(requested.min(available))
+                .collect();
+            let end = offset + page.chars().count();
+            Ok(header(end) + &page)
         })();
         Ok(match result {
             Ok(output) => ToolResult::success(output),
@@ -1603,3 +1657,7 @@ mod tests {
         server.abort();
     }
 }
+
+#[cfg(test)]
+#[path = "pagination_tests.rs"]
+mod pagination_tests;

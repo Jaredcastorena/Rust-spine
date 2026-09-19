@@ -554,6 +554,10 @@ impl Harness {
         } else {
             let mut metadata = std::collections::BTreeMap::new();
             metadata.insert("task".into(), task.into());
+            metadata.insert(
+                "max_tool_result_chars".into(),
+                self.config.max_tool_result_chars.to_string(),
+            );
             tool.execute(
                 call,
                 &ToolContext {
