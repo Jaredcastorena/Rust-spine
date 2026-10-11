@@ -1,4 +1,4 @@
-FROM rust:1.98.0-alpine3.22@sha256:2e452153b2dc6bed8ef123c4801cfd3f637e7c092846f974ecdce5e64af3120c AS builder
+FROM rust:1.99.0-alpine3.22@sha256:c3a5ad77ff2e5ec99fffaf62cb518e61a9dcbd9e1d7526d281a380db0be3bb3b AS builder
 
 ENV RUSTUP_TOOLCHAIN=1.98.0
 WORKDIR /build
