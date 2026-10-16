@@ -2444,7 +2444,7 @@ dependencies = [
 
 [[package]]
 name = "spine-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2469,7 +2469,7 @@ dependencies = [
 
 [[package]]
 name = "spine-heart"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "argon2",
  "bip39",
@@ -2495,7 +2495,7 @@ dependencies = [
 
 [[package]]
 name = "spine-models"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "candle-core",
@@ -2509,7 +2509,7 @@ dependencies = [
 
 [[package]]
 name = "spine-runtime"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "axum",
