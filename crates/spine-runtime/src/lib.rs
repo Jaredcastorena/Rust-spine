@@ -2,6 +2,7 @@
 
 mod harness;
 mod llama_cpp;
+mod modulation;
 mod plan;
 mod provider;
 mod subagent;
@@ -9,9 +10,11 @@ mod tool;
 mod tool_parser;
 
 pub use harness::{
-    ControlPlane, Harness, HarnessCheckpoint, HarnessConfig, HarnessEvent, RunOutcome,
+    ControlPlane, Harness, HarnessCheckpoint, HarnessConfig, HarnessEvent, HarnessPolicy,
+    RunOutcome,
 };
 pub use llama_cpp::{LlamaCppConfig, LlamaCppProvider};
+pub use modulation::{HostModulation, ModulationConfig, ModulationInput};
 pub use plan::{HostPlan, PlanStep, PlanStepStatus, parse_plan_steps, promised_more_work};
 pub use provider::{CompletionRequest, Message, MessageRole, ModelProvider, ModelTurn, TokenUsage};
 pub use subagent::{SubagentHarness, SubagentHarnessFactory};

@@ -216,6 +216,40 @@ impl ContextForest {
         Ok(())
     }
 
+    /// Return every DCMDb coordinate reachable from the live context roots.
+    /// Maintenance must not prune these nodes while a triangle still addresses them.
+    pub fn referenced_nodes(&self) -> BTreeSet<NodeId> {
+        let mut nodes = BTreeSet::new();
+        let mut triangles = BTreeSet::new();
+        for root in &self.roots {
+            self.collect_referenced_nodes(root.handle, &mut triangles, &mut nodes);
+        }
+        nodes
+    }
+
+    fn collect_referenced_nodes(
+        &self,
+        handle: ContextHandle,
+        seen_triangles: &mut BTreeSet<TriangleId>,
+        nodes: &mut BTreeSet<NodeId>,
+    ) {
+        match handle {
+            ContextHandle::Node(node_id) => {
+                nodes.insert(node_id);
+            }
+            ContextHandle::Triangle(triangle_id) => {
+                if !seen_triangles.insert(triangle_id) {
+                    return;
+                }
+                if let Some(triangle) = self.triangles.get(&triangle_id) {
+                    nodes.insert(triangle.apex);
+                    self.collect_referenced_nodes(triangle.left, seen_triangles, nodes);
+                    self.collect_referenced_nodes(triangle.right, seen_triangles, nodes);
+                }
+            }
+        }
+    }
+
     pub fn rehydrate(
         &self,
         root: ContextHandle,

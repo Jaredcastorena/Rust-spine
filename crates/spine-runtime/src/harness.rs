@@ -1,6 +1,6 @@
 use std::{
     collections::VecDeque,
-    num::NonZeroU64,
+    num::{NonZeroU64, NonZeroUsize},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -11,9 +11,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use crate::{
-    CompletionRequest, HostPlan, Message, MessageRole, ModelProvider, Result, RuntimeError,
-    TokenUsage, ToolCall, ToolCategory, ToolContext, ToolRegistry, ToolResult, ToolRisk,
-    parse_plan_steps, promised_more_work,
+    CompletionRequest, HostPlan, Message, MessageRole, ModelProvider, PlanStepStatus, Result,
+    RuntimeError, TokenUsage, ToolCall, ToolCategory, ToolContext, ToolRegistry, ToolResult,
+    ToolRisk, parse_plan_steps, promised_more_work,
 };
 
 const PLAN_GUIDANCE_MARKER: &str = "[HOST PLAN CONTRACT]";
@@ -38,6 +38,23 @@ impl Default for HarnessConfig {
             max_empty_plan_continuations: 8,
         }
     }
+}
+
+/// Per-run controls selected by host policy from committed cognitive state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessPolicy {
+    pub temperature: Option<f32>,
+    pub max_action_calls: Option<NonZeroUsize>,
+    /// Effective ceiling for this run; `None` explicitly means unlimited.
+    pub max_tool_rounds: Option<NonZeroU64>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CompletedWork {
+    tool_calls: u64,
+    tool_rounds: u64,
+    action_calls: usize,
 }
 
 #[derive(Default)]
@@ -94,26 +111,36 @@ impl OperatorControls {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HarnessCheckpoint {
     pub schema: u32,
     pub harness_id: String,
     pub messages: Vec<Message>,
     pub completed_tool_calls: u64,
     pub completed_tool_rounds: u64,
+    #[serde(default)]
+    pub completed_action_calls: usize,
     pub pending_task: String,
     #[serde(default)]
     pub host_plan: Option<HostPlan>,
+    /// Legacy records omitted policy; an explicit saved policy may be unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<HarnessPolicy>,
 }
 
 impl HarnessCheckpoint {
+    pub const RECORD_TYPE: &'static str = "harness_checkpoint";
+    pub const OUTCOME: &'static str = "graceful_stop_checkpoint";
+
     pub fn to_interaction(
         &self,
         agent_id: spine_heart::AgentId,
         thread_id: spine_heart::ThreadId,
     ) -> Result<spine_heart::InteractionInput> {
+        self.validate()?;
         let mut metadata = std::collections::BTreeMap::new();
-        metadata.insert("record_type".into(), "harness_checkpoint".into());
+        metadata.insert("record_type".into(), Self::RECORD_TYPE.into());
         metadata.insert("harness_id".into(), self.harness_id.clone());
         Ok(spine_heart::InteractionInput {
             agent_id,
@@ -128,9 +155,202 @@ impl HarnessCheckpoint {
             },
             tool: None,
             attachments: Vec::new(),
-            outcome: Some("graceful_stop_checkpoint".into()),
+            outcome: Some(Self::OUTCOME.into()),
         })
     }
+
+    pub fn from_interaction(interaction: &spine_heart::InteractionInput) -> Result<Self> {
+        if interaction.role != spine_heart::ParticipantRole::Operator
+            || interaction.kind != spine_heart::EventKind::Control
+            || interaction.outcome.as_deref() != Some(Self::OUTCOME)
+            || interaction
+                .provenance
+                .metadata
+                .get("record_type")
+                .map(String::as_str)
+                != Some(Self::RECORD_TYPE)
+            || interaction.tool.is_some()
+            || !interaction.attachments.is_empty()
+        {
+            return Err(invalid_checkpoint(
+                "persisted record does not have the checkpoint envelope",
+            ));
+        }
+        let spine_heart::Content::Inline(content) = &interaction.content else {
+            return Err(invalid_checkpoint("checkpoint content is not inline JSON"));
+        };
+        let checkpoint: Self = serde_json::from_str(content)
+            .map_err(|error| invalid_checkpoint(format!("invalid checkpoint JSON: {error}")))?;
+        checkpoint.validate()?;
+        if interaction
+            .provenance
+            .metadata
+            .get("harness_id")
+            .map(String::as_str)
+            != Some(checkpoint.harness_id.as_str())
+        {
+            return Err(invalid_checkpoint(
+                "checkpoint metadata does not match its payload",
+            ));
+        }
+        Ok(checkpoint)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.schema != 1 {
+            return Err(invalid_checkpoint("unsupported checkpoint schema"));
+        }
+        if self.harness_id.trim().is_empty()
+            || self.harness_id.trim() != self.harness_id
+            || self.harness_id.len() > 256
+        {
+            return Err(invalid_checkpoint(
+                "harness id must contain 1..=256 trimmed bytes",
+            ));
+        }
+        if self.pending_task.trim().is_empty() {
+            return Err(invalid_checkpoint("pending task is empty"));
+        }
+        if self
+            .policy
+            .and_then(|policy| policy.temperature)
+            .is_some_and(|value| !value.is_finite() || value < 0.0)
+            || self.completed_action_calls as u128 > u128::from(self.completed_tool_calls)
+            || self
+                .policy
+                .and_then(|policy| policy.max_action_calls)
+                .is_some_and(|limit| self.completed_action_calls > limit.get())
+        {
+            return Err(invalid_checkpoint(
+                "checkpoint action policy or counters are invalid",
+            ));
+        }
+        if self.messages.len() < 3
+            || self.messages.first().map(|message| message.role) != Some(MessageRole::System)
+            || self.messages.last().map(|message| message.role) != Some(MessageRole::Assistant)
+        {
+            return Err(invalid_checkpoint(
+                "checkpoint transcript is not a complete system/user/assistant exchange",
+            ));
+        }
+
+        let mut outstanding_calls = std::collections::BTreeSet::new();
+        let mut tool_rounds = 0_u64;
+        let mut tool_results = 0_u64;
+        let mut saw_user = false;
+        for message in &self.messages {
+            if !outstanding_calls.is_empty() && message.role != MessageRole::Tool {
+                return Err(invalid_checkpoint(
+                    "assistant tool calls are missing adjacent tool results",
+                ));
+            }
+            match message.role {
+                MessageRole::System | MessageRole::User => {
+                    if message.role == MessageRole::User {
+                        saw_user = true;
+                    }
+                    if message.tool_call_id.is_some()
+                        || !message.tool_calls.is_empty()
+                        || message.reasoning.is_some()
+                    {
+                        return Err(invalid_checkpoint(
+                            "system or user message contains assistant/tool metadata",
+                        ));
+                    }
+                }
+                MessageRole::Assistant => {
+                    if message.tool_call_id.is_some() {
+                        return Err(invalid_checkpoint(
+                            "assistant message contains a tool result id",
+                        ));
+                    }
+                    if !message.tool_calls.is_empty() {
+                        tool_rounds = tool_rounds.saturating_add(1);
+                        for call in &message.tool_calls {
+                            if call.id.trim().is_empty()
+                                || call.name.trim().is_empty()
+                                || !outstanding_calls.insert(call.id.as_str())
+                            {
+                                return Err(invalid_checkpoint(
+                                    "assistant tool calls have empty or duplicate identities",
+                                ));
+                            }
+                        }
+                    }
+                }
+                MessageRole::Tool => {
+                    if message.reasoning.is_some() || !message.tool_calls.is_empty() {
+                        return Err(invalid_checkpoint(
+                            "tool result contains assistant metadata",
+                        ));
+                    }
+                    let Some(call_id) = message.tool_call_id.as_deref() else {
+                        return Err(invalid_checkpoint("tool result is missing its call id"));
+                    };
+                    if !outstanding_calls.remove(call_id) {
+                        return Err(invalid_checkpoint(
+                            "tool result does not match an outstanding assistant call",
+                        ));
+                    }
+                    tool_results = tool_results.saturating_add(1);
+                }
+            }
+        }
+        if !saw_user || !outstanding_calls.is_empty() {
+            return Err(invalid_checkpoint(
+                "checkpoint transcript has no user task or ends inside a tool batch",
+            ));
+        }
+        let final_message = self.messages.last().expect("length checked");
+        if final_message.content.trim().is_empty()
+            || !final_message.tool_calls.is_empty()
+            || final_message.tool_call_id.is_some()
+        {
+            return Err(invalid_checkpoint(
+                "checkpoint transcript does not end with a safe assistant summary",
+            ));
+        }
+        if self.completed_tool_rounds > tool_rounds || self.completed_tool_calls > tool_results {
+            return Err(invalid_checkpoint(
+                "checkpoint tool counters do not match its transcript",
+            ));
+        }
+        if let Some(plan) = &self.host_plan {
+            validate_checkpoint_plan(plan)?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_checkpoint_plan(plan: &HostPlan) -> Result<()> {
+    if plan.goal.trim().is_empty()
+        || !(2..=8).contains(&plan.steps.len())
+        || plan.cursor > plan.steps.len()
+    {
+        return Err(invalid_checkpoint("host plan shape is invalid"));
+    }
+    for (offset, step) in plan.steps.iter().enumerate() {
+        let expected_status = if offset < plan.cursor {
+            PlanStepStatus::Done
+        } else if offset == plan.cursor {
+            PlanStepStatus::Active
+        } else {
+            PlanStepStatus::Pending
+        };
+        if step.index != offset + 1
+            || step.text.trim().is_empty()
+            || step.text.chars().count() > 160
+            || step.status != expected_status
+            || (step.status == PlanStepStatus::Done) != !step.evidence.trim().is_empty()
+        {
+            return Err(invalid_checkpoint("host plan state is inconsistent"));
+        }
+    }
+    Ok(())
+}
+
+fn invalid_checkpoint(message: impl Into<String>) -> RuntimeError {
+    RuntimeError::InvalidConfig(format!("invalid harness checkpoint: {}", message.into()))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -158,6 +378,8 @@ pub struct RunOutcome {
     pub checkpoint: Option<HarnessCheckpoint>,
     pub completed_tool_calls: u64,
     pub completed_tool_rounds: u64,
+    pub completed_action_calls: usize,
+    pub policy: HarnessPolicy,
     pub usage: TokenUsage,
     pub messages: Vec<Message>,
     pub host_plan: Option<HostPlan>,
@@ -171,6 +393,7 @@ pub struct Harness {
     controls: ControlPlane,
     events: broadcast::Sender<HarnessEvent>,
     agent_id: Option<spine_heart::AgentId>,
+    tool_metadata: std::collections::BTreeMap<String, String>,
 }
 
 impl Harness {
@@ -197,12 +420,38 @@ impl Harness {
             controls: ControlPlane::default(),
             events,
             agent_id: None,
+            tool_metadata: std::collections::BTreeMap::new(),
         })
     }
 
     pub fn with_agent_id(mut self, agent_id: spine_heart::AgentId) -> Self {
         self.agent_id = Some(agent_id);
         self
+    }
+
+    /// Replace this harness's bounded host introspection snapshot. Only the
+    /// three selected JSON object fields are forwarded; task and other keys are
+    /// runtime-owned. New harnesses/subagents start with an empty snapshot.
+    pub fn set_tool_metadata(
+        &mut self,
+        metadata: std::collections::BTreeMap<String, String>,
+    ) -> Result<()> {
+        let mut selected = std::collections::BTreeMap::new();
+        for key in ["spine_trajectory", "spine_modulation", "spine_risk_policy"] {
+            if let Some(value) = metadata.get(key) {
+                if value.len() > 8_192
+                    || !serde_json::from_str::<serde_json::Value>(value)
+                        .is_ok_and(|value| value.is_object())
+                {
+                    return Err(RuntimeError::InvalidConfig(format!(
+                        "{key} must be a JSON object no larger than 8192 bytes"
+                    )));
+                }
+                selected.insert(key.to_owned(), value.clone());
+            }
+        }
+        self.tool_metadata = selected;
+        Ok(())
     }
 
     pub fn id(&self) -> &str {
@@ -233,9 +482,9 @@ impl Harness {
                 Message::new(MessageRole::User, task.clone()),
             ],
             task,
-            0,
-            0,
+            CompletedWork::default(),
             None,
+            self.default_policy(),
         )
         .await
     }
@@ -251,15 +500,79 @@ impl Harness {
         messages.push(Message::new(MessageRole::System, system));
         messages.extend_from_slice(history);
         messages.push(Message::new(MessageRole::User, task.clone()));
-        self.run_messages(messages, task, 0, 0, None).await
+        self.run_messages(
+            messages,
+            task,
+            CompletedWork::default(),
+            None,
+            self.default_policy(),
+        )
+        .await
+    }
+
+    pub async fn run_with_history_policy(
+        &self,
+        system: impl Into<String>,
+        history: &[Message],
+        task: impl Into<String>,
+        policy: HarnessPolicy,
+    ) -> Result<RunOutcome> {
+        let task = task.into();
+        let mut messages = Vec::with_capacity(history.len() + 2);
+        messages.push(Message::new(MessageRole::System, system));
+        messages.extend_from_slice(history);
+        messages.push(Message::new(MessageRole::User, task.clone()));
+        self.run_messages(messages, task, CompletedWork::default(), None, policy)
+            .await
+    }
+
+    fn default_policy(&self) -> HarnessPolicy {
+        HarnessPolicy {
+            max_tool_rounds: self.config.max_tool_rounds,
+            ..HarnessPolicy::default()
+        }
+    }
+
+    /// Only pre-policy checkpoints inherit this harness's configured ceiling.
+    pub fn policy_for_checkpoint(&self, checkpoint: &HarnessCheckpoint) -> HarnessPolicy {
+        checkpoint.policy.unwrap_or_else(|| self.default_policy())
+    }
+
+    /// Continue a completed draft for host verification without refreshing its budgets.
+    /// Graceful stops require an explicit checkpoint resume instead.
+    pub async fn repair(
+        &self,
+        previous: &RunOutcome,
+        task: impl Into<String>,
+    ) -> Result<RunOutcome> {
+        if previous.stopped_gracefully || previous.checkpoint.is_some() {
+            return Err(RuntimeError::InvalidConfig(
+                "a stopped outcome requires explicit checkpoint resume".into(),
+            ));
+        }
+        let task = task.into();
+        let mut messages = previous.messages.clone();
+        messages.push(Message::new(MessageRole::User, task.clone()));
+        let mut outcome = self
+            .run_messages(
+                messages,
+                task,
+                CompletedWork {
+                    tool_calls: previous.completed_tool_calls,
+                    tool_rounds: previous.completed_tool_rounds,
+                    action_calls: previous.completed_action_calls,
+                },
+                previous.host_plan.clone(),
+                previous.policy,
+            )
+            .await?;
+        outcome.usage.add(previous.usage);
+        Ok(outcome)
     }
 
     pub async fn resume(&self, checkpoint: HarnessCheckpoint) -> Result<RunOutcome> {
-        if checkpoint.schema != 1 {
-            return Err(RuntimeError::InvalidConfig(
-                "unsupported harness checkpoint schema".into(),
-            ));
-        }
+        checkpoint.validate()?;
+        let policy = self.policy_for_checkpoint(&checkpoint);
         let mut messages = checkpoint.messages;
         messages.push(Message::new(
             MessageRole::User,
@@ -270,9 +583,13 @@ impl Harness {
         self.run_messages(
             messages,
             checkpoint.pending_task,
-            checkpoint.completed_tool_calls,
-            checkpoint.completed_tool_rounds,
+            CompletedWork {
+                tool_calls: checkpoint.completed_tool_calls,
+                tool_rounds: checkpoint.completed_tool_rounds,
+                action_calls: checkpoint.completed_action_calls,
+            },
             host_plan,
+            policy,
         )
         .await
     }
@@ -281,9 +598,9 @@ impl Harness {
         &self,
         mut messages: Vec<Message>,
         task: String,
-        mut completed_tool_calls: u64,
-        mut completed_tool_rounds: u64,
+        mut completed: CompletedWork,
         mut host_plan: Option<HostPlan>,
+        policy: HarnessPolicy,
     ) -> Result<RunOutcome> {
         let mut usage = TokenUsage::default();
         let mut empty_plan_continuations = 0_u64;
@@ -296,6 +613,7 @@ impl Harness {
                     messages: messages.clone(),
                     tools: self.registry.specs(),
                     allow_tool_calls: true,
+                    temperature: policy.temperature,
                 })
                 .await?;
             usage.add(turn.usage);
@@ -313,14 +631,7 @@ impl Harness {
                 }
                 if controls.stop {
                     return self
-                        .finish_gracefully(
-                            messages,
-                            task,
-                            completed_tool_calls,
-                            completed_tool_rounds,
-                            usage,
-                            host_plan,
-                        )
+                        .finish_gracefully(messages, task, completed, usage, host_plan, policy)
                         .await;
                 }
                 if !controls.guidance.is_empty() {
@@ -343,8 +654,10 @@ impl Harness {
                         response,
                         stopped_gracefully: false,
                         checkpoint: None,
-                        completed_tool_calls,
-                        completed_tool_rounds,
+                        completed_tool_calls: completed.tool_calls,
+                        completed_tool_rounds: completed.tool_rounds,
+                        completed_action_calls: completed.action_calls,
+                        policy,
                         usage,
                         messages,
                         host_plan,
@@ -371,13 +684,7 @@ impl Harness {
                             ));
                             return self
                                 .finish_without_tools(
-                                    messages,
-                                    task,
-                                    false,
-                                    completed_tool_calls,
-                                    completed_tool_rounds,
-                                    usage,
-                                    host_plan,
+                                    messages, task, false, completed, usage, host_plan, policy,
                                 )
                                 .await;
                         }
@@ -399,8 +706,10 @@ impl Harness {
                     response: turn.content,
                     stopped_gracefully: false,
                     checkpoint: None,
-                    completed_tool_calls,
-                    completed_tool_rounds,
+                    completed_tool_calls: completed.tool_calls,
+                    completed_tool_rounds: completed.tool_rounds,
+                    completed_action_calls: completed.action_calls,
+                    policy,
                     usage,
                     messages,
                     host_plan,
@@ -410,10 +719,9 @@ impl Harness {
             empty_model_retries = 0;
             self.maybe_install_plan(&mut host_plan, &task, &turn.content);
 
-            if self
-                .config
+            if policy
                 .max_tool_rounds
-                .is_some_and(|ceiling| completed_tool_rounds >= ceiling.get())
+                .is_some_and(|ceiling| completed.tool_rounds >= ceiling.get())
             {
                 messages.push(Message::new(MessageRole::Assistant, turn.content));
                 messages.push(Message::new(
@@ -422,18 +730,12 @@ impl Harness {
                 ));
                 return self
                     .finish_without_tools(
-                        messages,
-                        task,
-                        false,
-                        completed_tool_calls,
-                        completed_tool_rounds,
-                        usage,
-                        host_plan,
+                        messages, task, false, completed, usage, host_plan, policy,
                     )
                     .await;
             }
 
-            completed_tool_rounds = completed_tool_rounds.saturating_add(1);
+            completed.tool_rounds = completed.tool_rounds.saturating_add(1);
             let promised_more = promised_more_work(&turn.content);
             messages.push(Message::assistant(
                 turn.content,
@@ -444,15 +746,37 @@ impl Harness {
             let mut plan_evidence = false;
             let calls = turn.tool_calls;
             for (index, call) in calls.iter().enumerate() {
-                let result = self.execute_tool(call, &task).await;
-                plan_evidence |= self.registry.get(&call.name).is_some_and(|tool| {
-                    tool.spec().category != ToolCategory::Action || result.success
+                let is_action = self.registry.get(&call.name).is_some_and(|tool| {
+                    matches!(
+                        tool.spec().category,
+                        ToolCategory::Action | ToolCategory::Both
+                    )
                 });
-                completed_tool_calls = completed_tool_calls.saturating_add(1);
-                messages.push(Message::tool(
-                    &call.id,
-                    result.model_text(self.config.max_tool_result_chars),
-                ));
+                if is_action
+                    && policy
+                        .max_action_calls
+                        .is_some_and(|ceiling| completed.action_calls >= ceiling.get())
+                {
+                    messages.push(Message::tool(
+                        &call.id,
+                        "[skipped: host action budget for this run was reached]",
+                    ));
+                } else {
+                    if is_action {
+                        completed.action_calls = completed.action_calls.saturating_add(1);
+                    }
+                    let result = self.execute_tool(call, &task).await;
+                    plan_evidence |= self.registry.get(&call.name).is_some_and(|tool| {
+                        tool.spec().category != ToolCategory::Action || result.success
+                    });
+                    completed.tool_calls = completed.tool_calls.saturating_add(1);
+                    messages.push(Message::tool(
+                        &call.id,
+                        result.model_text(self.config.max_tool_result_chars),
+                    ));
+                }
+                // A rejected action is also a safe boundary. Otherwise an
+                // exhausted budget could starve queued guidance/stop forever.
                 let controls = self.controls.drain();
                 if !controls.is_empty() {
                     for skipped in &calls[index + 1..] {
@@ -477,14 +801,7 @@ impl Harness {
                 .is_some_and(|controls| controls.stop)
             {
                 return self
-                    .finish_gracefully(
-                        messages,
-                        task,
-                        completed_tool_calls,
-                        completed_tool_rounds,
-                        usage,
-                        host_plan,
-                    )
+                    .finish_gracefully(messages, task, completed, usage, host_plan, policy)
                     .await;
             }
             self.append_open_plan_prompt(&mut messages, host_plan.as_ref());
@@ -552,7 +869,7 @@ impl Harness {
         let result = if call_risk == ToolRisk::Destructive && !self.config.allow_destructive_tools {
             ToolResult::failure("destructive tool call blocked by this harness")
         } else {
-            let mut metadata = std::collections::BTreeMap::new();
+            let mut metadata = self.tool_metadata.clone();
             metadata.insert("task".into(), task.into());
             tool.execute(
                 call,
@@ -599,21 +916,13 @@ impl Harness {
         &self,
         messages: Vec<Message>,
         task: String,
-        completed_tool_calls: u64,
-        completed_tool_rounds: u64,
+        completed: CompletedWork,
         usage: TokenUsage,
         host_plan: Option<HostPlan>,
+        policy: HarnessPolicy,
     ) -> Result<RunOutcome> {
-        self.finish_without_tools(
-            messages,
-            task,
-            true,
-            completed_tool_calls,
-            completed_tool_rounds,
-            usage,
-            host_plan,
-        )
-        .await
+        self.finish_without_tools(messages, task, true, completed, usage, host_plan, policy)
+            .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -622,10 +931,10 @@ impl Harness {
         mut messages: Vec<Message>,
         task: String,
         stopped_gracefully: bool,
-        completed_tool_calls: u64,
-        completed_tool_rounds: u64,
+        completed: CompletedWork,
         mut usage: TokenUsage,
         host_plan: Option<HostPlan>,
+        policy: HarnessPolicy,
     ) -> Result<RunOutcome> {
         let turn = self
             .provider
@@ -633,6 +942,7 @@ impl Harness {
                 messages: messages.clone(),
                 tools: Vec::new(),
                 allow_tool_calls: false,
+                temperature: policy.temperature,
             })
             .await?;
         usage.add(turn.usage);
@@ -647,17 +957,21 @@ impl Harness {
             schema: 1,
             harness_id: self.id.clone(),
             messages: messages.clone(),
-            completed_tool_calls,
-            completed_tool_rounds,
+            completed_tool_calls: completed.tool_calls,
+            completed_tool_rounds: completed.tool_rounds,
+            completed_action_calls: completed.action_calls,
             pending_task: task,
             host_plan: host_plan.clone(),
+            policy: Some(policy),
         });
         Ok(RunOutcome {
             response,
             stopped_gracefully,
             checkpoint,
-            completed_tool_calls,
-            completed_tool_rounds,
+            completed_tool_calls: completed.tool_calls,
+            completed_tool_rounds: completed.tool_rounds,
+            completed_action_calls: completed.action_calls,
+            policy,
             usage,
             messages,
             host_plan,

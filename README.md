@@ -164,12 +164,27 @@ The Linux archives target glibc-based distributions, not Alpine/musl.
 If Hugging Face tooling already downloaded this model into its standard cache,
 Spine finds it automatically and you can omit `--model-dir`.
 
-### 3. Start a model server
+### 3. Choose an OpenAI-compatible model endpoint
 
-If an OpenAI-compatible model server is already running at
-`http://127.0.0.1:8080`, continue to step 4.
+Spine connects to an existing OpenAI-compatible service by default; it does not
+start llama.cpp. At interactive chat startup, enter the endpoint and then its port:
 
-For a local setup, Spine works with
+```text
+OpenAI-compatible API endpoint [http://127.0.0.1/v1/chat/completions]:
+Port [8080]:
+```
+
+Press Enter twice to use `http://127.0.0.1:8080/v1/chat/completions`.
+You can enter a base URL ending in `/v1` or the full `/v1/chat/completions` URL.
+The older text-only `/v1/completions` route is not compatible with Spine's chat
+and tool messages. An explicit URL port is offered as the port default; remote
+HTTPS endpoints default to 443. No endpoint setting is saved automatically.
+
+Set `--server-url` or `SPINE_LLM_URL` to skip both prompts. This is required when
+stdin is redirected, so setup cannot consume piped chat messages. Existing API-key
+and model-name options are unchanged. If you already have a service, go to step 4.
+
+For an optional local setup, Spine works with
 [`llama-server`](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)
 from [llama.cpp](https://github.com/ggml-org/llama.cpp#quick-start). Install
 llama.cpp, choose a GGUF chat model that fits your hardware, and start it in a
@@ -458,7 +473,24 @@ identity, or demographic profiling.
 | `/interrupt` | Stops immediately. |
 | `/resume` | Continues a saved checkpoint. |
 | `/tasks` | Shows work managed by the host. |
+| `/circuit` | Shows LLM, Thymos, and DCMDb circuit-breaker state. |
+| `/reset llm`, `/reset thymos`, `/reset dcmdb` | Resets one recovered subsystem circuit. |
+| `reset`, `reset cb`, `reset circuit breaker` | Resets all subsystem circuits. |
 | `/quit` | Exits at a safe boundary. |
+
+Terminal lines that arrive in one paste burst are submitted together as a
+single multi-line prompt or guidance message. Individually typed commands and
+guidance keep their normal one-line behavior.
+
+Graceful-stop checkpoints are stored in the encrypted heart. Reopening the
+same agent and thread restores the newest unconsumed checkpoint for `/resume`;
+once a resume begins, that exact checkpoint is durably marked consumed so it
+cannot be replayed after another restart.
+
+Transient recall, Thymos, or provider failures degrade the affected operation
+without discarding the encrypted canonical event log. If a prior write left the
+cognitive projection stale, the next chat startup verifies it and applies only
+the missing canonical suffix before accepting a turn.
 
 ### Browser interface
 
@@ -505,12 +537,14 @@ command-line names for each setting.
 | `SPINE_HEART_PASSPHRASE` | `--passphrase` | Heart passphrase. Let Spine prompt when practical. |
 | `SPINE_MINILM_DIR` | `--model-dir` | Location of the required MiniLM snapshot. |
 | `SPINE_NLI_DIR` | `--nli-model-dir` | Location of the optional NLI snapshot. |
-| `SPINE_LLM_URL` | `--server-url` | Address of the OpenAI-compatible model server. |
+| `SPINE_LLM_URL` | `--server-url` | Base URL or full chat-completions endpoint; skips endpoint/port prompts. |
 | `SPINE_LLM_MODEL` | `--server-model` | Model name, when the server cannot report it. |
 | `SPINE_LLM_API_KEY` | `--api-key` (hidden; environment preferred) | Model-server credential, when one is required. |
+| `SPINE_REASONING_EFFORT` | `--reasoning-effort` | Optional provider-specific reasoning effort; omitted by default for broad compatibility. |
 | `SPINE_MAX_CONTEXT_TOKENS` | `--max-context-tokens` | Context limit, when the server cannot report it. |
-| `SPINE_LLAMA_SERVER` | `--llama-server-bin` | Local `llama-server` executable for Spine to manage. |
-| `SPINE_LLAMA_MODEL` | `--llama-model` | Local GGUF model for that managed server. |
+| — | `--llamacpp` | Explicitly enable managed local llama.cpp; requires its model and executable options. |
+| `SPINE_LLAMA_SERVER` | `--llama-server-bin` | Local executable; requires `--llamacpp`. |
+| `SPINE_LLAMA_MODEL` | `--llama-model` | Local GGUF model; requires `--llamacpp`. |
 
 Never put a literal passphrase, recovery phrase, or API key in a command you
 might save or share.
@@ -549,6 +583,10 @@ On a multi-model endpoint, set `SPINE_LLM_MODEL` explicitly. Otherwise Spine
 uses the model advertised by `/v1/models` (normally its first entry) before
 falling back to `/props`.
 
+Spine omits `reasoning_effort` unless `SPINE_REASONING_EFFORT` or
+`--reasoning-effort` is set, because that optional field is not accepted by
+every OpenAI-compatible provider.
+
 The runtime value matters more than the model's theoretical maximum. A model
 may support 262,144 tokens but report only 4,096 when the server allocated a 4K
 context. Onboarding fits at 4K, but 16K or more is a practical starting point
@@ -573,16 +611,37 @@ Face cache.
 
 ### Let Spine manage llama.cpp
 
-Spine can start and stop a local `llama-server` with the chat session:
+Only with `--llamacpp`, Spine can start and stop a local `llama-server` with the
+chat session. This opt-in skips the endpoint prompts and defaults to port 8080;
+use `--server-url` to override it:
 
 ```bash
-spine chat --no-nli --model-dir "/absolute/path/to/all-MiniLM-L6-v2" --llama-server-bin "/absolute/path/to/llama-server" --llama-model "/absolute/path/to/model.gguf" --max-context-tokens 16384
+spine chat --llamacpp --no-nli --model-dir "/absolute/path/to/all-MiniLM-L6-v2" --llama-server-bin "/absolute/path/to/llama-server" --llama-model "/absolute/path/to/model.gguf" --max-context-tokens 16384
 ```
 
 Server output is written beside the heart. `--max-tool-rounds` is optional;
 tool rounds are unlimited by default. Omit `--model-dir` when Spine finds
 MiniLM automatically. Managed mode enables Jinja function calling without
 enabling llama.cpp's separate built-in host tools.
+
+After each user message is committed, the host uses its Thymos trajectory,
+recalled-memory tensions, and learned risk to widen automatic recall, cool the
+provider temperature, cap external actions, and raise the answer-grounding
+coverage requirement. Surprise also scales reflection learning through a
+per-observation multiplier stored in the signed event. Risk expands exact
+evidence from absorbed DCMDb nodes to a bounded depth of one to three levels.
+A positive `--max-tool-rounds` ceiling can expand under risk; omitting it remains
+unlimited. Checkpoints retain their explicitly saved effective policy, including
+unlimited rounds. Legacy checkpoints with no saved policy inherit the current
+harness ceiling, counting rounds already completed. Triangle-context rehydration
+keeps its fixed bounded topology.
+
+Risk training uses Python's normalized affect and all six retrieval statistics:
+top score, score margin, mean confidence, tension fraction, hierarchy depth, and
+corpus size. Existing released hearts upgrade atomically on open. Their learned
+raw-affect and count/empty-evidence contributions remain in separate compatibility
+segments, while the new oracle coordinates start with zero weights. Unknown or
+inconsistent layouts are rejected without resetting learned state.
 
 ## Developer reference
 

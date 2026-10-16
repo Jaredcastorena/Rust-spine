@@ -9,8 +9,9 @@ use async_trait::async_trait;
 use axum::{Router, response::Html, routing::get};
 use serde_json::{Value, json};
 use spine_heart::{
-    AgentId, CognitiveConfig, Embedding, HeartConfig, ModelManifest, Result as HeartResult,
-    SemanticEncoder, SpineHeart,
+    AgentId, CognitiveConfig, Content, Embedding, EventKind, HeartConfig, InteractionInput,
+    ModelManifest, ParticipantRole, Provenance, Result as HeartResult, SemanticEncoder, SpineHeart,
+    ThreadId,
 };
 use spine_runtime::{
     CompletionRequest, Harness, HarnessConfig, MessageRole, ModelProvider, ModelTurn, ToolCall,
@@ -58,8 +59,128 @@ impl SemanticEncoder for TinyEncoder {
     }
 }
 
+#[test]
+fn chat_startup_catches_up_a_stale_cognitive_projection_once() {
+    let temporary = tempfile::tempdir().unwrap();
+    let encoder = TinyEncoder::new();
+    let created = SpineHeart::create(
+        HeartConfig::new(temporary.path().join("stale.spine")),
+        "stale-passphrase",
+    )
+    .unwrap();
+    created
+        .heart
+        .initialize_cognition(CognitiveConfig::new(1, encoder.manifest().clone(), 2).unwrap())
+        .unwrap();
+    created
+        .heart
+        .commit_interaction(InteractionInput {
+            agent_id: AgentId::new("main").unwrap(),
+            thread_id: ThreadId::new("startup-recovery").unwrap(),
+            role: ParticipantRole::User,
+            kind: EventKind::Message,
+            content: Content::Inline("recover this canonical event".into()),
+            causal_parents: Vec::new(),
+            provenance: Provenance::default(),
+            tool: None,
+            attachments: Vec::new(),
+            outcome: None,
+        })
+        .unwrap();
+
+    assert!(!created.heart.cognition_is_current().unwrap());
+    assert!(crate::catch_up_stale_cognition(&created.heart, &encoder).unwrap());
+    assert!(created.heart.cognition_is_current().unwrap());
+    assert_eq!(
+        created.heart.cognition().unwrap().unwrap().projected_events,
+        1
+    );
+    assert!(!crate::catch_up_stale_cognition(&created.heart, &encoder).unwrap());
+}
+
 #[derive(Default)]
 struct FinalProvider;
+
+#[test]
+fn checkpoint_persistence_respects_the_memory_breaker() {
+    use crate::resilience::{BreakerState, CircuitBreaker, ResilienceChannel};
+    use spine_runtime::{HarnessCheckpoint, RunOutcome};
+    let temporary = tempfile::tempdir().unwrap();
+    let encoder = TinyEncoder::new();
+    let created = SpineHeart::create(
+        HeartConfig::new(temporary.path().join("checkpoint.spine")),
+        "checkpoint-passphrase",
+    )
+    .unwrap();
+    created
+        .heart
+        .initialize_cognition(CognitiveConfig::new(1, encoder.manifest().clone(), 2).unwrap())
+        .unwrap();
+    let outcome = RunOutcome {
+        response: String::new(),
+        stopped_gracefully: true,
+        checkpoint: Some(HarnessCheckpoint {
+            schema: 1,
+            harness_id: "test".into(),
+            messages: vec![
+                spine_runtime::Message::new(spine_runtime::MessageRole::System, "system"),
+                spine_runtime::Message::new(spine_runtime::MessageRole::User, "continue"),
+                spine_runtime::Message::new(spine_runtime::MessageRole::Assistant, "paused safely"),
+            ],
+            completed_tool_calls: 0,
+            completed_tool_rounds: 0,
+            pending_task: "continue".into(),
+            host_plan: None,
+            completed_action_calls: 0,
+            policy: Some(spine_runtime::HarnessPolicy::default()),
+        }),
+        completed_tool_calls: 0,
+        completed_tool_rounds: 0,
+        usage: Default::default(),
+        completed_action_calls: 0,
+        policy: spine_runtime::HarnessPolicy::default(),
+        messages: vec![],
+        host_plan: None,
+    };
+    let agent = AgentId::new("main").unwrap();
+    let thread = ThreadId::new("checkpoint").unwrap();
+    let mut checkpoint = None;
+    let mut breaker = CircuitBreaker::default();
+    for _ in 0..2 {
+        breaker.record_failure(ResilienceChannel::Dcmdb, std::time::Instant::now());
+    }
+    assert!(
+        crate::checkpoint_from_outcome(
+            &created.heart,
+            &encoder,
+            &agent,
+            &thread,
+            &outcome,
+            &mut checkpoint,
+            &mut breaker,
+        )
+        .is_err()
+    );
+    assert!(checkpoint.is_none());
+    assert_eq!(created.heart.stats().unwrap().events, 0);
+    assert_eq!(
+        breaker.status(ResilienceChannel::Dcmdb).state,
+        BreakerState::Open
+    );
+    breaker.reset(ResilienceChannel::Dcmdb);
+    crate::checkpoint_from_outcome(
+        &created.heart,
+        &encoder,
+        &agent,
+        &thread,
+        &outcome,
+        &mut checkpoint,
+        &mut breaker,
+    )
+    .unwrap();
+    assert!(checkpoint.is_some());
+    assert_eq!(created.heart.stats().unwrap().events, 1);
+}
 
 #[async_trait]
 impl ModelProvider for FinalProvider {
@@ -177,12 +298,117 @@ async fn execute(registry: &ToolRegistry, name: &str, arguments: Value) -> ToolR
     .unwrap_or_else(|error| panic!("execute {name}: {error}"))
 }
 
+#[tokio::test]
+async fn introspection_tools_preserve_fields_and_report_host_policy_and_memory_distributions() {
+    let fixture = fixture(false, false);
+    for (index, vector) in [vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0]]
+        .into_iter()
+        .enumerate()
+    {
+        fixture
+            .heart
+            .commit_embedded(
+                spine_heart::InteractionInput {
+                    agent_id: AgentId::new("main").unwrap(),
+                    thread_id: spine_heart::ThreadId::new("introspection").unwrap(),
+                    role: spine_heart::ParticipantRole::User,
+                    kind: spine_heart::EventKind::Message,
+                    content: spine_heart::Content::Inline(format!("memory {index}")),
+                    causal_parents: Vec::new(),
+                    provenance: spine_heart::Provenance {
+                        source_uri: Some(format!("source-{index}")),
+                        ..Default::default()
+                    },
+                    tool: None,
+                    attachments: Vec::new(),
+                    outcome: None,
+                },
+                Embedding::normalized(vector, 3).unwrap(),
+            )
+            .unwrap();
+    }
+    let before = fixture.heart.cognition().unwrap().unwrap();
+    let result = fixture
+        .registry
+        .get("feel")
+        .unwrap()
+        .execute(
+            &ToolCall {
+                id: "feel".into(),
+                name: "feel".into(),
+                arguments: json!({}),
+            },
+            &ToolContext {
+                agent_id: Some(AgentId::new("main").unwrap()),
+                metadata: [
+                    ("task".into(), "active task".into()),
+                    (
+                        "spine_trajectory".into(),
+                        json!({"surprise":0.4,"speed":0.3,"heading_norm":0.2}).to_string(),
+                    ),
+                    (
+                        "spine_modulation".into(),
+                        json!({"recall_top_k":8}).to_string(),
+                    ),
+                    (
+                        "spine_risk_policy".into(),
+                        json!({"risk_estimate":0.6,"coverage_threshold":0.7}).to_string(),
+                    ),
+                ]
+                .into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(result.success);
+    let value: Value = serde_json::from_str(&result.output).unwrap();
+    assert!(value["raw"].is_array());
+    assert!(value["valence"].is_number());
+    assert_eq!(value["trajectory"]["surprise"], 0.4);
+    assert_eq!(value["modulation"]["recall_top_k"], 8);
+    assert_eq!(value["risk_policy"]["coverage_threshold"], 0.7);
+    assert_eq!(value["grid_state"]["config_K"], 2);
+    assert_eq!(value["grid_state"]["has_trajectory"], true);
+    assert_eq!(fixture.heart.cognition().unwrap().unwrap(), before);
+    let no_host_snapshot = execute(&fixture.registry, "feel", json!({})).await;
+    let value: Value = serde_json::from_str(&no_host_snapshot.output).unwrap();
+    assert!(value["trajectory"].is_null());
+    assert!(value["modulation"].is_null());
+    assert!(value["risk_policy"].is_null());
+    let stats = execute(&fixture.registry, "memory_stats", json!({})).await;
+    let alias = execute(&fixture.registry, "heart_stats", json!({})).await;
+    assert_eq!(stats.output, alias.output);
+    let stats: Value = serde_json::from_str(&stats.output).unwrap();
+    assert_eq!(stats["events"], 2);
+    assert_eq!(stats["cognition"]["level_distribution"]["0"], 2);
+    assert!(stats["cognition"]["min_confidence"].is_number());
+    assert!(stats["cognition"]["max_confidence"].is_number());
+    assert_eq!(
+        stats["cognition"]["source_counts"]["source-0"],
+        before
+            .dcmdb
+            .nodes
+            .values()
+            .find(|node| node.source_counts.contains_key("source-0"))
+            .unwrap()
+            .source_counts["source-0"]
+    );
+}
+
 #[test]
 fn registration_exposes_the_complete_validated_tool_surface() {
     let fixture = fixture(true, true);
-    let names = fixture
-        .registry
-        .specs()
+    let specs = fixture.registry.specs();
+    let aggregation = specs
+        .iter()
+        .find(|spec| spec.name == "fact_aggregate")
+        .expect("fact aggregation spec");
+    assert!(aggregation.parameters["properties"]["query"].is_object());
+    assert!(aggregation.parameters.get("required").is_none());
+    assert!(aggregation.parameters.get("oneOf").is_none());
+
+    let names = specs
         .into_iter()
         .map(|spec| {
             assert!(!spec.description.trim().is_empty(), "{}", spec.name);
@@ -388,12 +614,12 @@ async fn filesystem_shell_browser_and_task_controls_work_together() {
 #[tokio::test]
 async fn ingestion_and_cognition_tools_round_trip_real_heart_state() {
     let fixture = fixture(true, false);
-    let document = "I am 32 years old. I love cobalt hedgehogs.";
+    let document = "I am 32 years old. I love cobalt hedgehogs. I attended 3 weddings. I attended 2 weddings. My hobby is chess. I spent $45 on bike tires. I spent $135 on bike accessories.";
     fs::create_dir_all(fixture._directory.path().join("documents")).expect("document directory");
-    fs::write(fixture._directory.path().join("documents/one.md"), document)
-        .expect("first document");
-    fs::write(fixture._directory.path().join("documents/two.md"), document)
-        .expect("duplicate document");
+    let first_path = fixture._directory.path().join("documents/one.md");
+    let second_path = fixture._directory.path().join("documents/two.md");
+    fs::write(&first_path, document).expect("first document");
+    fs::write(&second_path, document).expect("same-content second document");
 
     let ingested = execute(
         &fixture.registry,
@@ -409,8 +635,69 @@ async fn ingestion_and_cognition_tools_round_trip_real_heart_state() {
     .await;
     assert!(ingested.success, "{:?}", ingested.error);
     assert!(ingested.output.contains("files_discovered=2"));
-    assert!(ingested.output.contains("chunks_ingested=1"));
-    assert!(ingested.output.contains("skipped=1"));
+    assert!(ingested.output.contains("chunks_ingested=2"));
+    assert!(ingested.output.contains("skipped=0"));
+
+    let document_events = fixture.heart.events_canonical().expect("document events");
+    assert_eq!(document_events.len(), 2);
+    let sources: BTreeSet<_> = document_events
+        .iter()
+        .filter_map(|event| event.body.interaction.provenance.source_uri.clone())
+        .collect();
+    let expected_sources = BTreeSet::from([
+        format!(
+            "file://{}",
+            first_path.canonicalize().expect("first realpath").display()
+        ),
+        format!(
+            "file://{}",
+            second_path
+                .canonicalize()
+                .expect("second realpath")
+                .display()
+        ),
+    ]);
+    assert_eq!(sources, expected_sources);
+    let document_ids: BTreeSet<_> = document_events
+        .iter()
+        .filter_map(|event| {
+            event
+                .body
+                .interaction
+                .provenance
+                .metadata
+                .get("document_id")
+                .cloned()
+        })
+        .collect();
+    assert_eq!(document_ids.len(), 2);
+    let content_hashes: BTreeSet<_> = document_events
+        .iter()
+        .filter_map(|event| {
+            event
+                .body
+                .interaction
+                .provenance
+                .metadata
+                .get("document_sha256")
+                .cloned()
+        })
+        .collect();
+    assert_eq!(content_hashes.len(), 1);
+    for event in &document_events {
+        let metadata = &event.body.interaction.provenance.metadata;
+        assert_eq!(
+            metadata.get("record_schema").map(String::as_str),
+            Some("spine-document-chunk")
+        );
+        assert_eq!(metadata.get("chunk_index").map(String::as_str), Some("0"));
+        assert_eq!(metadata.get("chunk_count").map(String::as_str), Some("1"));
+        assert!(metadata.contains_key("chunk_sha256"));
+        assert_eq!(
+            metadata.get("provenance").map(String::as_str),
+            Some("operator-supplied-document")
+        );
+    }
 
     let repeated = execute(
         &fixture.registry,
@@ -421,6 +708,50 @@ async fn ingestion_and_cognition_tools_round_trip_real_heart_state() {
     assert!(repeated.success);
     assert!(repeated.output.contains("chunks_ingested=0"));
     assert!(repeated.output.contains("skipped=2"));
+    assert_eq!(
+        fixture
+            .heart
+            .events_canonical()
+            .expect("events after repeat")
+            .len(),
+        2
+    );
+
+    fs::write(&first_path, format!("{document}\nVersion two.")).expect("changed document");
+    let changed = execute(
+        &fixture.registry,
+        "ingest_documents",
+        json!({"paths":["documents/one.md"],"maintain":false}),
+    )
+    .await;
+    assert!(changed.success, "{:?}", changed.error);
+    assert!(changed.output.contains("chunks_ingested=1"));
+    assert!(changed.output.contains("skipped=0"));
+    let versioned_events = fixture
+        .heart
+        .events_canonical()
+        .expect("versioned document events");
+    assert_eq!(versioned_events.len(), 3);
+    let first_source = format!(
+        "file://{}",
+        first_path.canonicalize().expect("first realpath").display()
+    );
+    let first_source_ids: BTreeSet<_> = versioned_events
+        .iter()
+        .filter(|event| {
+            event.body.interaction.provenance.source_uri.as_deref() == Some(first_source.as_str())
+        })
+        .filter_map(|event| {
+            event
+                .body
+                .interaction
+                .provenance
+                .metadata
+                .get("document_id")
+                .cloned()
+        })
+        .collect();
+    assert_eq!(first_source_ids.len(), 2);
 
     for recall_name in ["heart_recall", "search_memory"] {
         let recalled = execute(
@@ -436,6 +767,37 @@ async fn ingestion_and_cognition_tools_round_trip_real_heart_state() {
         );
     }
 
+    // Retrieved documents are evidence, not personal claims from the user.
+    assert_eq!(
+        fixture
+            .heart
+            .cognition()
+            .unwrap()
+            .unwrap()
+            .facts
+            .facts()
+            .count(),
+        0
+    );
+    fixture
+        .heart
+        .commit_embedded(
+            InteractionInput {
+                agent_id: AgentId::new("main").unwrap(),
+                thread_id: ThreadId::new("tool-smoke").unwrap(),
+                role: ParticipantRole::User,
+                kind: EventKind::Message,
+                content: Content::Inline(document.into()),
+                causal_parents: Vec::new(),
+                provenance: Provenance::default(),
+                tool: None,
+                attachments: Vec::new(),
+                outcome: None,
+            },
+            TinyEncoder::new().encode(document).unwrap(),
+        )
+        .unwrap();
+
     let fact = execute(
         &fixture.registry,
         "fact_search",
@@ -445,6 +807,21 @@ async fn ingestion_and_cognition_tools_round_trip_real_heart_state() {
     assert!(fact.success);
     assert!(fact.output.contains("profile.age"));
     assert!(fact.output.contains("32"));
+    let fact_json: Value = serde_json::from_str(&fact.output).expect("fact search JSON");
+    let age = &fact_json.as_array().expect("fact hits")[0];
+    assert_eq!(age["slot_type"], "state");
+    assert_eq!(age["source_role"], "user");
+    assert_eq!(age["time_source"], "inferred");
+    assert!(
+        age["fact_id"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+    assert!(
+        age["node_id"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
     let latest = execute(
         &fixture.registry,
         "fact_aggregate",
@@ -453,6 +830,78 @@ async fn ingestion_and_cognition_tools_round_trip_real_heart_state() {
     .await;
     assert!(latest.success);
     assert!(latest.output.contains("32"));
+
+    let counted = execute(
+        &fixture.registry,
+        "fact_aggregate",
+        json!({"slot_prefix":"attended.weddings","operation":"count"}),
+    )
+    .await;
+    assert!(counted.success);
+    let counted: Value = serde_json::from_str(&counted.output).expect("fact count JSON");
+    assert_eq!(counted["value"], 5);
+    assert_eq!(counted["evidence"].as_array().map(Vec::len), Some(2));
+
+    let difference = execute(
+        &fixture.registry,
+        "fact_aggregate",
+        json!({"query":"What was the difference between my bike expenses?"}),
+    )
+    .await;
+    assert!(difference.success, "{:?}", difference.error);
+    let difference: Value = serde_json::from_str(&difference.output).expect("fact difference JSON");
+    assert_eq!(difference["operation"], "diff");
+    assert_eq!(difference["value"], 90.0, "{difference}");
+    assert_eq!(difference["highest"]["value"], 135.0);
+    assert_eq!(difference["lowest"]["value"], 45.0);
+    assert_eq!(difference["evidence"].as_array().map(Vec::len), Some(2));
+    assert_eq!(difference["evidence"][0]["value"], 135.0);
+    assert_eq!(difference["evidence"][1]["value"], 45.0);
+
+    let conflicting = execute(
+        &fixture.registry,
+        "fact_aggregate",
+        json!({"query":"bike","slot_prefix":"expense.","operation":"sum"}),
+    )
+    .await;
+    assert!(!conflicting.success);
+
+    let neither = execute(&fixture.registry, "fact_aggregate", json!({})).await;
+    assert!(!neither.success);
+    assert!(
+        neither
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("requires slot_prefix"))
+    );
+
+    let missing_operation = execute(
+        &fixture.registry,
+        "fact_aggregate",
+        json!({"slot_prefix":"expense."}),
+    )
+    .await;
+    assert!(!missing_operation.success);
+    assert!(
+        missing_operation
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("requires operation"))
+    );
+
+    let missing_prefix = execute(
+        &fixture.registry,
+        "fact_aggregate",
+        json!({"operation":"sum"}),
+    )
+    .await;
+    assert!(!missing_prefix.success);
+    assert!(
+        missing_prefix
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("requires slot_prefix"))
+    );
 
     let saved = execute(
         &fixture.registry,
@@ -480,9 +929,9 @@ async fn ingestion_and_cognition_tools_round_trip_real_heart_state() {
             .expect("stats JSON")
             .get("events")
             .and_then(Value::as_u64),
-        Some(2)
+        Some(5)
     );
-    assert_eq!(fixture.heart.stats().expect("heart stats").events, 2);
+    assert_eq!(fixture.heart.stats().expect("heart stats").events, 5);
 
     let maintained = execute(
         &fixture.registry,
@@ -493,6 +942,50 @@ async fn ingestion_and_cognition_tools_round_trip_real_heart_state() {
     assert!(maintained.success);
     let maintenance: Value = serde_json::from_str(&maintained.output).expect("maintenance JSON");
     assert!(maintenance.get("merges").is_some());
+}
+
+#[tokio::test]
+async fn concurrent_document_reingestion_is_idempotent() {
+    let fixture = fixture(true, false);
+    fs::write(
+        fixture._directory.path().join("source.md"),
+        "one source, one exact version",
+    )
+    .expect("document");
+    let first = execute(
+        &fixture.registry,
+        "ingest_documents",
+        json!({"paths":["source.md"],"maintain":false}),
+    );
+    let second = execute(
+        &fixture.registry,
+        "ingest_documents",
+        json!({"paths":["source.md"],"maintain":false}),
+    );
+
+    let (first, second) = tokio::join!(first, second);
+
+    assert!(first.success, "{:?}", first.error);
+    assert!(second.success, "{:?}", second.error);
+    let outputs = [first.output.as_str(), second.output.as_str()];
+    assert!(
+        outputs
+            .iter()
+            .any(|output| output.contains("chunks_ingested=1"))
+    );
+    assert!(
+        outputs
+            .iter()
+            .any(|output| output.contains("chunks_ingested=0"))
+    );
+    assert_eq!(
+        fixture
+            .heart
+            .events_canonical()
+            .expect("events after concurrent ingestion")
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]

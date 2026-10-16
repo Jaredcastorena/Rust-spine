@@ -300,6 +300,7 @@ async fn request_turn(
             messages,
             tools: Vec::new(),
             allow_tool_calls: false,
+            temperature: None,
         })
         .await?;
     let raw = if turn.content.trim().is_empty() {

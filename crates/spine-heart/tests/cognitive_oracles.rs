@@ -12,6 +12,31 @@ fn close(actual: f32, expected: f64, tolerance: f32) {
 }
 
 #[test]
+fn thymos_state_summary_matches_grid_equations_without_mutation() {
+    let thymos = Thymos::with_tensor(
+        ThymosConfig::new(2, 2).unwrap(),
+        vec![1.0, 0.0, 0.0, 2.0],
+        Some(vec![2.0, 4.0]),
+    )
+    .unwrap();
+    let before = thymos.clone();
+    let summary = thymos.state_summary();
+    assert_eq!(summary["channel_norms"], serde_json::json!([1.0, 2.0]));
+    assert_eq!(
+        summary["mean_resultant_length"],
+        serde_json::json!([0.5, 0.5])
+    );
+    assert_eq!(summary["mean_cross_similarity"], 0.0);
+    assert_eq!(summary["config_K"], 2);
+    assert_eq!(summary["config_d"], 2);
+    assert_eq!(summary["has_trajectory"], false);
+    assert_eq!(thymos, before);
+    let one_channel =
+        Thymos::with_tensor(ThymosConfig::new(2, 1).unwrap(), vec![0.0, 0.0], None).unwrap();
+    assert_eq!(one_channel.state_summary()["mean_cross_similarity"], 0.0);
+}
+
+#[test]
 fn dcmdb_matches_python_two_observation_oracle() {
     let mut config = DcmdbConfig::dense(3);
     config.theta_similarity = 0.8;
@@ -111,6 +136,132 @@ fn thymos_matches_python_fixed_tensor_oracle() {
     close(prediction[0], 0.0, 2e-6);
     close(prediction[1], 1.0, 2e-6);
     close(prediction[2], 0.0, 2e-6);
+}
+
+#[test]
+fn per_observation_learning_multiplier_matches_scaled_python_eta_without_scaling_decay() {
+    let config = ThymosConfig::new(3, 2).unwrap();
+    let tensor = vec![0.2, -0.1, 0.05, -0.3, 0.4, 0.1];
+    for multiplier in [1.0, 1.5, 2.0] {
+        let mut actual = Thymos::with_tensor(config.clone(), tensor.clone(), None).unwrap();
+        let mut scaled_config = config.clone();
+        scaled_config.learning_rate *= multiplier;
+        let mut oracle = Thymos::with_tensor(scaled_config, tensor.clone(), None).unwrap();
+        let eligibility = actual
+            .compute_valence(&[1.0, 0.0, 0.0], &[0.0, 1.0, 0.0])
+            .unwrap();
+        actual
+            .update_scaled(&[1.0, 2.0, 3.0], &eligibility, multiplier)
+            .unwrap();
+        oracle.update(&[1.0, 2.0, 3.0], &eligibility).unwrap();
+        assert_eq!(actual.tensor(), oracle.tensor());
+        assert_eq!(actual.channel_mass(), oracle.channel_mass());
+        assert_eq!(actual.config.learning_rate, config.learning_rate);
+        let before = actual.clone();
+        assert!(
+            actual
+                .update_scaled(&[1.0, 2.0, 3.0], &eligibility, f32::NAN)
+                .is_err()
+        );
+        assert_eq!(actual, before);
+    }
+}
+
+#[test]
+fn legacy_risk_upgrade_preserves_weight_meanings_and_learns_new_oracle_inputs() {
+    let x = [1.0, 0.0, 0.0];
+    let feeling = [3.0, 4.0];
+    let legacy_stats = [0.3, 0.0, 0.0, 0.0];
+    let mut field = RiskField::new(3, 2, 4);
+    for _ in 0..8 {
+        field.update(&x, &feeling, &legacy_stats, 1.0).unwrap();
+    }
+    let prediction = field.predict(&x, &feeling, &legacy_stats).unwrap();
+    let before = serde_json::to_value(&field).unwrap();
+    assert!(field.upgrade_retrieval_layout(3, 2, 4).unwrap());
+    let upgraded = serde_json::to_value(&field).unwrap();
+    assert_eq!(
+        upgraded["weights"].as_array().unwrap()[..3],
+        before["weights"].as_array().unwrap()[..3]
+    );
+    assert_eq!(
+        upgraded["weights"].as_array().unwrap()[7..13],
+        vec![serde_json::json!(0.0); 6]
+    );
+    assert_eq!(
+        upgraded["weights"].as_array().unwrap()[13..],
+        before["weights"].as_array().unwrap()[5..]
+    );
+    assert_eq!(
+        upgraded["weights"].as_array().unwrap()[3..5],
+        vec![serde_json::json!(0.0); 2]
+    );
+    assert_eq!(
+        upgraded["weights"].as_array().unwrap()[5..7],
+        before["weights"].as_array().unwrap()[3..5]
+    );
+    assert_eq!(upgraded["channels"], serde_json::json!(4));
+    assert_eq!(
+        field.affect_features(&feeling).unwrap(),
+        vec![0.6, 0.8, 3.0, 4.0]
+    );
+    for key in ["bias", "learning_rate", "updates", "d"] {
+        assert_eq!(upgraded[key], before[key]);
+    }
+    let all_features = [0.9, 0.2, 0.7, 0.5, 0.6, 0.46051702, 0.3, 0.0, 0.0, 0.0];
+    assert_eq!(
+        field.predict(&x, &feeling, &all_features).unwrap(),
+        prediction
+    );
+    assert_eq!(
+        field.predict(&x, &feeling, &legacy_stats).unwrap(),
+        prediction
+    );
+    assert!(!field.upgrade_retrieval_layout(3, 2, 10).unwrap());
+    field.update(&x, &feeling, &all_features, 1.0).unwrap();
+    let learned = serde_json::to_value(&field).unwrap();
+    assert!(
+        learned["weights"].as_array().unwrap()[7..13]
+            .iter()
+            .all(|value| value.as_f64().unwrap() > 0.0)
+    );
+    assert!(
+        learned["weights"].as_array().unwrap()[3..5]
+            .iter()
+            .all(|value| value.as_f64().unwrap() > 0.0)
+    );
+    assert_eq!(field.updates(), 9);
+}
+
+#[test]
+fn fresh_risk_affect_matches_python_normalization_including_zero_and_small_norms() {
+    let risk = RiskField::new(3, 2, 6);
+    assert_eq!(risk.affect_features(&[3.0, 4.0]).unwrap(), vec![0.6, 0.8]);
+    assert_eq!(risk.affect_features(&[0.0, 0.0]).unwrap(), vec![0.0, 0.0]);
+    let small = risk.affect_features(&[1e-9, 0.0]).unwrap();
+    close(small[0], 1.0 / 11.0, 1e-7);
+    assert_eq!(small[1], 0.0);
+}
+
+#[test]
+fn invalid_risk_layout_upgrade_rejects_without_mutating_learned_state() {
+    let mut unknown = RiskField::new(3, 2, 5);
+    let before = unknown.clone();
+    assert!(unknown.upgrade_retrieval_layout(3, 2, 5).is_err());
+    assert_eq!(unknown, before);
+    let valid = RiskField::new(3, 2, 4);
+    for (key, value) in [
+        ("retrieval_stats", serde_json::json!(6)),
+        ("weights", serde_json::json!([1.0])),
+        ("learning_rate", serde_json::json!(-1.0)),
+    ] {
+        let mut encoded = serde_json::to_value(&valid).unwrap();
+        encoded[key] = value;
+        let mut invalid: RiskField = serde_json::from_value(encoded).unwrap();
+        let before = invalid.clone();
+        assert!(invalid.upgrade_retrieval_layout(3, 2, 4).is_err());
+        assert_eq!(invalid, before);
+    }
 }
 
 #[test]

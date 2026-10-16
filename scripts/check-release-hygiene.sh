@@ -1,26 +1,55 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# A missing scanner or an unreadable file must never count as a clean release.
+# Use grep instead of assuming ripgrep is installed on every release runner.
+for required_command in git grep mktemp rm; do
+  if ! command -v "$required_command" >/dev/null 2>&1; then
+    printf 'release hygiene requires %s\n' "$required_command" >&2
+    exit 127
+  fi
+done
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
 failed=0
 release_files=()
+file_list=$(mktemp)
+trap 'rm -f -- "$file_list"' EXIT
 
+# Keep this outside process substitution so a failed Git enumeration is fatal.
+git ls-files -z --cached --others --exclude-standard > "$file_list"
 while IFS= read -r -d '' file; do
   case "$file" in
     Cargo.lock|fuzz/Cargo.lock|scripts/check-release-hygiene.sh) continue ;;
   esac
   release_files+=("$file")
-done < <(git ls-files -z --cached --others --exclude-standard)
+done < "$file_list"
+
+if (( ${#release_files[@]} == 0 )); then
+  echo "release hygiene found no candidate files to scan" >&2
+  exit 1
+fi
 
 check_files() {
   local label="$1"
   local pattern="$2"
   local matches
-  matches=$(rg -l --no-messages -e "$pattern" -- "${release_files[@]}" || true)
-  if [[ -n "$matches" ]]; then
-    echo "$label found in:"
-    echo "$matches"
-    failed=1
-  fi
+  local status=0
+  matches=$(LC_ALL=C grep -E -l -e "$pattern" -- "${release_files[@]}") || status=$?
+  case "$status" in
+    0)
+      echo "$label found in:"
+      printf '%s\n' "$matches"
+      failed=1
+      ;;
+    1) ;; # grep uses 1 for a successful scan with no matches.
+    *)
+      printf 'release hygiene scanner failed for %s (exit %s)\n' "$label" "$status" >&2
+      exit "$status"
+      ;;
+  esac
 }
 
 check_files "absolute developer home path" '(/h[o]me/[^/[:space:]]+|/U[s]ers/[^/[:space:]]+|[A-Za-z]:\\U[s]ers\\[^\\[:space:]]+)'

@@ -16,13 +16,13 @@
   <h1>Spine third-party licenses</h1>
   <p>This file lists the Rust crates incorporated into the Spine executable and the license texts selected for distribution.</p>
   <table>
-    <thead><tr><th>Package</th><th>Version</th><th>License</th></tr></thead>
+    <thead><tr><th>Package</th><th>Version</th><th>Declared license</th></tr></thead>
     <tbody>
     {{#each crates}}
       <tr>
         <td><a href="{{#if package.repository}}{{package.repository}}{{else}}https://crates.io/crates/{{package.name}}{{/if}}">{{package.name}}</a></td>
         <td>{{package.version}}</td>
-        <td>{{license}}</td>
+        <td>{{#if package.license}}{{package.license}}{{else}}{{license}}{{/if}}</td>
       </tr>
     {{/each}}
     </tbody>

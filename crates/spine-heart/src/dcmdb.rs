@@ -545,6 +545,78 @@ impl Dcmdb {
         self.nodes.get(&id).or_else(|| self.absorbed.get(&id))
     }
 
+    /// Select exact evidence across a bounded absorbed-node subtree. Parent
+    /// event IDs include all absorbed events, so remove children's contributions
+    /// before round-robin selection to keep a large parent from hiding them.
+    pub fn subtree_event_ids(
+        &self,
+        root: NodeId,
+        max_depth: usize,
+        max_nodes: usize,
+        max_events: usize,
+    ) -> Vec<EventId> {
+        let mut pending = std::collections::VecDeque::from([(root, 0)]);
+        let mut visited = BTreeSet::new();
+        let mut sources = Vec::new();
+        while visited.len() < max_nodes
+            && let Some((id, depth)) = pending.pop_front()
+        {
+            if !visited.insert(id) {
+                continue;
+            }
+            let Some(node) = self.node(id) else {
+                continue;
+            };
+            let inherited: BTreeSet<_> = node
+                .children
+                .iter()
+                .filter_map(|child| self.node(*child))
+                .flat_map(|child| child.event_ids.iter().copied())
+                .collect();
+            sources.push(
+                node.event_ids
+                    .iter()
+                    .rev()
+                    .filter(|id| !inherited.contains(id))
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .into_iter(),
+            );
+            if depth < max_depth {
+                // Bound queued work as well as visited nodes, even for malformed
+                // wide/cyclic imported hierarchies.
+                for child in &node.children {
+                    if pending.len() + visited.len() >= max_nodes {
+                        break;
+                    }
+                    if !visited.contains(child) && !pending.iter().any(|(id, _)| id == child) {
+                        pending.push_back((*child, depth + 1));
+                    }
+                }
+            }
+        }
+        let mut result = Vec::new();
+        let mut seen = BTreeSet::new();
+        while result.len() < max_events {
+            let mut advanced = false;
+            for source in &mut sources {
+                if result.len() == max_events {
+                    break;
+                }
+                if let Some(id) = source.next() {
+                    advanced = true;
+                    if seen.insert(id) {
+                        result.push(id);
+                    }
+                }
+            }
+            if !advanced {
+                break;
+            }
+        }
+        result
+    }
+
     pub fn relationship_score(&self, left: NodeId, right: NodeId) -> Option<f32> {
         let left_node = self.node(left)?;
         let right_node = self.node(right)?;
@@ -689,12 +761,17 @@ impl Dcmdb {
     }
 
     pub fn prune_pass(&mut self, now: f64) -> usize {
+        self.prune_pass_protected(now, &BTreeSet::new())
+    }
+
+    pub fn prune_pass_protected(&mut self, now: f64, protected: &BTreeSet<NodeId>) -> usize {
         let to_remove: Vec<_> = self
             .nodes
             .iter_mut()
             .filter_map(|(id, node)| {
                 node.apply_decay(now, self.config.eps);
-                (node.weight < self.config.prune_weight_threshold
+                (!protected.contains(id)
+                    && node.weight < self.config.prune_weight_threshold
                     && (now - node.last_seen).max(0.0) as f32 >= self.config.minimum_prune_age)
                     .then_some(*id)
             })
@@ -805,6 +882,15 @@ impl Dcmdb {
     }
 
     pub fn maintain(&mut self, now: f64, maximum_rounds: usize) -> MaintenanceReport {
+        self.maintain_protected(now, maximum_rounds, &BTreeSet::new())
+    }
+
+    pub fn maintain_protected(
+        &mut self,
+        now: f64,
+        maximum_rounds: usize,
+        protected: &BTreeSet<NodeId>,
+    ) -> MaintenanceReport {
         let mut report = MaintenanceReport::default();
         for _ in 0..maximum_rounds {
             let merged = self.consolidate_pass();
@@ -813,7 +899,7 @@ impl Dcmdb {
                 break;
             }
         }
-        report.pruned = self.prune_pass(now);
+        report.pruned = self.prune_pass_protected(now, protected);
         let dream = self.dream_pass(now);
         report.merges += dream.merges;
         report.walks_completed = dream.walks_completed;

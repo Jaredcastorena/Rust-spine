@@ -1,10 +1,13 @@
-use std::collections::{BTreeMap, btree_map::Entry};
+use std::{
+    collections::{BTreeMap, btree_map::Entry},
+    sync::OnceLock,
+};
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentId, Content, ContextForest, Dcmdb, DcmdbConfig, Embedding, EventId, FactExtractor,
-    FactStore, FeelingVector, HeartError, MemoryObservation, ModelManifest, NodeId,
+    AgentId, Content, ContextForest, Dcmdb, DcmdbConfig, Embedding, EventId, FactCandidate,
+    FactExtractor, FactStore, FeelingVector, HeartError, MemoryObservation, ModelManifest, NodeId,
     ParticipantRole, Result, RiskField, SignedEvent, Thymos, ThymosConfig, TrajectoryStep,
 };
 
@@ -32,7 +35,7 @@ impl CognitiveConfig {
             generation,
             model,
             thymos_channels,
-            retrieval_stat_dimensions: 4,
+            retrieval_stat_dimensions: 6,
         })
     }
 }
@@ -59,6 +62,20 @@ pub struct MemoryReceipt {
 }
 
 impl CognitiveState {
+    pub(crate) const CURRENT_SCHEMA: u32 = 4;
+
+    pub fn upgrade_risk_layout(&mut self) -> Result<bool> {
+        let changed = self.risk.upgrade_retrieval_layout(
+            self.config.model.dimension,
+            self.config.thymos_channels,
+            self.config.retrieval_stat_dimensions,
+        )?;
+        if changed {
+            self.config.retrieval_stat_dimensions = self.risk.retrieval_stat_dimensions();
+        }
+        Ok(changed)
+    }
+
     pub fn new(config: CognitiveConfig) -> Result<Self> {
         let dcmdb = Dcmdb::new(DcmdbConfig::dense(config.model.dimension))?;
         let risk = RiskField::new(
@@ -67,7 +84,7 @@ impl CognitiveState {
             config.retrieval_stat_dimensions,
         );
         Ok(Self {
-            schema: 1,
+            schema: Self::CURRENT_SCHEMA,
             config,
             event_frontier: BTreeMap::new(),
             dcmdb,
@@ -100,6 +117,23 @@ impl CognitiveState {
         }
 
         let interaction = &event.body.interaction;
+        // Persist the host-selected multiplier with the signed observation so
+        // replicas and projection rebuilds replay the same learning update.
+        let learning_multiplier = interaction
+            .provenance
+            .metadata
+            .get("thymos_learning_multiplier")
+            .map(|value| value.parse::<f32>())
+            .transpose()
+            .map_err(|_| {
+                HeartError::InvalidInput("invalid Thymos learning multiplier metadata".into())
+            })?
+            .unwrap_or(1.0);
+        if !learning_multiplier.is_finite() || !(0.0..=2.0).contains(&learning_multiplier) {
+            return Err(HeartError::InvalidInput(
+                "Thymos learning multiplier must be in [0, 2]".into(),
+            ));
+        }
         let mut metadata = BTreeMap::new();
         metadata.insert("event_id".into(), event.id.to_string());
         metadata.insert("agent_id".into(), interaction.agent_id.to_string());
@@ -113,19 +147,8 @@ impl CognitiveState {
             source: interaction.provenance.source_uri.clone(),
             metadata,
         })?;
-        if interaction.role == ParticipantRole::User
-            && let Some(text) = Self::inline_text(event)
-        {
-            let candidates = FactExtractor::new()?.extract(
-                text,
-                None,
-                None,
-                event.body.timestamp.wall_millis,
-                [
-                    event.body.timestamp.wall_millis,
-                    u64::from(event.body.timestamp.counter),
-                ],
-            );
+        let candidates = extract_event_facts(event)?;
+        if !candidates.is_empty() {
             self.facts.add_candidates(event.id, node_id, candidates);
         }
 
@@ -148,7 +171,7 @@ impl CognitiveState {
         };
         let (feeling, trajectory) = if interaction.role == ParticipantRole::User {
             let feeling = thymos
-                .learn_predicted_next(embedding.as_slice())?
+                .learn_predicted_next_scaled(embedding.as_slice(), learning_multiplier)?
                 .unwrap_or(thymos.query(embedding.as_slice())?);
             let trajectory = thymos.step(embedding.as_slice())?;
             (feeling, trajectory)
@@ -216,4 +239,120 @@ impl CognitiveState {
             Content::ColdBlob(_) | Content::Redacted => None,
         }
     }
+
+    pub(crate) fn upgrade_facts(&mut self, events: &[SignedEvent]) -> Result<()> {
+        let mut by_event = BTreeMap::new();
+        // Absorbed originals are preferable to merged aggregate coordinates.
+        // Existing facts then override either choice with their exact provenance.
+        for node in self
+            .dcmdb
+            .nodes
+            .values()
+            .chain(self.dcmdb.absorbed.values())
+        {
+            for event_id in &node.event_ids {
+                by_event.insert(*event_id, node.id);
+            }
+        }
+        for fact in self.facts.facts() {
+            by_event.insert(fact.event_id, fact.node_id);
+        }
+        let mut facts = FactStore::default();
+        for event in events {
+            let candidates = extract_event_facts(event)?;
+            if candidates.is_empty() {
+                continue;
+            }
+            let node_id = by_event.get(&event.id).ok_or_else(|| {
+                HeartError::InvalidInput(format!(
+                    "cannot upgrade facts: event {} has no retained DCMDb provenance",
+                    event.id
+                ))
+            })?;
+            facts.add_candidates(event.id, *node_id, candidates);
+        }
+        self.facts = facts;
+        self.schema = Self::CURRENT_SCHEMA;
+        Ok(())
+    }
+}
+
+fn extract_event_facts(event: &SignedEvent) -> Result<Vec<FactCandidate>> {
+    let interaction = &event.body.interaction;
+    if interaction.role != ParticipantRole::User
+        || interaction.provenance.provider.as_deref() == Some("spine-document-ingest")
+        || interaction
+            .provenance
+            .metadata
+            .get("record_schema")
+            .map(String::as_str)
+            == Some("spine-document-chunk")
+    {
+        return Ok(Vec::new());
+    }
+    let Some(text) = CognitiveState::inline_text(event) else {
+        return Ok(Vec::new());
+    };
+    let provenance = &interaction.provenance;
+    let event_time = provenance
+        .metadata
+        .get("event_time")
+        .or_else(|| provenance.metadata.get("date"))
+        .cloned();
+    let session_time = provenance
+        .metadata
+        .get("session_time")
+        .or_else(|| provenance.metadata.get("date"))
+        .cloned();
+    let arrival_order = provenance
+        .metadata
+        .get("session_index")
+        .and_then(|value| value.parse().ok())
+        .zip(
+            provenance
+                .metadata
+                .get("chunk_index")
+                .and_then(|value| value.parse().ok()),
+        )
+        .map_or(
+            [
+                event.body.timestamp.wall_millis,
+                u64::from(event.body.timestamp.counter),
+            ],
+            |(session, chunk)| [session, chunk],
+        );
+    let mut candidates = fact_extractor()?.extract(
+        text,
+        event_time,
+        session_time,
+        event.body.timestamp.wall_millis,
+        arrival_order,
+    );
+    for candidate in &mut candidates {
+        for (key, value) in &provenance.metadata {
+            candidate
+                .metadata
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
+        }
+        if let Some(source_uri) = &provenance.source_uri {
+            candidate
+                .metadata
+                .entry("source_uri".into())
+                .or_insert_with(|| source_uri.clone());
+        }
+    }
+    Ok(candidates)
+}
+
+fn fact_extractor() -> Result<&'static FactExtractor> {
+    static EXTRACTOR: OnceLock<FactExtractor> = OnceLock::new();
+    if let Some(extractor) = EXTRACTOR.get() {
+        return Ok(extractor);
+    }
+    let extractor = FactExtractor::new()?;
+    let _ = EXTRACTOR.set(extractor);
+    Ok(EXTRACTOR
+        .get()
+        .expect("fact extractor was initialized or won a concurrent race"))
 }

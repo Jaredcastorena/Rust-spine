@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use spine_heart::{Dcmdb, DcmdbConfig, EventId, MemoryObservation};
 
@@ -34,6 +34,48 @@ fn consolidation_preserves_hierarchy_events_and_internal_invariants() {
 }
 
 #[test]
+fn absorbed_subtree_expansion_uses_depth_and_node_event_budgets() {
+    let mut memory = Dcmdb::new(DcmdbConfig::dense(3)).unwrap();
+    let ids = [
+        add(&mut memory, 1, [1.0, 0.0, 0.0], 1.0),
+        add(&mut memory, 2, [0.0, 1.0, 0.0], 2.0),
+        add(&mut memory, 3, [0.0, 0.0, 1.0], 3.0),
+        add(&mut memory, 4, [-1.0, 0.0, 0.0], 4.0),
+    ];
+    // Model the same aggregated-event contract as real DCMDb consolidation,
+    // retaining an absorbed chain to make the Python depth oracle explicit.
+    for i in (0..3).rev() {
+        let inherited = memory.nodes[&ids[i + 1]].event_ids.clone();
+        let node = memory.nodes.get_mut(&ids[i]).unwrap();
+        node.children.push(ids[i + 1]);
+        node.event_ids.extend(inherited);
+    }
+    for id in &ids[1..] {
+        let node = memory.nodes.remove(id).unwrap();
+        memory.absorbed.insert(*id, node);
+    }
+    let events = |count: u8| {
+        (1..=count)
+            .map(|n| EventId::from_bytes([n; 32]))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(memory.subtree_event_ids(ids[0], 1, 32, 20), events(2));
+    assert_eq!(memory.subtree_event_ids(ids[0], 2, 32, 20), events(3));
+    assert_eq!(memory.subtree_event_ids(ids[0], 3, 32, 20), events(4));
+    assert_eq!(memory.subtree_event_ids(ids[0], 3, 2, 20), events(2));
+    assert_eq!(memory.subtree_event_ids(ids[0], 3, 32, 1), events(1));
+    assert!(memory.subtree_event_ids(ids[0], 3, 0, 20).is_empty());
+    // Repeated/cyclic coordinates cannot trigger unbounded traversal.
+    memory
+        .absorbed
+        .get_mut(&ids[3])
+        .unwrap()
+        .children
+        .push(ids[0]);
+    assert!(memory.subtree_event_ids(ids[0], usize::MAX, 32, 2).len() <= 2);
+}
+
+#[test]
 fn pruning_cleans_all_graph_and_count_references() {
     let mut config = DcmdbConfig::dense(3);
     config.prune_weight_threshold = 2.0;
@@ -43,6 +85,23 @@ fn pruning_cleans_all_graph_and_count_references() {
     assert_eq!(memory.prune_pass(2.0), 2);
     assert!(memory.nodes.is_empty());
     assert!(memory.graph.is_empty());
+    assert!(memory.check_invariants().is_empty());
+}
+
+#[test]
+fn pruning_preserves_nodes_addressed_by_context_triangles() {
+    let mut config = DcmdbConfig::dense(3);
+    config.prune_weight_threshold = 2.0;
+    let mut memory = Dcmdb::new(config).unwrap();
+    let protected = add(&mut memory, 1, [1.0, 0.0, 0.0], 1.0);
+    let disposable = add(&mut memory, 2, [0.0, 1.0, 0.0], 2.0);
+
+    assert_eq!(
+        memory.prune_pass_protected(2.0, &BTreeSet::from([protected])),
+        1
+    );
+    assert!(memory.node(protected).is_some());
+    assert!(memory.node(disposable).is_none());
     assert!(memory.check_invariants().is_empty());
 }
 

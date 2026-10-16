@@ -22,6 +22,7 @@ fn compaction_folds_only_pairs_with_a_real_coherent_apex() {
     let mut config = DcmdbConfig::dense(3);
     config.theta_similarity = 0.9999;
     config.tension_promote_count = 99;
+    config.prune_weight_threshold = 2.0;
     let mut memory = Dcmdb::new(config).unwrap();
     let a = add(&mut memory, 1, [1.0, 0.0, 0.0], 1.0);
     let b = add(&mut memory, 2, [0.99, 0.1, 0.0], 2.0);
@@ -59,6 +60,13 @@ fn compaction_folds_only_pairs_with_a_real_coherent_apex() {
     assert!(memory.node(triangle.apex).is_some());
     assert!(triangle.apex == a || triangle.apex == b);
     assert_eq!(memory.nodes.len(), 3);
+    forest.verify(&memory).unwrap();
+
+    let disposable = add(&mut memory, 4, [0.0, 0.0, 1.0], 4.0);
+    let referenced = forest.referenced_nodes();
+    assert_eq!(referenced, [a, b, c].into_iter().collect());
+    assert_eq!(memory.prune_pass_protected(4.0, &referenced), 1);
+    assert!(memory.node(disposable).is_none());
     forest.verify(&memory).unwrap();
 }
 

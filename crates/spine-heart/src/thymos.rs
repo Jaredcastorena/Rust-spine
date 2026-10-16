@@ -201,6 +201,39 @@ impl Thymos {
         self.update_count
     }
 
+    /// Non-mutating diagnostics corresponding to the Python grid-cell summary.
+    pub fn state_summary(&self) -> serde_json::Value {
+        let rows: Vec<_> = self.tensor.chunks(self.config.dimension).collect();
+        let norms: Vec<_> = rows.iter().map(|row| vector::norm(row)).collect();
+        let mut cross_sum = 0.0;
+        for (i, left) in rows.iter().enumerate() {
+            for (j, right) in rows.iter().enumerate() {
+                if i != j {
+                    cross_sum += vector::dot(left, right)
+                        / (norms[i].max(self.config.eps) * norms[j].max(self.config.eps));
+                }
+            }
+        }
+        let pairs = rows.len() * rows.len().saturating_sub(1);
+        let resultant: Vec<_> = norms
+            .iter()
+            .zip(&self.channel_mass)
+            .map(|(norm, mass)| (norm / mass.max(self.config.eps)).clamp(0.0, 1.0))
+            .collect();
+        serde_json::json!({
+            "t": self.logical_time,
+            "update_count": self.update_count,
+            "channel_norms": norms,
+            "channel_mass": self.channel_mass,
+            "mean_resultant_length": resultant,
+            "mean_cross_similarity": if pairs == 0 { 0.0 } else { cross_sum / pairs as f32 },
+            "heading_norm": self.heading_norm,
+            "has_trajectory": self.previous_position.is_some(),
+            "config_K": self.config.channels,
+            "config_d": self.config.dimension,
+        })
+    }
+
     pub fn query(&self, input: &[f32]) -> Result<FeelingVector> {
         vector::validate_dimension(input, self.config.dimension)?;
         let input_norm = vector::norm(input);
@@ -265,13 +298,33 @@ impl Thymos {
     }
 
     pub fn update(&mut self, context: &[f32], eligibility: &[f32]) -> Result<()> {
+        self.update_scaled(context, eligibility, 1.0)
+    }
+
+    /// Apply one observation's learning-rate multiplier without changing decay
+    /// or the persistent base configuration.
+    pub fn update_scaled(
+        &mut self,
+        context: &[f32],
+        eligibility: &[f32],
+        learning_multiplier: f32,
+    ) -> Result<()> {
+        let learning_rate = self.config.learning_rate * learning_multiplier;
+        if !learning_multiplier.is_finite()
+            || learning_multiplier < 0.0
+            || !learning_rate.is_finite()
+        {
+            return Err(HeartError::InvalidInput(
+                "invalid Thymos learning multiplier".into(),
+            ));
+        }
         vector::validate_dimension(context, self.config.dimension)?;
         vector::validate_dimension(eligibility, self.config.channels)?;
         let context = vector::unit(context, self.config.eps);
         let activation = self.multiply(&context);
         let rho = 1.0 - self.config.decay;
         for channel in 0..self.config.channels {
-            let signal = self.config.learning_rate * eligibility[channel] * activation[channel];
+            let signal = learning_rate * eligibility[channel] * activation[channel];
             let row_start = channel * self.config.dimension;
             let row_end = row_start + self.config.dimension;
             let row = &mut self.tensor[row_start..row_end];
@@ -303,6 +356,14 @@ impl Thymos {
     /// Learn from the trajectory's prior prediction and a newly observed incoming context.
     /// Returns `None` until both a previous position and heading exist.
     pub fn learn_predicted_next(&mut self, actual: &[f32]) -> Result<Option<FeelingVector>> {
+        self.learn_predicted_next_scaled(actual, 1.0)
+    }
+
+    pub fn learn_predicted_next_scaled(
+        &mut self,
+        actual: &[f32],
+        learning_multiplier: f32,
+    ) -> Result<Option<FeelingVector>> {
         vector::validate_dimension(actual, self.config.dimension)?;
         let Some(context) = self.previous_position.clone() else {
             return Ok(None);
@@ -310,8 +371,9 @@ impl Thymos {
         let Some(expected) = self.predict_next() else {
             return Ok(None);
         };
-        self.update_from_experience(&context, &expected, actual)
-            .map(Some)
+        let eligibility = self.compute_valence(&expected, actual)?;
+        self.update_scaled(&context, &eligibility, learning_multiplier)?;
+        self.query(actual).map(Some)
     }
 
     pub fn step(&mut self, input: &[f32]) -> Result<TrajectoryStep> {
