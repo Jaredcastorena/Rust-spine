@@ -5,6 +5,7 @@ mod agent_tools;
 mod checkpoint_recovery_tests;
 mod cognition_tools;
 mod document_ingest;
+mod endpoint_prompt;
 mod grounding;
 mod longmem;
 mod onboarding;
@@ -183,9 +184,15 @@ enum Command {
         model_dir: Option<PathBuf>,
         #[arg(
             long,
+            requires_all = ["llama_model", "llama_server_bin"],
+            help = "Explicitly start and manage a local llama.cpp server"
+        )]
+        llamacpp: bool,
+        #[arg(
+            long,
             env = "SPINE_LLAMA_MODEL",
             hide_env_values = true,
-            requires = "llama_server_bin",
+            requires_all = ["llama_server_bin", "llamacpp"],
             help = "GGUF model to serve in a managed local llama.cpp process"
         )]
         llama_model: Option<PathBuf>,
@@ -193,7 +200,7 @@ enum Command {
             long,
             env = "SPINE_LLAMA_SERVER",
             hide_env_values = true,
-            requires = "llama_model",
+            requires_all = ["llama_model", "llamacpp"],
             help = "llama-server executable to start and stop with this session"
         )]
         llama_server_bin: Option<PathBuf>,
@@ -208,10 +215,9 @@ enum Command {
             long,
             env = "SPINE_LLM_URL",
             hide_env_values = true,
-            default_value = "http://127.0.0.1:8080",
-            help = "OpenAI-compatible server base URL"
+            help = "OpenAI-compatible base URL or chat endpoint (otherwise prompt for endpoint and port)"
         )]
-        server_url: String,
+        server_url: Option<String>,
         #[arg(long, env = "SPINE_LLM_API_KEY", hide = true, hide_env_values = true)]
         api_key: Option<String>,
         #[arg(
@@ -580,6 +586,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             allow_remote_web,
             passphrase,
             model_dir,
+            llamacpp,
             llama_model,
             llama_server_bin,
             gpu_layers,
@@ -602,6 +609,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_history_turns,
             max_history_chars,
         } => {
+            let server_url = endpoint_prompt::resolve(
+                server_url.as_deref(),
+                llamacpp,
+                io::stdin().is_terminal(),
+                &mut io::stdin().lock(),
+                &mut io::stdout().lock(),
+            )?;
             let heart_target = ChatHeartTarget::resolve(path, incognito_mode)?;
             let path = &heart_target.path;
             let model_dir = resolve_required_model_directory(model_dir)?;
@@ -660,8 +674,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .ok()
                     .filter(|value| !value.is_empty())
             });
-            let mut managed_server = match (llama_server_bin, llama_model) {
-                (Some(binary), Some(model)) => Some(ManagedLlamaServer::start(
+            let mut managed_server = match (llamacpp, llama_server_bin, llama_model) {
+                (true, Some(binary), Some(model)) => Some(ManagedLlamaServer::start(
                     &binary,
                     &model,
                     &server_url,
@@ -670,9 +684,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     resolved_api_key.as_deref(),
                     path.with_extension("llama-server.log"),
                 )?),
-                (None, None) => None,
+                (false, None, None) => None,
                 _ => {
-                    return Err("--llama-model and --llama-server-bin must be used together".into());
+                    return Err("--llamacpp requires --llama-model and --llama-server-bin".into());
                 }
             };
             let mut provider_config = LlamaCppConfig::new(server_url);
@@ -3569,7 +3583,7 @@ mod cli_tests {
                 allow_remote_web: false,
                 server_url,
                 ..
-            } if web_host == "127.0.0.1" && server_url == "http://127.0.0.1:8080"
+            } if web_host == "127.0.0.1" && server_url.is_none()
         ));
         assert!(Cli::try_parse_from(["spine", "chat", "--allow-remote-web"]).is_err());
     }
@@ -3609,6 +3623,49 @@ mod cli_tests {
                 "model.gguf",
             ])
             .is_err()
+        );
+        assert!(Cli::try_parse_from(["spine", "chat", "--llamacpp"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "spine",
+                "chat",
+                "--llama-model",
+                "model.gguf",
+                "--llama-server-bin",
+                "llama-server",
+            ])
+            .is_err()
+        );
+        let cli = Cli::try_parse_from([
+            "spine",
+            "chat",
+            "--llamacpp",
+            "--llama-model",
+            "model.gguf",
+            "--llama-server-bin",
+            "llama-server",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command, Command::Chat { llamacpp: true, .. }));
+    }
+
+    #[test]
+    fn chat_defaults_to_endpoint_setup_and_explicit_url_bypasses_it() {
+        let cli = Cli::try_parse_from(["spine", "chat"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Chat {
+                llamacpp: false,
+                server_url: None,
+                llama_model: None,
+                llama_server_bin: None,
+                ..
+            }
+        ));
+        let cli = Cli::try_parse_from(["spine", "chat", "--server-url", "https://example.com/v1"])
+            .unwrap();
+        assert!(
+            matches!(cli.command, Command::Chat { llamacpp: false, server_url: Some(url), .. } if url == "https://example.com/v1")
         );
     }
 

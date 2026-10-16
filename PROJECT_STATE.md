@@ -21,7 +21,8 @@
   profile supplies revisable behavioral defaults on later runs.
 - `--incognito-mode` (alias `--test-mode`) runs against a randomly keyed heart in a private temporary directory and does not require or modify a persistent heart.
 - `--web` serves an embedded single-binary UI on `127.0.0.1:8088` by default. Browser messages and controls enter the same harness loop as the terminal; no parallel agent session is created.
-- `--llama-server-bin` plus `--llama-model` optionally manages the local llama.cpp server in the same process tree; using an existing OpenAI-compatible endpoint remains supported.
+- Chat prompts for an OpenAI-compatible endpoint and port by default; explicit `--server-url`/`SPINE_LLM_URL` bypasses setup and is required with redirected stdin.
+- Only `--llamacpp` together with `--llama-server-bin` and `--llama-model` manages a local llama.cpp server. Normal chat connects to the chosen existing service.
 - Persistent chat has a platform-style default heart path, and MiniLM assets resolve from `SPINE_MINILM_DIR` or the local Hugging Face cache; explicit paths still override both.
 - Web APIs require a random per-process fragment token. Non-loopback binding is rejected unless the operator explicitly supplies `--allow-remote-web`.
 - Version tags build checksum-paired Linux, macOS, and Windows release archives; each archive contains one executable plus licenses and attribution.

@@ -1,97 +1,44 @@
-# Rust Spine parity ledger
+# Rust Spine working memory
 
-## Purpose
+## Current goal — 2026-10-15
+- Change only chat startup: prompt for an OpenAI-compatible endpoint and port by
+  default; require explicit --llamacpp to launch a managed local server.
+- Implement and test on the clean PR #16 checkout, branch fix/python-parity.
+  Its starting HEAD and fetched remote HEAD are both 3931bc5.
+- Preserve unrelated uncommitted Codex/provider changes in the parent checkout.
+- Explicit --server-url / SPINE_LLM_URL bypass prompts; noninteractive startup
+  must require an explicit URL rather than consuming piped chat input.
+- Prompt defaults: http://127.0.0.1/v1/chat/completions, port 8080. Normalize the
+  standard full chat endpoint to the provider base URL; reject legacy text-only
+  /v1/completions rather than silently sending an incompatible request.
+- Implementation and local verification complete; delivery uses existing PR #16.
+- Verification: 217 workspace tests pass, strict all-target/all-feature Clippy,
+  formatting, diff/release hygiene, optimized build and real-terminal startup
+  smoke pass. No model assets or production service were needed for this change.
+- Independent review found two issues, both fixed: empty port delimiters must not
+  imply port80, and full chat endpoints must normalize to the server prefix so
+  root /health and /props discovery still works. Models-only and root-health-only
+  mock-server regressions pass. Final reviewer reports no remaining blockers.
+- Redirected stdin, explicit flag/environment URLs, EOF, invalid URLs/ports and
+  llama environment paths without the opt-in flag have regression coverage.
+- New-commit remote CI is not yet verified; use PR16 checks for its current state.
 
-Keep the implementation contracts, review findings, and verification evidence
-durable as Rust becomes the base implementation. Read this before starting a
-parity lane; update it after accepted milestones and when the next action changes.
+## Locked contracts
+- Python-free production; preserve DCMDb/Thymos equations and signed event truth.
+- Unlimited tool rounds remain default; explicit saved checkpoint policy survives.
+- Preserve fact schema4 cleanup, learned state, source authority and atomic recovery.
+- Triangles use real existing coordinates; no synthetic scaffold or periodic fold.
+- Legacy Python import, device-revocation redesign and model selection are out of scope.
 
-## Architecture contracts
+## Verified historical baseline
+- September 8 correction: 206 Rust tests and 149 isolated Python tests passed.
+- Independent reviews and native-model/release checks recorded in the archive.
+- These historical results do not substitute for verification of today's change.
 
-- Production is Python-free. The legacy Python implementation is a behavior oracle.
-- Preserve the tested DCMDb and Thymos equations.
-- Typed facts, supersession, recency, and aggregation derive from signed heart events.
-- Preserve exact NLI evidence and the contradiction/entailment/neutral label order.
-- Tool rounds are unlimited by default; positive operator ceilings remain optional.
-- Guidance enters after a completed tool boundary. Graceful stop leaves a validated
-  resumable checkpoint; immediate interrupt does not imply successful completion.
-- Triangles contain addresses, use existing coherent DCMDb coordinates, and retain
-  standalone branches when no valid apex exists. No synthetic scaffold or periodic
-  three-to-one fold is introduced. Rehydration remains externally budgeted.
-- Canonical events are durable truth. Recovery must preserve valid learned state;
-  suffix catch-up must reject events that reorder an already projected prefix.
-- Historical source provenance must never be rebound through today's filesystem.
-- Legacy state import, new device-revocation design, and smaller model selection
-  are separate projects from Python runtime parity.
-
-## Production workflow
-
-1. Reproduce each gap against the Python oracle and record the exact contract.
-2. Implement in an isolated branch with deterministic regression coverage.
-3. Have a second reviewer inspect behavior, error paths, and the tests.
-4. Resolve findings and integrate focused commits into the parity branch.
-5. Run the combined workspace tests, strict Clippy, formatting, release build,
-   fuzz compilation, release hygiene, and license checks before PR acceptance.
-
-## 2026-09-07 parity integration
-
-Current work is PR #16, `fix/python-parity`, based on current main `d8299d1`.
-Provider/input/checkpoints, typed facts/aggregation, source-aware documents,
-resilience, host modulation, introspection, and web fallback are integrated and
-reviewed. `PARITY.md` maps each behavior to regression evidence.
-
-Important accepted review findings:
-
-- Exact canonical consume markers reconcile ambiguous writes before retry or
-  resume; unknown markers fail closed. Saved unlimited tool policy stays
-  unlimited across restart. Grounding repair preserves cumulative budgets and
-  evidence, and cannot continue a gracefully stopped run.
-- Fact schema 4 backfills user facts and removes document-source contamination
-  while preserving non-fact cognitive state. Both chat and one-shot harness
-  startup perform suffix recovery followed by fact upgrade.
-- Released risk models used raw affect and count/empty features. Atomic migration
-  preserves their weights in explicit compatibility segments and adds normalized
-  affect plus six oracle inputs with zero initial weights. Fresh hearts use only
-  the Python layout; unsupported layouts fail visibly.
-- Unavailable risk is labeled unknown and selects conservative policy. Turn
-  introspection is host-owned and bounded; resume clears unrelated turn metadata.
-- Diagnostic history is a separate encrypted projection with known observations,
-  bounded 100-sample retention and last-ten means. Missing legacy samples stay
-  unknown; tensor replacement must break diagnostic continuity explicitly.
-
-The reviewed correction passes 206 combined Rust tests and the 149-test
-isolated Python oracle. Actual native model tests, strict Clippy, formatting,
-optimized build, fuzz compilation, license freshness, hygiene and dependency
-audits pass. The release CLI completes two native tool rounds against a local
-test endpoint using genuine MiniLM weights and cleans up its incognito heart.
-Diagnostic suffix recovery is atomic, preserves learned state and context links,
-and adds each known observation once across failure, retry and reopen.
-
-Use PR #16's checks for current remote CI status. Review and merge remain normal
-repository acceptance steps; do not silently change the locked architecture or
-reinterpret missing historical diagnostics as known data.
-
-## 2026-09-08 user review corrections
-
-The prior passing suite missed three real defects; it was not proof of complete
-parity. Each now has a regression that failed before its correction:
-
-- Missing checkpoint policy stays distinguishable from an explicitly saved
-  unlimited policy. Only the legacy missing-policy case inherits the configured
-  total-round ceiling, including already completed rounds. Persist/reload keeps
-  that distinction; resume introspection shows the same resolved effective policy.
-- Partner names require explicit `is named` / `is called` constructions with a
-  capitalized single name ending its clause. Only the prefix is case-insensitive;
-  `named after her grandmother`, `called every evening`, and `called daily` must
-  not supersede an existing name. Lowercase/compound/multiword mentions remain
-  searchable text, not guessed or truncated typed names. This deliberately avoids
-  the same permissive-regex defect present in the Python oracle.
-- Numeric age validation is independent of the text-length minimum, preserving
-  both single- and double-digit ages across the supported constructions.
-- Schema 4 atomically repairs existing schema 1–3 fact projections from canonical
-  evidence, including schema 3's stored false names and omitted ages. It preserves
-  learned risk, affect, DCMDb, triangles and frontiers without replaying cognition.
-  Missing retained provenance still fails visibly without installing a partial
-  upgrade; successful upgrades are idempotent across reopening.
-
-Reacceptance of this correction is recorded in PR #16 and the production Forum.
+## Immutable archive
+- Path: memory/archive/ccf406391500972157b000600dafcbe0b7d26f579c9f5a238d089fe2101e44c4.md
+- SHA-256: ccf406391500972157b000600dafcbe0b7d26f579c9f5a238d089fe2101e44c4
+- 97 lines; byte-for-byte copy and hash verified before shrinking this file.
+- 1-based topic ranges: purpose 1–8; architecture 9–26; production workflow 27–35;
+  parity integration/acceptance 36–73; September 8 review fixes 74–97.
+- Never edit the archive or reuse its line addresses for changed content.

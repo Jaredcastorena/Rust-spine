@@ -164,12 +164,27 @@ The Linux archives target glibc-based distributions, not Alpine/musl.
 If Hugging Face tooling already downloaded this model into its standard cache,
 Spine finds it automatically and you can omit `--model-dir`.
 
-### 3. Start a model server
+### 3. Choose an OpenAI-compatible model endpoint
 
-If an OpenAI-compatible model server is already running at
-`http://127.0.0.1:8080`, continue to step 4.
+Spine connects to an existing OpenAI-compatible service by default; it does not
+start llama.cpp. At interactive chat startup, enter the endpoint and then its port:
 
-For a local setup, Spine works with
+```text
+OpenAI-compatible API endpoint [http://127.0.0.1/v1/chat/completions]:
+Port [8080]:
+```
+
+Press Enter twice to use `http://127.0.0.1:8080/v1/chat/completions`.
+You can enter a base URL ending in `/v1` or the full `/v1/chat/completions` URL.
+The older text-only `/v1/completions` route is not compatible with Spine's chat
+and tool messages. An explicit URL port is offered as the port default; remote
+HTTPS endpoints default to 443. No endpoint setting is saved automatically.
+
+Set `--server-url` or `SPINE_LLM_URL` to skip both prompts. This is required when
+stdin is redirected, so setup cannot consume piped chat messages. Existing API-key
+and model-name options are unchanged. If you already have a service, go to step 4.
+
+For an optional local setup, Spine works with
 [`llama-server`](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)
 from [llama.cpp](https://github.com/ggml-org/llama.cpp#quick-start). Install
 llama.cpp, choose a GGUF chat model that fits your hardware, and start it in a
@@ -522,13 +537,14 @@ command-line names for each setting.
 | `SPINE_HEART_PASSPHRASE` | `--passphrase` | Heart passphrase. Let Spine prompt when practical. |
 | `SPINE_MINILM_DIR` | `--model-dir` | Location of the required MiniLM snapshot. |
 | `SPINE_NLI_DIR` | `--nli-model-dir` | Location of the optional NLI snapshot. |
-| `SPINE_LLM_URL` | `--server-url` | Address of the OpenAI-compatible model server. |
+| `SPINE_LLM_URL` | `--server-url` | Base URL or full chat-completions endpoint; skips endpoint/port prompts. |
 | `SPINE_LLM_MODEL` | `--server-model` | Model name, when the server cannot report it. |
 | `SPINE_LLM_API_KEY` | `--api-key` (hidden; environment preferred) | Model-server credential, when one is required. |
 | `SPINE_REASONING_EFFORT` | `--reasoning-effort` | Optional provider-specific reasoning effort; omitted by default for broad compatibility. |
 | `SPINE_MAX_CONTEXT_TOKENS` | `--max-context-tokens` | Context limit, when the server cannot report it. |
-| `SPINE_LLAMA_SERVER` | `--llama-server-bin` | Local `llama-server` executable for Spine to manage. |
-| `SPINE_LLAMA_MODEL` | `--llama-model` | Local GGUF model for that managed server. |
+| — | `--llamacpp` | Explicitly enable managed local llama.cpp; requires its model and executable options. |
+| `SPINE_LLAMA_SERVER` | `--llama-server-bin` | Local executable; requires `--llamacpp`. |
+| `SPINE_LLAMA_MODEL` | `--llama-model` | Local GGUF model; requires `--llamacpp`. |
 
 Never put a literal passphrase, recovery phrase, or API key in a command you
 might save or share.
@@ -595,10 +611,12 @@ Face cache.
 
 ### Let Spine manage llama.cpp
 
-Spine can start and stop a local `llama-server` with the chat session:
+Only with `--llamacpp`, Spine can start and stop a local `llama-server` with the
+chat session. This opt-in skips the endpoint prompts and defaults to port 8080;
+use `--server-url` to override it:
 
 ```bash
-spine chat --no-nli --model-dir "/absolute/path/to/all-MiniLM-L6-v2" --llama-server-bin "/absolute/path/to/llama-server" --llama-model "/absolute/path/to/model.gguf" --max-context-tokens 16384
+spine chat --llamacpp --no-nli --model-dir "/absolute/path/to/all-MiniLM-L6-v2" --llama-server-bin "/absolute/path/to/llama-server" --llama-model "/absolute/path/to/model.gguf" --max-context-tokens 16384
 ```
 
 Server output is written beside the heart. `--max-tool-rounds` is optional;
