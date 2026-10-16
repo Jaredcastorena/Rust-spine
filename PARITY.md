@@ -49,8 +49,8 @@ accept the combined branch.
 
 ## Intentional differences
 
-The architecture decisions in `stigmergicmemory.md` take precedence over a literal
-port: no synthetic triangle scaffold or periodic three-to-one folding, no Python
+The Rust architecture intentionally differs from a literal Python port:
+no synthetic triangle scaffold or periodic three-to-one folding, no Python
 production dependency, and no legacy Python state import requirement. New device
 revocation and smaller-model selection remain separate projects.
 
