@@ -108,7 +108,7 @@ impl Tool for MetadataProbe {
 }
 
 #[tokio::test]
-async fn host_introspection_metadata_is_bounded_isolated_and_cannot_override_task() {
+async fn host_introspection_metadata_is_bounded_isolated_and_cannot_override_task_or_budget() {
     let mut registry = ToolRegistry::default();
     registry.register(MetadataProbe).unwrap();
     let make_provider = || {
@@ -128,6 +128,7 @@ async fn host_introspection_metadata_is_bounded_isolated_and_cannot_override_tas
             [
                 ("spine_trajectory".into(), "{\"surprise\":0.25}".into()),
                 ("task".into(), "spoofed task".into()),
+                ("max_tool_result_chars".into(), "9999999".into()),
                 (
                     "unrelated_private_value".into(),
                     "must not reach tools".into(),
@@ -154,6 +155,7 @@ async fn host_introspection_metadata_is_bounded_isolated_and_cannot_override_tas
         .unwrap();
     let metadata: serde_json::Value = serde_json::from_str(&message.content).unwrap();
     assert_eq!(metadata["task"], "actual task");
+    assert_eq!(metadata["max_tool_result_chars"], "16384");
     assert_eq!(metadata["spine_trajectory"], "{\"surprise\":0.25}");
     assert!(metadata.get("unrelated_private_value").is_none());
     let separate = Harness::new(make_provider(), registry, HarnessConfig::default()).unwrap();
@@ -167,7 +169,10 @@ async fn host_introspection_metadata_is_bounded_isolated_and_cannot_override_tas
         .find(|message| message.role == MessageRole::Tool)
         .unwrap();
     let metadata: serde_json::Value = serde_json::from_str(&message.content).unwrap();
-    assert_eq!(metadata, serde_json::json!({"task":"independent task"}));
+    assert_eq!(
+        metadata,
+        serde_json::json!({"task":"independent task", "max_tool_result_chars":"16384"})
+    );
 }
 
 fn registry(executed: Arc<Mutex<Vec<String>>>) -> ToolRegistry {

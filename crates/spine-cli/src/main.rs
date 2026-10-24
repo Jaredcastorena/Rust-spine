@@ -11,6 +11,7 @@ mod longmem;
 mod onboarding;
 mod partner_tools;
 mod resilience;
+mod setup;
 mod terminal_input;
 #[cfg(test)]
 mod tool_smoke_tests;
@@ -29,7 +30,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use spine_heart::{
     AgentId, CognitiveConfig, Content, ContextLeaf, Embedding, EventId, EventKind, HeartConfig,
     InteractionInput, KeySource, ParticipantRole, Provenance, SemanticEncoder, SignedEvent,
@@ -51,6 +52,16 @@ use resilience::{CircuitBreaker, ResilienceChannel};
     about = "Single-binary encrypted AI partner for the terminal and browser"
 )]
 struct Cli {
+    #[arg(
+        long,
+        global = true,
+        env = "SPINE_CONFIG",
+        hide_env_values = true,
+        help = "Launch settings file (defaults to the platform config directory)"
+    )]
+    config: Option<PathBuf>,
+    #[arg(long, global = true, help = "Do not read or save launch settings")]
+    no_settings: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -129,6 +140,27 @@ enum Command {
     },
     /// Talk to Spine in the terminal or embedded browser.
     Chat {
+        #[arg(
+            long,
+            help = "Enter a new model server URL; save it after successful startup"
+        )]
+        setup: bool,
+        #[arg(
+            long,
+            help = "Use local MiniLM files only; never download missing assets"
+        )]
+        no_download: bool,
+        #[arg(
+            long,
+            help = "Workspace for file and shell tools (remembered after startup)"
+        )]
+        workspace: Option<PathBuf>,
+        #[arg(
+            long,
+            conflicts_with = "web_server",
+            help = "Use the terminal instead of a saved browser preference"
+        )]
+        terminal: bool,
         #[arg(
             value_name = "HEART",
             env = "SPINE_HEART_PATH",
@@ -215,7 +247,7 @@ enum Command {
             long,
             env = "SPINE_LLM_URL",
             hide_env_values = true,
-            help = "OpenAI-compatible base URL or chat endpoint (otherwise prompt for endpoint and port)"
+            help = "OpenAI-compatible base URL or chat endpoint (otherwise reuse saved settings or prompt once)"
         )]
         server_url: Option<String>,
         #[arg(long, env = "SPINE_LLM_API_KEY", hide = true, hide_env_values = true)]
@@ -332,7 +364,12 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
+    let mut arguments: Vec<_> = std::env::args_os().collect();
+    if arguments.len() == 1 {
+        arguments.push("chat".into());
+    }
+    let matches = Cli::command().get_matches_from(arguments);
+    let cli = Cli::from_arg_matches(&matches)?;
     match cli.command {
         Command::Create { path, passphrase } => {
             let passphrase = resolve_heart_passphrase(passphrase, true)?;
@@ -578,6 +615,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         Command::Chat {
+            setup: reconfigure,
+            no_download,
+            workspace,
+            terminal,
             path,
             incognito_mode,
             web_server: enable_web_server,
@@ -609,30 +650,150 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_history_turns,
             max_history_chars,
         } => {
+            // Incognito and managed-server runs never change normal launch preferences.
+            let remember = !cli.no_settings && !incognito_mode && !llamacpp;
+            let settings_path = if remember {
+                Some(match cli.config {
+                    Some(path) => setup::absolute(path)?,
+                    None => setup::config_path()?,
+                })
+            } else {
+                None
+            };
+            let saved = settings_path
+                .as_deref()
+                .map(setup::Settings::load)
+                .transpose()?
+                .unwrap_or_default();
+            let chat_matches = matches.subcommand_matches("chat").expect("chat arguments");
             let server_url = endpoint_prompt::resolve(
-                server_url.as_deref(),
+                server_url.as_deref().or({
+                    if reconfigure {
+                        None
+                    } else {
+                        saved.server_url.as_deref()
+                    }
+                }),
                 llamacpp,
                 io::stdin().is_terminal(),
                 &mut io::stdin().lock(),
                 &mut io::stdout().lock(),
             )?;
-            let heart_target = ChatHeartTarget::resolve(path, incognito_mode)?;
+            let same_provider = saved
+                .server_url
+                .as_deref()
+                .and_then(|url| endpoint_prompt::normalize(url).ok())
+                .is_some_and(|url| url.as_str() == server_url);
+            // Provider-specific overrides must not leak into a different connection.
+            let server_model = server_model
+                .or_else(|| same_provider.then(|| saved.server_model.clone()).flatten());
+            let reasoning_effort = reasoning_effort.or_else(|| {
+                same_provider
+                    .then(|| saved.reasoning_effort.clone())
+                    .flatten()
+            });
+            let max_context_tokens = max_context_tokens
+                .or_else(|| same_provider.then_some(saved.max_context_tokens).flatten());
+            let enable_web_server = !terminal
+                && setup::choose(chat_matches, "web_server", enable_web_server, saved.web);
+            let web_port = setup::choose(chat_matches, "web_port", web_port, saved.web_port);
+            let skip_onboarding = setup::choose(
+                chat_matches,
+                "skip_onboarding",
+                skip_onboarding,
+                saved.skip_onboarding,
+            );
+            let no_nli = if nli_model_dir.is_some() {
+                false
+            } else {
+                setup::choose(chat_matches, "no_nli", no_nli, saved.no_nli)
+            };
+            let workspace = setup::absolute(
+                workspace
+                    .or(saved.workspace)
+                    .unwrap_or(std::env::current_dir()?),
+            )?;
+            if !workspace.is_dir() {
+                return Err(
+                    "Workspace does not exist; choose an existing directory with --workspace"
+                        .into(),
+                );
+            }
+            let heart_target = ChatHeartTarget::resolve(path.or(saved.heart), incognito_mode)?;
             let path = &heart_target.path;
-            let model_dir = resolve_required_model_directory(model_dir)?;
             let nli_model_dir = if no_nli {
                 None
             } else {
-                resolve_optional_nli_directory(nli_model_dir)?
+                resolve_optional_nli_directory(nli_model_dir.or(saved.nli_model_dir))?
+                    .map(setup::absolute)
+                    .transpose()?
+            };
+            let resolved_api_key = api_key.filter(|value| !value.is_empty());
+            let mut provider_config = LlamaCppConfig::new(server_url.clone());
+            provider_config.api_key = resolved_api_key.clone();
+            provider_config.model = server_model.clone();
+            provider_config.reasoning_effort = reasoning_effort.clone();
+            provider_config.max_tokens = max_tokens;
+            provider_config.temperature = temperature;
+            provider_config.timeout = Duration::from_secs(timeout_seconds);
+            provider_config.maximum_retries = provider_retries;
+            provider_config.max_context_tokens = max_context_tokens;
+            let provider = LlamaCppProvider::new(provider_config)?;
+            let mut managed_server = match (llamacpp, llama_server_bin, llama_model) {
+                (true, Some(binary), Some(model)) => {
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    Some(ManagedLlamaServer::start(
+                        &binary,
+                        &model,
+                        &server_url,
+                        gpu_layers,
+                        max_context_tokens.unwrap_or(115_968),
+                        resolved_api_key.as_deref(),
+                        path.with_extension("llama-server.log"),
+                    )?)
+                }
+                (false, None, None) => None,
+                _ => return Err("--llamacpp requires --llama-model and --llama-server-bin".into()),
+            };
+            if let Some(server) = managed_server.as_mut() {
+                wait_for_managed_server(&provider, server, Duration::from_secs(120)).await?;
+            } else {
+                setup::validate_connection(&provider).await?;
+            }
+            report_provider_settings(&provider);
+            let provider = Arc::new(provider);
+            let model_dir =
+                resolve_chat_model_directory(model_dir.or(saved.model_dir), no_download).await?;
+            let encoder = Arc::new(MiniLmEncoder::load(
+                MiniLmAssets::from_directory(&model_dir),
+                256,
+            )?);
+            let grounding = nli_model_dir
+                .clone()
+                .map(grounding::GroundingGate::load)
+                .transpose()?;
+            let preferences = setup::Settings {
+                server_url: Some(server_url),
+                server_model,
+                reasoning_effort,
+                max_context_tokens,
+                heart: Some(setup::absolute(path.clone())?),
+                model_dir: Some(model_dir),
+                workspace: Some(workspace.clone()),
+                web: enable_web_server,
+                web_port,
+                no_nli,
+                nli_model_dir,
+                skip_onboarding,
+                ..setup::Settings::default()
             };
             let passphrase = if incognito_mode {
                 ephemeral_passphrase()?
             } else {
                 resolve_heart_passphrase(passphrase, !path.exists())?
             };
-            let encoder = Arc::new(MiniLmEncoder::load(
-                MiniLmAssets::from_directory(model_dir),
-                256,
-            )?);
             let (heart, created_new_heart) = if path.exists() {
                 (
                     SpineHeart::open(
@@ -652,7 +813,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     8,
                 )?)?;
                 if incognito_mode {
-                    println!("Incognito mode: temporary encrypted heart; nothing will persist");
+                    println!(
+                        "Incognito mode: temporary encrypted heart; conversations will not persist"
+                    );
                 } else {
                     println!("created new encrypted heart: {}", path.display());
                     println!("recovery phrase: {}", created.recovery_phrase.expose());
@@ -669,47 +832,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let heart_was_empty = heart.stats()?.events == 0;
             let agent_id = AgentId::new(agent)?;
             let thread_id = ThreadId::new(thread)?;
-            let resolved_api_key = api_key.filter(|value| !value.is_empty()).or_else(|| {
-                std::env::var("SPINE_LLM_API_KEY")
-                    .ok()
-                    .filter(|value| !value.is_empty())
-            });
-            let mut managed_server = match (llamacpp, llama_server_bin, llama_model) {
-                (true, Some(binary), Some(model)) => Some(ManagedLlamaServer::start(
-                    &binary,
-                    &model,
-                    &server_url,
-                    gpu_layers,
-                    max_context_tokens.unwrap_or(115_968),
-                    resolved_api_key.as_deref(),
-                    path.with_extension("llama-server.log"),
-                )?),
-                (false, None, None) => None,
-                _ => {
-                    return Err("--llamacpp requires --llama-model and --llama-server-bin".into());
-                }
-            };
-            let mut provider_config = LlamaCppConfig::new(server_url);
-            provider_config.api_key = resolved_api_key;
-            provider_config.model = server_model;
-            provider_config.reasoning_effort = reasoning_effort;
-            provider_config.max_tokens = max_tokens;
-            provider_config.temperature = temperature;
-            provider_config.timeout = Duration::from_secs(timeout_seconds);
-            provider_config.maximum_retries = provider_retries;
-            provider_config.max_context_tokens = max_context_tokens;
-            let provider = LlamaCppProvider::new(provider_config)?;
-            if let Some(server) = managed_server.as_mut() {
-                wait_for_managed_server(&provider, server, Duration::from_secs(120)).await?;
-            } else {
-                provider.health().await?;
-            }
-            report_provider_settings(&provider);
-            let provider = Arc::new(provider);
-            let grounding = nli_model_dir
-                .map(grounding::GroundingGate::load)
-                .transpose()?;
-
             let mut registry = ToolRegistry::default();
             cognition_tools::register_cognition_tools(
                 &mut registry,
@@ -721,7 +843,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &mut registry,
                 Arc::clone(&heart),
                 Arc::clone(&encoder),
-                std::env::current_dir()?,
+                workspace,
                 path.with_extension("action-audit.jsonl"),
             )?;
             let cognitive_config = heart
@@ -769,6 +891,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let web_ui = web_server.as_ref().map(web_server::WebServer::ui);
             if let Some(server) = &web_server {
                 println!("Spine web UI: {}", server.access_url);
+            }
+
+            if let Some(settings_path) = settings_path {
+                preferences.save(&settings_path)?;
             }
 
             let status = Arc::new(TerminalStatus::new());
@@ -2170,6 +2296,28 @@ fn expand_home(path: PathBuf) -> PathBuf {
         return home.join(suffix);
     }
     path
+}
+
+async fn resolve_chat_model_directory(
+    explicit: Option<PathBuf>,
+    no_download: bool,
+) -> io::Result<PathBuf> {
+    if let Some(path) = explicit {
+        let path = setup::absolute(path)?;
+        if setup::minilm_directory()
+            .and_then(setup::absolute)
+            .is_ok_and(|managed| path == managed)
+        {
+            setup::ensure_minilm(&path, no_download).await?;
+        }
+        return validate_model_directory(path, "MiniLM");
+    }
+    if let Ok(path) = resolve_required_model_directory(None) {
+        return setup::absolute(path);
+    }
+    let managed = setup::minilm_directory()?;
+    setup::ensure_minilm(&managed, no_download).await?;
+    setup::absolute(managed)
 }
 
 fn resolve_required_model_directory(explicit: Option<PathBuf>) -> io::Result<PathBuf> {

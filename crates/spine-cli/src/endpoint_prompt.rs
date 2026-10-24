@@ -3,7 +3,7 @@ use std::io::{self, BufRead, Write};
 
 use reqwest::Url;
 
-const DEFAULT_ENDPOINT: &str = "http://127.0.0.1/v1/chat/completions";
+const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:8080";
 const MANAGED_ENDPOINT: &str = "http://127.0.0.1:8080";
 
 pub fn resolve(
@@ -21,59 +21,19 @@ pub fn resolve(
     }
     if !interactive {
         return Err(invalid(
-            "set --server-url or SPINE_LLM_URL when stdin is not a terminal",
+            "set --server-url or SPINE_LLM_URL, or run interactive setup once, when stdin is not a terminal",
         ));
     }
-    let (mut url, explicit_port) = loop {
-        let endpoint = prompt(
-            input,
-            output,
-            "OpenAI-compatible API endpoint",
-            DEFAULT_ENDPOINT,
-        )?;
+    loop {
+        let endpoint = prompt(input, output, "Model server URL", DEFAULT_ENDPOINT)?;
         match normalize(&endpoint) {
-            Ok(url) => {
-                // Url normalizes :80/:443 away, but an explicitly entered port
-                // must still take precedence over our loopback suggestion.
-                let authority = endpoint
-                    .split_once("://")
-                    .unwrap()
-                    .1
-                    .split('/')
-                    .next()
-                    .unwrap();
-                let explicit_port = authority
-                    .rsplit_once(':')
-                    .and_then(|(_, port)| port.parse::<u16>().ok())
-                    .is_some();
-                break (url, explicit_port);
-            }
+            Ok(url) => return Ok(url.to_string()),
             Err(error) => writeln!(output, "{error}")?,
         }
-    };
-    let default_port = url.port().unwrap_or_else(|| {
-        if !explicit_port
-            && url.scheme() == "http"
-            && matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
-        {
-            8080
-        } else {
-            url.port_or_known_default().expect("validated HTTP(S) URL")
-        }
-    });
-    let port = loop {
-        let value = prompt(input, output, "Port", &default_port.to_string())?;
-        match value.parse::<u16>() {
-            Ok(port) if port > 0 => break port,
-            _ => writeln!(output, "Port must be a number from 1 to 65535.")?,
-        }
-    };
-    url.set_port(Some(port))
-        .map_err(|_| invalid("cannot set endpoint port"))?;
-    Ok(url.to_string())
+    }
 }
 
-fn normalize(value: &str) -> io::Result<Url> {
+pub fn normalize(value: &str) -> io::Result<Url> {
     if !value.contains("://") {
         return Err(invalid("Enter a valid HTTP(S) endpoint URL including ://."));
     }
@@ -152,48 +112,31 @@ mod tests {
     }
 
     #[test]
-    fn blank_answers_select_local_chat_endpoint_and_port_without_consuming_chat() {
-        let (result, output, consumed) = interact("\n\nhello\n");
+    fn one_url_prompt_leaves_chat_unconsumed() {
+        let (result, output, consumed) = interact("\nhello\n");
         assert_eq!(result.unwrap(), "http://127.0.0.1:8080/");
-        assert!(output.contains(DEFAULT_ENDPOINT));
-        assert!(output.contains("Port [8080]"));
-        assert_eq!(consumed, 2);
+        assert_eq!(output.matches("Model server URL").count(), 1);
+        assert_eq!(consumed, 1);
+        assert_eq!(
+            interact("https://example.com/v1\n").0.unwrap(),
+            "https://example.com/v1"
+        );
+        assert_eq!(
+            interact("http://localhost:9001/v1/chat/completions\n")
+                .0
+                .unwrap(),
+            "http://localhost:9001/"
+        );
     }
-
-    #[test]
-    fn endpoint_and_port_normalize_without_duplicating_chat_route() {
-        for (answers, expected) in [
-            (
-                "http://localhost/v1/chat/completions\n9000\n",
-                "http://localhost:9000/",
-            ),
-            ("http://localhost:9001/v1/\n\n", "http://localhost:9001/v1"),
-            ("http://localhost:80/v1\n\n", "http://localhost/v1"),
-            ("http://localhost:/v1\n\n", "http://localhost:8080/v1"),
-            ("http://[::1]:/v1\n\n", "http://[::1]:8080/v1"),
-            (
-                "https://example.com/api/v1/chat/completions/\n\n",
-                "https://example.com/api",
-            ),
-            ("http://[::1]/v1\n8081\n", "http://[::1]:8081/v1"),
-        ] {
-            assert_eq!(interact(answers).0.unwrap(), expected);
-        }
-    }
-
     #[test]
     fn invalid_answers_retry_and_eof_never_accepts_defaults() {
-        let (result, output, _) =
-            interact("bad-url\nhttp://localhost/v1/completions\n\n0\n65536\noops\n8082\n");
-        assert_eq!(result.unwrap(), "http://127.0.0.1:8082/");
+        let (result, output, _) = interact("bad-url\nhttp://localhost/v1/completions\n\n");
+        assert_eq!(result.unwrap(), "http://127.0.0.1:8080/");
         assert!(output.contains("not the text-only"));
-        assert_eq!(output.matches("Port must be").count(), 3);
-        for text in ["", "\n"] {
-            assert_eq!(
-                interact(text).0.unwrap_err().kind(),
-                io::ErrorKind::UnexpectedEof
-            );
-        }
+        assert_eq!(
+            interact("").0.unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
     }
 
     #[test]
@@ -282,7 +225,7 @@ mod tests {
             let server = tokio::spawn(async move {
                 axum::serve(listener, app).await.unwrap();
             });
-            let base = interact(&format!("\n{port}\n")).0.unwrap();
+            let base = interact(&format!("http://127.0.0.1:{port}\n")).0.unwrap();
             let mut config = LlamaCppConfig::new(base);
             config.maximum_retries = 0;
             config.timeout = std::time::Duration::from_secs(5);

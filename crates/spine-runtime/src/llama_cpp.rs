@@ -111,20 +111,22 @@ impl LlamaCppProvider {
         let health_ok = health
             .as_ref()
             .is_ok_and(|response| response.status().is_success());
-        if health_ok
-            && self.config.max_context_tokens.is_some()
-            && self
-                .config
-                .model
-                .as_ref()
-                .is_some_and(|model| !model.is_empty())
-        {
-            return Ok(());
-        }
         let (props_response, models_response) = tokio::join!(
             self.client.get(self.endpoint("/props")).send(),
             self.client.get(self.endpoint("/v1/models")).send(),
         );
+        // A public health endpoint does not establish API access. Do not accept
+        // rejected credentials just because the process itself is healthy.
+        if models_response.as_ref().is_ok_and(|response| {
+            matches!(
+                response.status(),
+                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+            )
+        }) {
+            return Err(RuntimeError::Provider(
+                "Model API rejected access; check the API key and permissions".into(),
+            ));
+        }
         let (props, props_error) = discovery_json(props_response).await;
         let (models, models_error) = discovery_json(models_response).await;
         let discovery_ok = props.is_some() || models.is_some();

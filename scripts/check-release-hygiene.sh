@@ -61,4 +61,6 @@ if (( failed != 0 )); then
   exit 1
 fi
 
+python3 scripts/check-vendored-candle.py
+
 echo "release hygiene checks passed"

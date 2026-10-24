@@ -7,78 +7,19 @@ Python, Node.js, npm, or separate web server to install.
 
 ## First-time setup
 
-Spine does not include a chat model. A working setup has three required pieces:
+Spine v0.3.0 includes automatic memory-model setup and remembers successful
+launch settings. Download the package for your platform, open Spine, connect your
+model service once, and choose a heart passphrase.
 
-| Piece | What it does |
-| --- | --- |
-| **Spine** | Runs the partner, tools, terminal interface, and browser interface. |
-| **MiniLM** | Finds relevant memories. It is small and is **not** the chat model. |
-| **Model server and chat model** | Generate replies through an OpenAI-compatible API. |
-
-An optional fourth model, **NLI**, checks how well answers are supported. Leave
-it off during the first setup with `--no-nli`; chat and memory still work.
-
-Follow these steps in order for a native installation. If you prefer a
-container, complete steps 2 and 3 first, then use the
-[Docker installation](#docker-installation).
+Spine connects to an existing OpenAI-compatible chat model service. It installs
+its small memory model, MiniLM, automatically when needed. MiniLM is not the chat
+model. The optional NLI answer checker can be configured later.
 
 ### 1. Install Spine
 
-#### Build from source
-
-This route works now and requires Git, Rust, and your platform's normal native
-build tools.
-
-1. Install [Git](https://git-scm.com/install/) and
-   [Rust with rustup](https://rust-lang.org/tools/install/).
-
-   On Linux, macOS, or WSL, the official rustup command is:
-
-   ```bash
-   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-   ```
-
-   On Windows, run the installer from the Rust page and accept the offered
-   [Visual Studio C++ prerequisites](https://rust-lang.github.io/rustup/installation/windows-msvc.html).
-   Debian/Ubuntu users can install the native compiler with
-   `sudo apt install build-essential`; macOS users can run
-   `xcode-select --install`.
-
-2. Open a new terminal and verify the tools are available:
-
-   ```bash
-   git --version
-   rustc --version
-   cargo --version
-   ```
-
-3. Download this repository and enter its directory:
-
-   ```bash
-   git clone https://github.com/Jaredcastorena/Rust-spine.git
-   cd Rust-spine
-   ```
-
-4. Build and install the `spine` executable, then verify it:
-
-   ```bash
-   cargo install --locked --path crates/spine-cli
-   spine --version
-   ```
-
-The repository pins Rust 1.98.0, and rustup selects or downloads that version
-automatically. Cargo normally installs executables in `~/.cargo/bin` on Linux
-and macOS or `%USERPROFILE%\.cargo\bin` on Windows. If `spine` is not found,
-open a new terminal and make sure that directory is on `PATH`.
-
-Rust is needed only when building from source.
-
-#### Prebuilt archive (when available)
-
-Tagged release archives and their checksum files will appear on the
+Download an archive and its checksum from the
 [GitHub Releases page](https://github.com/Jaredcastorena/Rust-spine/releases).
-If that page has no archive for your system, use the source-build or Docker
-route.
+No Rust, Git, Python, or Node.js is needed to run a prebuilt archive.
 
 | System | Archive name contains |
 | --- | --- |
@@ -137,52 +78,106 @@ The Linux archives target glibc-based distributions, not Alpine/musl.
 4. Run the executable from that directory or move it into a directory on
    `PATH`. The terminal and browser interfaces are both inside the same file.
 
-### 2. Download MiniLM
+### 2. Open Spine
 
-1. Outside the `Rust-spine` checkout, create a folder named
-   `all-MiniLM-L6-v2`. Keep model weights out of the repository.
-2. Download these three files into that folder without renaming them:
+From the directory you want Spine to work in, run:
 
-   - [`config.json`](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/1110a243fdf4706b3f48f1d95db1a4f5529b4d41/config.json?download=true)
-   - [`tokenizer.json`](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/1110a243fdf4706b3f48f1d95db1a4f5529b4d41/tokenizer.json?download=true)
-   - [`model.safetensors`](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/1110a243fdf4706b3f48f1d95db1a4f5529b4d41/model.safetensors?download=true)
-
-   These links pin one model revision so all three files stay consistent.
-
-3. Confirm the files are directly inside the folder:
-
-   ```text
-   all-MiniLM-L6-v2/
-   ├── config.json
-   ├── model.safetensors
-   └── tokenizer.json
-   ```
-
-4. Copy the folder's absolute path. You will use it as `--model-dir` in step 4.
-   Despite the option name, this is the MiniLM folder, not the chat-model path.
-
-If Hugging Face tooling already downloaded this model into its standard cache,
-Spine finds it automatically and you can omit `--model-dir`.
-
-### 3. Choose an OpenAI-compatible model endpoint
-
-Spine connects to an existing OpenAI-compatible service by default; it does not
-start llama.cpp. At interactive chat startup, enter the endpoint and then its port:
-
-```text
-OpenAI-compatible API endpoint [http://127.0.0.1/v1/chat/completions]:
-Port [8080]:
+```bash
+spine
 ```
 
-Press Enter twice to use `http://127.0.0.1:8080/v1/chat/completions`.
-You can enter a base URL ending in `/v1` or the full `/v1/chat/completions` URL.
-The older text-only `/v1/completions` route is not compatible with Spine's chat
-and tool messages. An explicit URL port is offered as the port default; remote
-HTTPS endpoints default to 443. No endpoint setting is saved automatically.
+For an extracted archive use `./spine` on Linux/macOS, or `.\spine.exe` in
+PowerShell. `spine chat` does the same thing. On the first launch there is one
+connection question:
 
-Set `--server-url` or `SPINE_LLM_URL` to skip both prompts. This is required when
-stdin is redirected, so setup cannot consume piped chat messages. Existing API-key
-and model-name options are unchanged. If you already have a service, go to step 4.
+```text
+Model server URL [http://127.0.0.1:8080]:
+```
+
+Press Enter for that address, or paste your server URL including its port.
+Spine checks the connection (with a 20-second deadline), discovers the model and
+context size when advertised, then downloads about **91 MB** of MiniLM assets
+from Hugging Face if they are not already available. Downloads use a pinned
+revision and SHA-256 checks, show progress, and reuse completed files on retry.
+No model download prompt or manual file placement is needed.
+
+Spine asks for a passphrase, creates an encrypted heart, shows a recovery phrase
+to save offline, and begins a short 5–10 question introduction. The answers are
+soft working preferences, not a hard-coded personality. Type `/skip` at any time
+to begin chatting normally.
+
+The heart and its large-blob sidecars are encrypted on your machine. Requests
+to the model server can include conversation text, selected memories, and tool
+results; use a local server if you want those requests to remain local. When
+Spine runs a shell command, the command and its captured output are written to
+a separate, unencrypted `*.action-audit.jsonl` file, so treat that file as
+sensitive.
+
+Model weights stay outside Spine. Historical size measurements are available below; they predate v0.3.0 and its
+updated dependencies. MiniLM is about 91 MB; your chat model is additional. See
+[Honest size numbers](#honest-size-numbers) for the full measurements.
+
+### Next launches and saved settings
+
+Run `spine` again. A successful normal chat startup remembers the connection,
+explicit provider model/context/reasoning overrides, heart and MiniLM locations,
+workspace, terminal/browser preference and browser port, NLI selection, and
+`--skip-onboarding`. Subsequent launches reuse these settings and prompt only
+for the heart passphrase. File and shell tools keep using the saved workspace,
+even if you open Spine from another directory; use `--workspace` to change it.
+
+Command-line options and their environment variables override saved settings.
+Changing the server URL clears inherited model/context/reasoning overrides so
+settings from one provider do not silently carry over to another. Model and
+context values discovered from the server are checked anew on each launch.
+Settings are written only after connection, model loading, heart unlock, and
+optional web startup succeed. A failed setup keeps the last working settings.
+
+Useful changes:
+
+```bash
+spine chat --setup                       # Ask for a different connection URL
+spine chat --web                         # Remember browser mode
+spine chat --terminal                    # Switch back to terminal mode
+spine chat --workspace "/path/to/project"
+spine chat --skip-onboarding             # Go straight to chat
+spine chat --no-download                 # Never download MiniLM
+spine chat --no-settings                 # Ignore saved settings and do not save
+```
+
+Settings are a private-permission JSON file at:
+
+| System | Default file |
+| --- | --- |
+| Linux | `$XDG_CONFIG_HOME/spine/settings.json`, or `~/.config/spine/settings.json` |
+| macOS | `~/Library/Application Support/Spine/settings.json` |
+| Windows | `%LOCALAPPDATA%\Spine\settings.json` |
+
+Use `--config PATH` or `SPINE_CONFIG` for a separate profile. The file contains
+nonsecret preferences only: API keys, passphrases, recovery phrases, remote web
+binding, and elevated tool permissions are never saved. For a service requiring
+credentials, supply `SPINE_LLM_API_KEY` through your normal secret manager or
+environment on each launch. Incognito, managed llama.cpp, and `--no-settings`
+runs neither read nor write this file. Other chat tuning flags remain per-run.
+
+MiniLM is stored under the platform's Spine app-data directory in
+`models/all-MiniLM-L6-v2/<revision>/`, separate from the executable and heart.
+Explicit `--model-dir`/`SPINE_MINILM_DIR` and existing Hugging Face cache snapshots
+are reused. An invalid explicit path produces an error instead of silently
+replacing your model. Missing or damaged files in Spine's managed model directory
+are downloaded again unless `--no-download` is set. For an offline machine,
+copy the model files in advance using the instructions below.
+
+### Connect a model server
+
+The chat model service must already be running. Spine does not install or start
+one unless you explicitly select the managed llama.cpp mode. A base URL ending
+in `/v1` or a full `/v1/chat/completions` URL is accepted. Setup checks service
+readiness and rejects authentication failures from `/v1/models`; it does not
+send a billable test conversation or guarantee every provider's tool support.
+
+For unattended use, supply `--server-url`/`SPINE_LLM_URL` or an already validated
+settings file. Setup never consumes redirected chat messages as answers.
 
 For an optional local setup, Spine works with
 [`llama-server`](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)
@@ -219,49 +214,39 @@ Spine asks the server which model and context size it is actually running, so
 most people do not need to enter either value by hand. For another address, see
 [Use a model server at another address](#use-a-model-server-at-another-address).
 
-### 4. Start Spine
+### Offline or custom MiniLM installation
 
-Launch Spine from the directory you want its relative file and shell tools to
-use as their workspace. Replace the example MiniLM path with the absolute path
-from step 2:
+1. Outside the `Rust-spine` checkout, create a folder named
+   `all-MiniLM-L6-v2`. Keep model weights out of the repository.
+2. Download these three files into that folder without renaming them:
 
-```bash
-spine chat --no-nli --model-dir "/absolute/path/to/all-MiniLM-L6-v2"
-```
+   - [`config.json`](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/1110a243fdf4706b3f48f1d95db1a4f5529b4d41/config.json?download=true)
+   - [`tokenizer.json`](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/1110a243fdf4706b3f48f1d95db1a4f5529b4d41/tokenizer.json?download=true)
+   - [`model.safetensors`](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/1110a243fdf4706b3f48f1d95db1a4f5529b4d41/model.safetensors?download=true)
 
-These examples assume `spine` is on `PATH`. For an extracted prebuilt archive,
-use `./spine` on Linux or macOS, or the path to `spine.exe` on Windows.
-Windows paths such as `C:\Models\all-MiniLM-L6-v2` work when placed in quotes.
+   These links pin one model revision so all three files stay consistent.
 
-If Spine found MiniLM in the Hugging Face cache, the shorter command is enough:
+3. Confirm the files are directly inside the folder:
 
-```bash
-spine chat --no-nli
-```
+   ```text
+   all-MiniLM-L6-v2/
+   ├── config.json
+   ├── model.safetensors
+   └── tokenizer.json
+   ```
 
-Spine asks for a passphrase, creates an encrypted heart, shows a recovery phrase
-to save offline, and begins a short 5–10 question introduction. The answers are
-soft working preferences, not a hard-coded personality. Type `/skip` at any time
-to begin chatting normally.
+4. Supply the folder's absolute path with `--model-dir` when starting chat.
+   Despite the option name, this is the MiniLM folder, not the chat-model path.
 
-The heart and its large-blob sidecars are encrypted on your machine. Requests
-to the model server can include conversation text, selected memories, and tool
-results; use a local server if you want those requests to remain local. When
-Spine runs a shell command, the command and its captured output are written to
-a separate, unencrypted `*.action-audit.jsonl` file, so treat that file as
-sensitive.
-
-Model weights stay outside Spine. The verified Linux amd64 executable is
-**13.3 MB**. A minimal container setup is about **113.7 MB** for Spine plus
-MiniLM; your chat model is additional. See
-[Honest size numbers](#honest-size-numbers) for the full measurements.
+If Hugging Face tooling already downloaded this model into its standard cache,
+Spine finds it automatically and you can omit `--model-dir`.
 
 ## Docker installation
 
 This route requires [Docker](https://docs.docker.com/get-started/get-docker/)
 and, if you are cloning the repository, [Git](https://git-scm.com/install/).
-It does not require Rust on the host. It still needs the MiniLM folder from step
-2 and a reachable model server from step 3. Model weights and credentials stay
+It does not require Rust on the host. Use a MiniLM folder from [offline installation](#offline-or-custom-minilm-installation)
+and a reachable [model server](#connect-a-model-server). Model weights and credentials stay
 outside the image so they are not silently copied into an image layer.
 
 The multiline commands below use Bash. In PowerShell, enter each command on one
@@ -282,7 +267,7 @@ line or replace each trailing `\` with PowerShell's backtick continuation.
 
 3. Run the command for your platform. Replace the MiniLM source path with the
    absolute path to the folder that directly contains the three files from
-   step 2.
+   [offline installation](#offline-or-custom-minilm-installation).
 
    The container runs as UID and GID `10001`. On Linux, that user must be able
    to traverse the mounted folder and read all three model files. If the folder
@@ -294,7 +279,7 @@ line or replace each trailing `\` with PowerShell's backtick continuation.
    chmod a+r "/absolute/path/to/all-MiniLM-L6-v2"/{config.json,tokenizer.json,model.safetensors}
    ```
 
-   Linux, with the model server from step 3 on the same machine:
+   Linux, with the model server described above on the same machine:
 
    ```bash
    docker run --rm -it --name spine \
@@ -344,7 +329,7 @@ bind-mount one explicitly selected directory at `/workspace` and ensure UID
 
 The Docker Desktop example uses its built-in `host.docker.internal` name to
 reach port 8080 on the host. The Linux example uses host networking so the
-loopback-only server from step 3 remains reachable without exposing it to the
+loopback-only server described above remains reachable without exposing it to the
 LAN. Host networking also lets the container reach other host-loopback
 services, so use it only on a trusted machine. Override `SPINE_LLM_URL` (and
 pass `SPINE_LLM_API_KEY` with `-e` when needed) for another endpoint.
@@ -388,7 +373,8 @@ correct, so do not add `--allow-remote-web`.
 
 ## Honest size numbers
 
-These measurements came from the verified Linux amd64 reference build on
+These historical measurements predate v0.3.0. They came from the verified Linux
+amd64 reference build on
 2026-08-29. Docker reports decimal units here (1 MB = 1,000,000 bytes).
 
 | Item | Measured size | Where it lives |
@@ -422,26 +408,15 @@ image or user data and can be managed with Docker's normal cache controls.
 
 ### Start or reopen your heart
 
-If MiniLM is in the Hugging Face cache or `SPINE_MINILM_DIR` is set, run:
-
 ```bash
-spine chat --no-nli
+spine
 ```
 
-Otherwise, repeat its directory explicitly:
-
-```bash
-spine chat --no-nli --model-dir "/absolute/path/to/all-MiniLM-L6-v2"
-```
-
-Spine prompts for the heart passphrase without echoing it. On a new heart it
-asks you to confirm the passphrase and prints a recovery phrase; save that
-phrase offline. Later launches reopen the same heart. A wrong passphrase stops
-with an error and never overwrites the existing heart.
-
-Unless you choose another location, the heart lives in the normal app-data
-folder for your operating system. MiniLM and NLI are found automatically when
-they are already in the Hugging Face cache.
+Spine reuses your successful setup and prompts for the passphrase without echoing
+it. A wrong passphrase never overwrites the existing heart or saved preferences.
+Use `spine chat --setup` to enter a new connection, or `--workspace PATH` to
+change the directory used by tools. The heart lives in the normal app-data
+folder unless you selected another location.
 
 ### The first conversation
 
@@ -497,11 +472,11 @@ the missing canonical suffix before accepting a turn.
 Add `--web` to the normal chat command:
 
 ```bash
-spine chat --no-nli --web --model-dir "/absolute/path/to/all-MiniLM-L6-v2"
+spine chat --web
 ```
 
-As with terminal chat, omit `--model-dir` when Spine can find MiniLM
-automatically.
+Spine reuses the saved connection and memory model. Browser mode is remembered;
+use `spine chat --terminal` to switch back.
 
 Spine prints the complete private URL to open. The interface listens only on
 `127.0.0.1:8088` by default and uses a new browser token for every process. The
@@ -523,8 +498,9 @@ spine chat --incognito-mode --no-nli
 
 No heart path or passphrase is needed. Spine makes a temporary, randomly keyed
 heart and deletes it, its encrypted blobs, and its action audit after a normal
-exit. `--test-mode` is an alias for the same behavior. MiniLM is still required;
-add `--model-dir` when it is not in the Hugging Face cache.
+exit. `--test-mode` is an alias for the same behavior. MiniLM is still required and is automatically downloaded if needed. Incognito
+mode can reuse/install model files but does not read or change saved launch settings.
+Supply `--server-url` for a non-default service.
 
 ## Settings and optional features
 
@@ -533,6 +509,7 @@ command-line names for each setting.
 
 | Environment variable | Command-line form | What it changes |
 | --- | --- | --- |
+| `SPINE_CONFIG` | `--config` | Separate launch-settings profile. |
 | `SPINE_HEART_PATH` | positional `HEART` argument | Location of the encrypted heart. |
 | `SPINE_HEART_PASSPHRASE` | `--passphrase` | Heart passphrase. Let Spine prompt when practical. |
 | `SPINE_MINILM_DIR` | `--model-dir` | Location of the required MiniLM snapshot. |
@@ -572,7 +549,7 @@ $env:SPINE_LLM_API_KEY = $env:PROVIDER_API_KEY
 spine chat --no-nli
 ```
 
-Omit `SPINE_MINILM_DIR` when MiniLM is already in the Hugging Face cache.
+Omit `SPINE_MINILM_DIR` to reuse saved/cached MiniLM or install it automatically.
 
 At startup Spine checks `/props` and `/v1/models`. When the server advertises
 its active model ID and runtime context size, Spine adopts both automatically.
@@ -643,6 +620,56 @@ raw-affect and count/empty-evidence contributions remain in separate compatibili
 segments, while the new oracle coordinates start with zero weights. Unknown or
 inconsistent layouts are rejected without resetting learned state.
 
+## Build from source
+
+This route works now and requires Git, Rust, and your platform's normal native
+build tools.
+
+1. Install [Git](https://git-scm.com/install/) and
+   [Rust with rustup](https://rust-lang.org/tools/install/).
+
+   On Linux, macOS, or WSL, the official rustup command is:
+
+   ```bash
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+   ```
+
+   On Windows, run the installer from the Rust page and accept the offered
+   [Visual Studio C++ prerequisites](https://rust-lang.github.io/rustup/installation/windows-msvc.html).
+   Debian/Ubuntu users can install the native compiler with
+   `sudo apt install build-essential`; macOS users can run
+   `xcode-select --install`.
+
+2. Open a new terminal and verify the tools are available:
+
+   ```bash
+   git --version
+   rustc --version
+   cargo --version
+   ```
+
+3. Download this repository and enter its directory:
+
+   ```bash
+   git clone https://github.com/Jaredcastorena/Rust-spine.git
+   cd Rust-spine
+   ```
+
+4. Build and install the `spine` executable, then verify it:
+
+   ```bash
+   cargo install --locked --path crates/spine-cli
+   spine --version
+   ```
+
+The repository pins Rust 1.99.1, and rustup selects or downloads that version
+automatically. Cargo normally installs executables in `~/.cargo/bin` on Linux
+and macOS or `%USERPROFILE%\.cargo\bin` on Windows. If `spine` is not found,
+open a new terminal and make sure that directory is on `PATH`.
+
+Rust is needed only when building from source.
+
+
 ## Developer reference
 
 ### What is in this repository
@@ -679,14 +706,14 @@ Support location, and Windows uses Local AppData. Model discovery honors
 
 ### Build and test
 
-Rust 1.98.0 is needed only for source builds. The pinned toolchain includes
+Rust 1.99.1 is needed only for source builds. The pinned toolchain includes
 `rustfmt` and `clippy` through rustup.
 
 ```bash
 cargo build --release --locked
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo fmt --all -- --check
+cargo fmt -p spine-cli -p spine-heart -p spine-models -p spine-runtime -- --check
 ```
 
 The resulting executable is `target/release/spine`.
@@ -695,6 +722,13 @@ The harness accepts native OpenAI tool calls and the reference text forms used
 by existing Spine integrations: canonical, legacy, unfenced, truncated,
 bare-JSON, and Laguna calls. Multi-step plans advance only after tool evidence;
 a response that merely promises more work is not treated as complete.
+
+The file reader returns bounded pages with Unicode character offsets and a
+`next_offset` cursor, so the harness can continue reading large files without
+losing text at its output limit.
+
+The Candle ZIP 9 compatibility backport and its source-verification procedure
+are documented in [vendor/README.md](vendor/README.md).
 
 The single-binary browser approach and visual direction are inspired by
 llama.cpp's MIT-licensed `llama-ui`. Spine's HTML, CSS, JavaScript, and host API

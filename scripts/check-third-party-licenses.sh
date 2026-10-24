@@ -12,10 +12,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cargo about generate about.hbs > "$generated"
+cargo about generate about.hbs | sed -E 's/[[:space:]]+$//' > "$generated"
 if ! cmp -s THIRD_PARTY_LICENSES.html "$generated"; then
   echo "THIRD_PARTY_LICENSES.html is stale; regenerate it with:" >&2
-  echo "  cargo about generate about.hbs > THIRD_PARTY_LICENSES.html" >&2
+  echo "  cargo about generate about.hbs | sed -E 's/[[:space:]]+$//' > THIRD_PARTY_LICENSES.html" >&2
   exit 1
 fi
 
