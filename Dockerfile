@@ -11,7 +11,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 
 FROM alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a AS runtime
 
-ARG APP_VERSION=0.3.0
+ARG APP_VERSION=0.3.1
 LABEL org.opencontainers.image.title="Spine" \
       org.opencontainers.image.description="Standalone native Spine harness" \
       org.opencontainers.image.version="${APP_VERSION}" \

@@ -1,6 +1,13 @@
 # Changelog
 
-## 0.3.0 — 2026-10-24
+## 0.3.1 — 2026-10-24
+
+- Includes the automatic setup and maintenance changes below.
+- Windows release binaries statically link the C runtime, removing the separate
+  Visual C++ Redistributable installation step. Release checks reject external
+  Visual C++ runtime DLL dependencies.
+
+## 0.3.0 — 2026-10-24 (validation tag; downloads not published)
 
 - Run `spine` to start chat. First-run setup asks for one model server URL,
   checks readiness and API access, downloads verified MiniLM assets when needed,
