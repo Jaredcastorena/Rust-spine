@@ -7,7 +7,7 @@ Python, Node.js, npm, or separate web server to install.
 
 ## First-time setup
 
-Spine v0.3.0 includes automatic memory-model setup and remembers successful
+Spine v0.3.1 includes automatic memory-model setup and remembers successful
 launch settings. Download the package for your platform, open Spine, connect your
 model service once, and choose a heart passphrase.
 
@@ -20,6 +20,8 @@ model. The optional NLI answer checker can be configured later.
 Download an archive and its checksum from the
 [GitHub Releases page](https://github.com/Jaredcastorena/Rust-spine/releases).
 No Rust, Git, Python, or Node.js is needed to run a prebuilt archive.
+The Windows executable includes its C runtime, so no separate Visual C++
+Redistributable installer is needed.
 
 | System | Archive name contains |
 | --- | --- |

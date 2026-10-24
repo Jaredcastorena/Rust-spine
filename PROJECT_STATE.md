@@ -2,9 +2,11 @@
 
 ## Baseline
 
-- v0.3.0 includes first-run setup, the outstanding budget-aware file-pagination
+- v0.3.1 includes first-run setup, the outstanding budget-aware file-pagination
   fix, stable dependency updates, Rust 1.99.1, and refreshed pinned CI/container images.
 
+- Windows release builds statically include the C runtime and verify that no
+  separate Visual C++ runtime installer is required.
 - Standalone Rust workspace with no Python runtime imports.
 - One encrypted heart contains the signed canonical event log and its versioned cognitive projection.
 - The projection unifies DCMDb, per-agent Thymos, typed facts, learned risk, and context triangles.
