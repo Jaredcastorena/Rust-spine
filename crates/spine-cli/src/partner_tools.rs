@@ -1783,7 +1783,11 @@ mod tests {
             .await
             .expect_err("outer shell call was not interrupted");
         assert!(outer_error.is_cancelled(), "{outer_error}");
-        let status = tokio::time::timeout(Duration::from_secs(10), async {
+        // The detached command includes cold PowerShell startup on Windows.
+        // Verify completion and output without treating runner load as failure.
+        let completion_timeout =
+            Duration::from_secs(if cfg!(target_os = "windows") { 30 } else { 10 });
+        let status = tokio::time::timeout(completion_timeout, async {
             loop {
                 let status = manager.format();
                 if status.contains("status=completed") && status.contains("survived") {
