@@ -512,10 +512,13 @@ async fn filesystem_shell_browser_and_task_controls_work_together() {
     let command = "printf shell-ok";
     #[cfg(target_os = "windows")]
     let command = "Write-Output shell-ok";
+    // A cold PowerShell startup can exceed five seconds on a busy Windows
+    // runner. This checks tool integration, not shell startup performance.
+    let shell_timeout = if cfg!(target_os = "windows") { 30 } else { 5 };
     let shell = execute(
         &fixture.registry,
         "shell",
-        json!({"command":command,"timeout_s":5}),
+        json!({"command":command,"timeout_s":shell_timeout}),
     )
     .await;
     assert!(shell.success, "{:?}", shell.error);
