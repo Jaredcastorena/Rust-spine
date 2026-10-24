@@ -7,10 +7,9 @@ Python, Node.js, npm, or separate web server to install.
 
 ## First-time setup
 
-The automatic setup described here is new in the source on this branch. Published
-**v0.2.0 archives still use [the v0.2.0 manual setup](https://github.com/Jaredcastorena/Rust-spine/blob/v0.2.0/README.md)**
-until a release containing this change is published. To try it now, use
-[Build from source](#build-from-source).
+Spine v0.3.0 includes automatic memory-model setup and remembers successful
+launch settings. Download the package for your platform, open Spine, connect your
+model service once, and choose a heart passphrase.
 
 Spine connects to an existing OpenAI-compatible chat model service. It installs
 its small memory model, MiniLM, automatically when needed. MiniLM is not the chat
@@ -114,9 +113,8 @@ Spine runs a shell command, the command and its captured output are written to
 a separate, unencrypted `*.action-audit.jsonl` file, so treat that file as
 sensitive.
 
-Model weights stay outside Spine. The verified Linux amd64 executable is
-**13.3 MB**. A minimal container setup is about **113.7 MB** for Spine plus
-MiniLM; your chat model is additional. See
+Model weights stay outside Spine. Historical size measurements are available below; they predate v0.3.0 and its
+updated dependencies. MiniLM is about 91 MB; your chat model is additional. See
 [Honest size numbers](#honest-size-numbers) for the full measurements.
 
 ### Next launches and saved settings
@@ -375,7 +373,8 @@ correct, so do not add `--allow-remote-web`.
 
 ## Honest size numbers
 
-These measurements came from the verified Linux amd64 reference build on
+These historical measurements predate v0.3.0. They came from the verified Linux
+amd64 reference build on
 2026-08-29. Docker reports decimal units here (1 MB = 1,000,000 bytes).
 
 | Item | Measured size | Where it lives |
@@ -663,7 +662,7 @@ build tools.
    spine --version
    ```
 
-The repository pins Rust 1.98.0, and rustup selects or downloads that version
+The repository pins Rust 1.99.1, and rustup selects or downloads that version
 automatically. Cargo normally installs executables in `~/.cargo/bin` on Linux
 and macOS or `%USERPROFILE%\.cargo\bin` on Windows. If `spine` is not found,
 open a new terminal and make sure that directory is on `PATH`.
@@ -707,14 +706,14 @@ Support location, and Windows uses Local AppData. Model discovery honors
 
 ### Build and test
 
-Rust 1.98.0 is needed only for source builds. The pinned toolchain includes
+Rust 1.99.1 is needed only for source builds. The pinned toolchain includes
 `rustfmt` and `clippy` through rustup.
 
 ```bash
 cargo build --release --locked
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo fmt --all -- --check
+cargo fmt -p spine-cli -p spine-heart -p spine-models -p spine-runtime -- --check
 ```
 
 The resulting executable is `target/release/spine`.
@@ -723,6 +722,13 @@ The harness accepts native OpenAI tool calls and the reference text forms used
 by existing Spine integrations: canonical, legacy, unfenced, truncated,
 bare-JSON, and Laguna calls. Multi-step plans advance only after tool evidence;
 a response that merely promises more work is not treated as complete.
+
+The file reader returns bounded pages with Unicode character offsets and a
+`next_offset` cursor, so the harness can continue reading large files without
+losing text at its output limit.
+
+The Candle ZIP 9 compatibility backport and its source-verification procedure
+are documented in [vendor/README.md](vendor/README.md).
 
 The single-binary browser approach and visual direction are inspired by
 llama.cpp's MIT-licensed `llama-ui`. Spine's HTML, CSS, JavaScript, and host API

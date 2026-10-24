@@ -30,3 +30,8 @@ about.toml
 *~
 .DS_Store
 Thumbs.db
+
+# Private agent continuity is never part of an image context.
+stigmergicmemory.md
+docs/handoffs
+.stigmergicmemory.lock

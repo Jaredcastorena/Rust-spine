@@ -2,6 +2,9 @@
 
 ## Baseline
 
+- v0.3.0 includes first-run setup, the outstanding budget-aware file-pagination
+  fix, stable dependency updates, Rust 1.99.1, and refreshed pinned CI/container images.
+
 - Standalone Rust workspace with no Python runtime imports.
 - One encrypted heart contains the signed canonical event log and its versioned cognitive projection.
 - The projection unifies DCMDb, per-agent Thymos, typed facts, learned risk, and context triangles.
@@ -51,10 +54,13 @@ Legacy Python DCMDb/Thymos state is not queried by the native runtime. Running t
 
 ## Accepted verification
 
-- First-run setup: 226 locked Rust workspace tests passed; a clean interactive
+- v0.3.0: all 231 locked Rust workspace tests pass. A clean interactive release
   launch downloaded and verified real MiniLM assets, created a heart and completed
   a chat turn. Reopening reused settings/models; explicit overrides worked; failed
   unlocks and connections preserved the last working profile.
+- Genuine MiniLM and NLI model inference tests pass. A heart created and
+  snapshotted by v0.2.0 was read and extended by v0.3.0, then successfully
+  reopened by v0.2.0 with both memories and its snapshot intact.
 
 - The reviewed parity corrections pass 206 locked Rust workspace tests and
   all 149 Python oracle tests from an isolated source-only copy. `PARITY.md`
@@ -62,14 +68,10 @@ Legacy Python DCMDb/Thymos state is not queried by the native runtime. Running t
 - Strict workspace Clippy with all targets and features.
 - Formatting checks across the workspace and standalone fuzz package.
 - Locked fuzz-target compilation.
-- The 2026-10-24 audit required patch updates to ctutils, rustls-webpki,
-  webpki-roots and Tokio. The fuzz graph is clean. The main graph remains blocked
-  by RUSTSEC-2026-0367/0368/0369 in zip 8.6.0, required by the latest published
-  Candle 0.11.0 (upstream main also still requires zip 8.6.0). No advisories are
-  suppressed. These concern ZIP extraction; the new downloader uses verified raw
-  safetensors/JSON files and does not extract archives. The existing unmaintained
-  warning for paste also remains. This branch is not release-ready until the
-  dependency audit passes.
+- v0.3.0 updates stable dependencies and uses a provenance-checked Candle 0.11.0
+  backport with ZIP 9.1.0. Both dependency audits pass with no known vulnerabilities;
+  the upstream unmaintained `paste` warning remains informational. No advisories
+  are suppressed. See `vendor/README.md` for the minimal compatibility patch.
 - Optimized release build, executable privacy scan, encrypted-heart lifecycle
   smoke test, and checksum/unpack/version smoke test of the Linux release archive.
 - The release executable completed both terminal and authenticated browser chat

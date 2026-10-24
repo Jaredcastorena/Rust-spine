@@ -1,23 +1,24 @@
-FROM rust:1.98.0-alpine3.22@sha256:2e452153b2dc6bed8ef123c4801cfd3f637e7c092846f974ecdce5e64af3120c AS builder
+FROM rust:1.99.1-alpine3.24@sha256:b1d5dd5a22a09404d3e798c0cf051b689077360374eb505fa5bb93c479693d87 AS builder
 
-ENV RUSTUP_TOOLCHAIN=1.98.0
+ENV RUSTUP_TOOLCHAIN=1.99.1
 WORKDIR /build
-RUN apk add --no-cache g++
+RUN apk add --no-cache g++ cmake perl
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/build/target,sharing=locked \
     cargo build --locked --release --package spine-cli \
     && install -D -m 0755 target/release/spine /out/spine
 
-FROM alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce AS runtime
+FROM alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a AS runtime
 
-ARG APP_VERSION=0.2.0
+ARG APP_VERSION=0.3.0
 LABEL org.opencontainers.image.title="Spine" \
       org.opencontainers.image.description="Standalone native Spine harness" \
       org.opencontainers.image.version="${APP_VERSION}" \
       org.opencontainers.image.licenses="MIT OR Apache-2.0"
 
-RUN install -d -o 10001 -g 10001 /data /workspace \
+RUN apk add --no-cache ca-certificates \
+    && install -d -o 10001 -g 10001 /data /workspace \
     && install -d /usr/share/doc/spine
 
 COPY --from=builder /out/spine /usr/local/bin/spine
