@@ -21,9 +21,10 @@
   profile supplies revisable behavioral defaults on later runs.
 - `--incognito-mode` (alias `--test-mode`) runs against a randomly keyed heart in a private temporary directory and does not require or modify a persistent heart.
 - `--web` serves an embedded single-binary UI on `127.0.0.1:8088` by default. Browser messages and controls enter the same harness loop as the terminal; no parallel agent session is created.
-- Chat prompts for an OpenAI-compatible endpoint and port by default; explicit `--server-url`/`SPINE_LLM_URL` bypasses setup and is required with redirected stdin.
+- Bare `spine` starts chat. First-run chat asks for one model server URL, validates readiness before creating a heart, and saves successful nonsecret launch settings. Explicit CLI/environment options override saved preferences; redirected input requires an explicit or saved URL.
 - Only `--llamacpp` together with `--llama-server-bin` and `--llama-model` manages a local llama.cpp server. Normal chat connects to the chosen existing service.
-- Persistent chat has a platform-style default heart path, and MiniLM assets resolve from `SPINE_MINILM_DIR` or the local Hugging Face cache; explicit paths still override both.
+- Persistent chat has a platform-style default heart path. MiniLM resolves from explicit/saved paths or the local Hugging Face cache, then automatically downloads a pinned, size- and SHA-256-verified snapshot into app data. Interrupted downloads do not publish partial files; `--no-download` supports offline use.
+- Settings retain connection, paths/workspace, interface and NLI/onboarding choices after successful startup. Secrets, remote bind consent and elevated permissions are not saved. Incognito, managed llama.cpp and `--no-settings` runs bypass saved settings.
 - Web APIs require a random per-process fragment token. Non-loopback binding is rejected unless the operator explicitly supplies `--allow-remote-web`.
 - Version tags build checksum-paired Linux, macOS, and Windows release archives; each archive contains one executable plus licenses and attribution.
 - A two-stage OCI build runs the single binary as an unprivileged user, keeps
@@ -50,15 +51,25 @@ Legacy Python DCMDb/Thymos state is not queried by the native runtime. Running t
 
 ## Accepted verification
 
+- First-run setup: 226 locked Rust workspace tests passed; a clean interactive
+  launch downloaded and verified real MiniLM assets, created a heart and completed
+  a chat turn. Reopening reused settings/models; explicit overrides worked; failed
+  unlocks and connections preserved the last working profile.
+
 - The reviewed parity corrections pass 206 locked Rust workspace tests and
   all 149 Python oracle tests from an isolated source-only copy. `PARITY.md`
   records the behavior map, independent review and migration boundaries.
 - Strict workspace Clippy with all targets and features.
 - Formatting checks across the workspace and standalone fuzz package.
 - Locked fuzz-target compilation.
-- Locked dependency audit with no known vulnerabilities. The main graph retains
-  one allowed unmaintained warning for `paste`, inherited through the current
-  Candle/tokenizers stack; the fuzz graph is clean.
+- The 2026-10-24 audit required patch updates to ctutils, rustls-webpki,
+  webpki-roots and Tokio. The fuzz graph is clean. The main graph remains blocked
+  by RUSTSEC-2026-0367/0368/0369 in zip 8.6.0, required by the latest published
+  Candle 0.11.0 (upstream main also still requires zip 8.6.0). No advisories are
+  suppressed. These concern ZIP extraction; the new downloader uses verified raw
+  safetensors/JSON files and does not extract archives. The existing unmaintained
+  warning for paste also remains. This branch is not release-ready until the
+  dependency audit passes.
 - Optimized release build, executable privacy scan, encrypted-heart lifecycle
   smoke test, and checksum/unpack/version smoke test of the Linux release archive.
 - The release executable completed both terminal and authenticated browser chat
