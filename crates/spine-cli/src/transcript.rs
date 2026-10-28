@@ -22,6 +22,19 @@ struct Envelope {
     progress: HarnessProgress,
 }
 
+fn decode(bytes: &[u8]) -> Result<Envelope> {
+    let saved: Envelope = serde_json::from_slice(bytes)?;
+    if saved.schema != 1
+        || saved.progress.run_id.is_empty()
+        || saved.progress.start_offset > saved.progress.messages.len()
+    {
+        return Err(spine_runtime::RuntimeError::InvalidConfig(
+            "Invalid saved tool journal; retained for inspection".into(),
+        ));
+    }
+    Ok(saved)
+}
+
 pub struct HeartJournal {
     heart: Arc<SpineHeart>,
     agent: AgentId,
@@ -67,14 +80,9 @@ pub fn recover_thread(
     let records = heart.local_states("harness/")?;
     let mut recovered = 0;
     for (key, bytes) in records {
-        let mut saved: Envelope = serde_json::from_slice(&bytes)?;
+        let mut saved: Envelope = decode(&bytes)?;
         if thread.is_some_and(|thread| thread != &saved.thread) {
             continue;
-        }
-        if saved.schema != 1 || saved.progress.start_offset > saved.progress.messages.len() {
-            return Err(spine_runtime::RuntimeError::InvalidConfig(
-                "Invalid saved tool journal; retained for inspection".into(),
-            ));
         }
         let p = &mut saved.progress;
         if !p.finished {
@@ -152,7 +160,7 @@ pub fn recover_thread(
 /// A child explicitly reported final; its safe-boundary stop is successful completion.
 pub fn finish_child_checkin(heart: &SpineHeart, thread: &ThreadId) -> Result<()> {
     for (key, bytes) in heart.local_states("harness/")? {
-        let mut saved: Envelope = serde_json::from_slice(&bytes)?;
+        let mut saved: Envelope = decode(&bytes)?;
         if &saved.thread == thread && saved.progress.finished {
             saved.progress.stopped = false;
             heart.set_local_state(&key, Some(&serde_json::to_vec(&saved)?))?;
@@ -298,7 +306,7 @@ pub fn persist(
     }
     // Completed ordinary runs can be dropped only after every display/result record is durable.
     for (key, bytes) in heart.local_states("harness/")? {
-        let saved: Envelope = serde_json::from_slice(&bytes)?;
+        let saved: Envelope = decode(&bytes)?;
         if !saved.progress.finished || saved.progress.stopped {
             continue;
         }

@@ -755,7 +755,9 @@ impl Harness {
                 false,
                 false,
             )?;
-            let (updates, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+            let (updates, mut receiver) =
+                tokio::sync::watch::channel(crate::ModelProgress::default());
+            let mut progress_open = true;
             let _ = self
                 .events
                 .send(HarnessEvent::ModelProgress(crate::ModelProgress::default()));
@@ -771,13 +773,20 @@ impl Harness {
                 temperature: policy.temperature,
             });
             tokio::pin!(completion);
+            let stop_deadline = tokio::time::sleep(std::time::Duration::from_secs(5));
+            tokio::pin!(stop_deadline);
             let turn = loop {
                 tokio::select! {
                     result = &mut completion => break result,
-                    Some(update) = receiver.recv() => {
-                        partial = update.clone();
-                        partial_dirty = true;
-                        let _ = self.events.send(HarnessEvent::ModelProgress(update));
+                    changed = receiver.changed(), if progress_open => {
+                        if changed.is_ok() {
+                            let update = receiver.borrow_and_update().clone();
+                            partial = update.clone();
+                            partial_dirty = true;
+                            let _ = self.events.send(HarnessEvent::ModelProgress(update));
+                        } else {
+                            progress_open = false;
+                        }
                     }
                     _ = journal_tick.tick(), if self.journal.is_some() => {
                         if partial_dirty {
@@ -790,14 +799,15 @@ impl Harness {
                     () = self.controls.stopped(), if !initially_stopping => {
                         break Err(RuntimeError::Provider("stopped by operator".into()));
                     }
+                    () = &mut stop_deadline, if initially_stopping => {
+                        break Err(RuntimeError::Provider("stop deadline reached".into()));
+                    }
                 }
             };
             let turn = match turn {
                 Ok(turn) => turn,
                 Err(error) => {
-                    while let Ok(update) = receiver.try_recv() {
-                        partial = update;
-                    }
+                    partial = receiver.borrow().clone();
                     if !partial.content.is_empty() || partial.reasoning.is_some() {
                         messages.push(Message::assistant(
                             partial.content,
@@ -1191,19 +1201,26 @@ impl Harness {
         host_plan: Option<HostPlan>,
         policy: HarnessPolicy,
     ) -> Result<RunOutcome> {
-        let turn = self
-            .provider
-            .complete(CompletionRequest {
-                    progress: None,
-                messages: messages.clone(),
-                tools: Vec::new(),
-                allow_tool_calls: false,
-                temperature: policy.temperature,
-            })
-            .await.unwrap_or_else(|error| crate::ModelTurn {
-                content: format!("Stopped at a safe boundary. Completed tool results are retained; model summary unavailable: {error}"),
-                ..crate::ModelTurn::default()
-            });
+        let completion = self.provider.complete(CompletionRequest {
+            progress: None,
+            messages: messages.clone(),
+            tools: Vec::new(),
+            allow_tool_calls: false,
+            temperature: policy.temperature,
+        });
+        // A final summary must never hold a safe stop hostage to the provider timeout.
+        let deadline = std::time::Duration::from_secs(if stopped_gracefully { 5 } else { 60 });
+        let turn = tokio::select! {
+            result = tokio::time::timeout(deadline, completion) => match result {
+                Ok(result) => result,
+                Err(_) => Err(RuntimeError::Provider("summary deadline reached".into())),
+            },
+            () = self.controls.stopped() => Err(RuntimeError::Provider("summary stopped by operator".into())),
+        }.unwrap_or_else(|error| crate::ModelTurn {
+            content: format!("Stopped at a safe boundary. Completed tool results are retained; model summary unavailable: {error}"),
+            ..crate::ModelTurn::default()
+        });
+        let stopped_gracefully = self.controls.drain().stop || stopped_gracefully;
         usage.add(turn.usage);
         let response = if turn.content.trim().is_empty() {
             "Stopped at a safe tool boundary; completed results are retained in the checkpoint."

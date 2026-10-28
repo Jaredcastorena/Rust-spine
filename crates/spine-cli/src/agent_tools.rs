@@ -220,7 +220,22 @@ impl SubagentManager {
                     )
                 }
                 Ok(outcome) => format!("[{final_id} | FINAL]\n{}", outcome.response),
-                Err(error) => format!("[{final_id} | FINAL ERROR] {error}"),
+                Err(error) => {
+                    let recovery = memory.as_ref().map(|memory| {
+                        crate::transcript::recover_thread(
+                            &memory.heart,
+                            memory.encoder.as_ref(),
+                            Some(&thread),
+                        )
+                    });
+                    let detail = match recovery {
+                        Some(Err(recovery_error)) => {
+                            format!("; recovery deferred: {recovery_error}")
+                        }
+                        _ => String::new(),
+                    };
+                    format!("[{final_id} | FINAL ERROR] {error}{detail}")
+                }
             };
             final_reports
                 .lock()

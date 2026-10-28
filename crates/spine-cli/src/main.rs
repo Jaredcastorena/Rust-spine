@@ -2879,13 +2879,15 @@ async fn run_with_operator_controls<'a>(
 ) -> ControlledRun {
     let controls = harness.controls();
     let mut quit_after = false;
+    let mut input_open = true;
     loop {
         tokio::select! {
             outcome = &mut run => {
                 return ControlledRun { outcome: outcome.map(Some), quit_after };
             }
-            line = lines.recv() => {
+            line = lines.recv(), if input_open => {
                 let Some(line) = line else {
+                    input_open = false;
                     controls.request_graceful_stop();
                     quit_after = true;
                     continue;

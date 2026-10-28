@@ -8,7 +8,7 @@ DCMDb and Thymos packages. Production Python databases are never used as fixture
 ## Acceptance result
 
 The desktop audit restores the missing cognitive controls and runtime behaviors
-listed below. The complete Rust suite passes 253 tests, compared with 231 at the
+listed below. The complete Rust suite passes 261 tests, compared with 231 at the
 starting release. The isolated Python suite passes 257 tests. These establish
 specific behavioral evidence, not a claim of identical model-generated answers
 or large-corpus performance. Source hashes and synthetic inputs are recorded in
@@ -117,3 +117,28 @@ The NLI installer pins `cross-encoder/nli-MiniLM2-L6-H768` at
 `b95119ce93d3e065de6214e38cd4a97b0f2f2c6d`; all three installed files were independently
 verified against the Hub. Its approximately 330 MB download is additional to
 MiniLM's 91 MB. No new release tag is created by this audit.
+
+## Second-pass failure-path audit
+
+The first PR revision passed GitHub CI. Additional adversarial checks then found
+and corrected gaps beyond the initial successful-turn tests:
+
+- A graceful stop could wait for the provider's long final-summary timeout. A
+  stopped run now has a five-second summary/initial-completion deadline; another
+  stop cancels the summary. Closing terminal input no longer busy-polls a closed
+  channel while the run is finishing.
+- Consumed or rejected canonical checkpoints now clear cached open obligations.
+  Finished journal cleanup validates schema and offsets before slicing records;
+  invalid records remain available for inspection instead of panicking.
+- A child that fails after a tool result recovers that result immediately, without
+  requiring a parent restart.
+- Stream progress retains only the latest snapshot. The complete SSE response is
+  bounded to 32 MiB, including multiline frames. Line decoding avoids repeated
+  buffer shifts and preserves final events without a trailing newline.
+- Misspelled DCMDb policy fields are rejected, and invalid policies/timestamps are
+  covered by a no-mutation regression.
+
+The complete 261-test Linux suite and strict Clippy pass. Browser JavaScript
+syntax and release hygiene pass. PR CI now also runs the complete workspace in
+release mode on Windows, Intel/Apple Silicon macOS, and ARM Linux. Those remote
+platform results must be checked before claiming cross-platform acceptance.

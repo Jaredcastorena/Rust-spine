@@ -32,7 +32,7 @@ pub enum PmiSignificance {
 /// Applications persisting a custom policy should serialize it alongside their
 /// operation log, rather than changing it implicitly during replay.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DcmdbPolicy {
     pub maximum_secondary_updates: Option<usize>,
     pub source_prior_weight: f32,

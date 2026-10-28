@@ -2,6 +2,8 @@ use crate::{ModelProgress, Result, RuntimeError};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
+const MAX_STREAM_BYTES: usize = 32 * 1024 * 1024;
+
 /// Remove closed and truncated inline thoughts before tool parsing or display.
 pub(crate) fn separate_thoughts(text: &str, supplied: Option<&str>) -> (String, Option<String>) {
     let lower = text.to_ascii_lowercase();
@@ -127,29 +129,36 @@ impl Accumulator {
 
 pub(crate) async fn read_response(
     mut response: reqwest::Response,
-    updates: Option<&tokio::sync::mpsc::UnboundedSender<ModelProgress>>,
+    updates: Option<&tokio::sync::watch::Sender<ModelProgress>>,
 ) -> Result<Value> {
     let mut accumulator = Accumulator::default();
     let mut pending = Vec::new();
     let mut data = String::new();
+    let mut received = 0_usize;
     while let Some(bytes) = response
         .chunk()
         .await
         .map_err(|e| RuntimeError::Provider(e.to_string()))?
     {
-        pending.extend_from_slice(&bytes);
-        if pending.len() > 32 * 1024 * 1024 {
-            return Err(RuntimeError::Provider("oversized SSE frame".into()));
+        received = received.saturating_add(bytes.len());
+        if received > MAX_STREAM_BYTES {
+            return Err(RuntimeError::Provider(
+                "stream exceeded the 32 MiB response limit".into(),
+            ));
         }
-        while let Some(end) = pending.iter().position(|b| *b == b'\n') {
-            let line = String::from_utf8(pending.drain(..=end).collect())
+        pending.extend_from_slice(&bytes);
+        let mut consumed = 0;
+        while let Some(relative) = pending[consumed..].iter().position(|b| *b == b'\n') {
+            let end = consumed + relative;
+            let line = std::str::from_utf8(&pending[consumed..=end])
                 .map_err(|e| RuntimeError::Provider(e.to_string()))?;
+            consumed = end + 1;
             let line = line.trim_end_matches(['\r', '\n']);
             if line.is_empty() {
                 if !data.is_empty() {
                     accumulator.event(data.trim_end_matches('\n'))?;
                     if let Some(updates) = updates {
-                        let _ = updates.send(accumulator.progress());
+                        updates.send_replace(accumulator.progress());
                     }
                     data.clear();
                 }
@@ -158,6 +167,7 @@ pub(crate) async fn read_response(
                 data.push('\n');
             }
         }
+        pending.drain(..consumed);
     }
     if !pending.is_empty() {
         let line = String::from_utf8(pending).map_err(|e| RuntimeError::Provider(e.to_string()))?;
@@ -167,6 +177,9 @@ pub(crate) async fn read_response(
     }
     if !data.is_empty() {
         accumulator.event(data.trim())?;
+        if let Some(updates) = updates {
+            updates.send_replace(accumulator.progress());
+        }
     }
     accumulator.response()
 }
@@ -174,6 +187,47 @@ pub(crate) async fn read_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn fragmented_stream_coalesces_progress_and_preserves_unterminated_final_event() {
+        use axum::{Router, routing::get};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route("/", get(|| async {
+            let mut wire = String::new();
+            for _ in 0..2000 { wire.push_str("data: {\"choices\":[{\"delta\":{\"content\":\"🦀\"}}]}\n\n"); }
+            wire.push_str("data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}");
+            wire
+        }));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let response = reqwest::get(format!("http://{address}/")).await.unwrap();
+        let (updates, receiver) = tokio::sync::watch::channel(ModelProgress::default());
+        let result = read_response(response, Some(&updates)).await.unwrap();
+        let expected = "🦀".repeat(2000) + "done";
+        assert_eq!(result["choices"][0]["message"]["content"], expected);
+        // No consumer ran during production; only the newest snapshot is retained.
+        assert_eq!(receiver.borrow().content, expected);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn oversized_multiline_event_is_rejected_before_model_parsing() {
+        use axum::{Router, routing::get};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/",
+            get(|| async {
+                // Many short lines used to bypass the per-line pending-buffer bound.
+                "data: padding without an event separator\n".repeat(MAX_STREAM_BYTES / 40 + 1)
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let response = reqwest::get(format!("http://{address}/")).await.unwrap();
+        let error = read_response(response, None).await.unwrap_err().to_string();
+        assert!(error.contains("response limit"), "{error}");
+        server.abort();
+    }
+
     #[test]
     fn thought_examples_and_truncation_never_become_visible_calls() {
         let (answer, thought) = separate_thoughts(

@@ -362,3 +362,29 @@ fn counter_and_bayesian_tension_promotion_match_python() {
         );
     }
 }
+
+#[test]
+fn invalid_policy_or_time_is_rejected_without_mutating_memory() {
+    assert!(serde_json::from_str::<DcmdbPolicy>(r#"{"adaptive_merge_angl":true}"#).is_err());
+    let mut db = Dcmdb::new(DcmdbConfig::dense(3)).unwrap();
+    let observation = MemoryObservation {
+        event_id: EventId::from_bytes([1; 32]),
+        vector: vec![1., 0., 0.],
+        time: 1.,
+        source: None,
+        metadata: BTreeMap::new(),
+    };
+    db.update(observation.clone()).unwrap();
+    let before = postcard::to_allocvec(&db).unwrap();
+    let invalid = DcmdbPolicy {
+        source_prior_weight: f32::NAN,
+        ..Default::default()
+    };
+    assert!(db.update_with_policy(observation, &invalid).is_err());
+    assert!(
+        db.query_with_policy(&[1., 0., 0.], 2., 5, None, &invalid)
+            .is_err()
+    );
+    assert!(db.query(&[1., 0., 0.], f64::NAN, 5).is_err());
+    assert_eq!(postcard::to_allocvec(&db).unwrap(), before);
+}
