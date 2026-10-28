@@ -1,12 +1,25 @@
 use std::process::{Command, Stdio};
 
-fn command(directory: &std::path::Path) -> Command {
+fn isolated_command(directory: &std::path::Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_spine"));
     command
         .env_clear()
         .current_dir(directory)
-        .stdin(Stdio::null())
-        .args(["chat", "--incognito-mode", "--no-nli"]);
+        .stdin(Stdio::null());
+    // Windows networking needs its OS installation environment even when app
+    // configuration, credentials, proxies and user settings are isolated.
+    #[cfg(windows)]
+    for name in ["SystemRoot", "WINDIR"] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    command
+}
+
+fn command(directory: &std::path::Path) -> Command {
+    let mut command = isolated_command(directory);
+    command.args(["chat", "--incognito-mode", "--no-nli"]);
     command
 }
 
@@ -69,15 +82,16 @@ async fn saved_connection_is_used_without_prompt_and_failed_startup_preserves_se
     })
     .to_string();
     std::fs::write(&config, &original).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_spine"))
-        .env_clear()
-        .current_dir(temp.path())
-        .stdin(Stdio::null())
+    let output = isolated_command(temp.path())
         .args(["chat", "--config"])
         .arg(&config)
         .output()
         .unwrap();
-    assert!(String::from_utf8_lossy(&output.stderr).contains("missing-model"));
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("missing-model"),
+        "expected model validation, got {error}"
+    );
     assert!(!String::from_utf8_lossy(&output.stdout).contains("Model server URL"));
     assert!(!heart.exists());
     assert_eq!(std::fs::read_to_string(config).unwrap(), original);
@@ -90,10 +104,7 @@ fn refused_connection_fails_before_creating_heart_models_or_settings() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     drop(listener);
-    let output = Command::new(env!("CARGO_BIN_EXE_spine"))
-        .env_clear()
-        .current_dir(temp.path())
-        .stdin(Stdio::null())
+    let output = isolated_command(temp.path())
         .args(["chat", "--config"])
         .arg(temp.path().join("settings.json"))
         .arg(temp.path().join("heart.spine"))
@@ -110,19 +121,13 @@ fn bare_launch_uses_chat_and_no_settings_bypasses_a_broken_profile() {
     let temp = tempfile::tempdir().unwrap();
     let config = temp.path().join("settings.json");
     std::fs::write(&config, "invalid-json").unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_spine"))
-        .env_clear()
+    let output = isolated_command(temp.path())
         .env("SPINE_CONFIG", &config)
-        .current_dir(temp.path())
-        .stdin(Stdio::null())
         .output()
         .unwrap();
     assert!(String::from_utf8_lossy(&output.stderr).contains("Cannot read settings"));
-    let output = Command::new(env!("CARGO_BIN_EXE_spine"))
-        .env_clear()
+    let output = isolated_command(temp.path())
         .env("SPINE_CONFIG", &config)
-        .current_dir(temp.path())
-        .stdin(Stdio::null())
         .args(["chat", "--no-settings"])
         .output()
         .unwrap();
