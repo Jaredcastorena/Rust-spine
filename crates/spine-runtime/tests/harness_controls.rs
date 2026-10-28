@@ -1100,3 +1100,64 @@ async fn stopping_inflight_completion_keeps_partial_text_in_checkpoint() {
     assert!(states.last().unwrap().finished);
     assert!(states.last().unwrap().stopped);
 }
+
+#[tokio::test]
+async fn graceful_stop_cannot_hang_on_the_final_model_summary() {
+    struct HangingSummary;
+    #[async_trait]
+    impl ModelProvider for HangingSummary {
+        async fn complete(&self, request: CompletionRequest) -> Result<ModelTurn> {
+            if request.allow_tool_calls {
+                Ok(tool_turn(vec![call(1)]))
+            } else {
+                std::future::pending().await
+            }
+        }
+    }
+    let executed = Arc::new(Mutex::new(Vec::new()));
+    let harness = Harness::new(
+        Arc::new(HangingSummary),
+        registry(executed.clone()),
+        HarnessConfig::default(),
+    )
+    .unwrap();
+    harness.controls().request_graceful_stop();
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        harness.run("system", "inspect"),
+    )
+    .await
+    .expect("stop must not depend on a responding model")
+    .unwrap();
+    assert_eq!(*executed.lock().unwrap(), ["1"]);
+    assert!(outcome.stopped_gracefully);
+    outcome.checkpoint.unwrap().validate().unwrap();
+}
+
+#[tokio::test]
+async fn stop_queued_before_a_hung_first_completion_is_bounded() {
+    struct Pending;
+    #[async_trait]
+    impl ModelProvider for Pending {
+        async fn complete(&self, _: CompletionRequest) -> Result<ModelTurn> {
+            std::future::pending().await
+        }
+    }
+    let harness = Harness::new(
+        Arc::new(Pending),
+        ToolRegistry::default(),
+        HarnessConfig::default(),
+    )
+    .unwrap();
+    harness.controls().request_graceful_stop();
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        harness.run("system", "inspect"),
+    )
+    .await
+    .expect("queued stop must have a deadline")
+    .unwrap();
+    assert!(outcome.stopped_gracefully);
+    assert_eq!(outcome.completed_tool_calls, 0);
+    outcome.checkpoint.unwrap().validate().unwrap();
+}

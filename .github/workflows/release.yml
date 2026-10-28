@@ -100,8 +100,8 @@ jobs:
 
       # gemm-f16's unoptimized AArch64 build currently fails in inline assembly:
       # https://github.com/sarah-quinones/gemm/issues/31
-      - name: Test release CLI and web surface
-        run: cargo test --release --locked --bin spine --target ${{ matrix.target }}
+      - name: Test complete release workspace
+        run: cargo test --release --locked --workspace --target ${{ matrix.target }}
 
       - run: cargo build --release --locked --bin spine --target ${{ matrix.target }}
 

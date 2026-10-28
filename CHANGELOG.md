@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Bound safe-stop summaries and streamed-response memory, recover failed-child
+  results immediately, reject malformed recovery records, and prevent consumed
+  checkpoints from resurfacing as cached obligations. Extend whole-workspace
+  PR tests to Windows, both macOS architectures and ARM Linux.
+
 - Restore optional DCMDb source/PMI/merge policies, presets, tuning and inspection;
   correct concentration and split-promotion differences found with Python fixtures.
 - Restore raw Thymos queries, affinities, learning-rate overrides and presets;

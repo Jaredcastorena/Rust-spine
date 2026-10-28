@@ -2,7 +2,7 @@
 
 ## Unreleased desktop audit
 
-- [Behavior map and acceptance](docs/desktop-parity-audit.md): 253 Rust tests,
+- [Behavior map and acceptance](docs/desktop-parity-audit.md): 261 Rust tests,
   257 isolated Python tests, real MiniLM/NLI inference, desktop setup/browser
   smoke tests and old-heart read/write/reopen checks pass.
 - Optional DCMDb controls and Thymos APIs restored with cross-language fixtures;

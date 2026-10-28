@@ -108,22 +108,43 @@ pub fn rehydrate(
         .rev()
         .find(|e| &e.body.interaction.thread_id == thread)
         .map(|e| &e.body.interaction.agent_id)
-        && let crate::CheckpointDiscovery::Available(saved) =
-            crate::discover_persisted_checkpoint(&events, agent, thread)
     {
-        state.goal = saved.checkpoint.pending_task;
-        state.plan = saved.checkpoint.host_plan;
-        state.obligations = state
-            .plan
-            .as_ref()
-            .map(|p| {
-                p.steps
-                    .iter()
-                    .skip(p.cursor)
-                    .map(|s| s.text.clone())
-                    .collect()
-            })
-            .unwrap_or_else(|| vec![state.goal.clone()]);
+        match crate::discover_persisted_checkpoint(&events, agent, thread) {
+            crate::CheckpointDiscovery::Available(saved) => {
+                state.goal = saved.checkpoint.pending_task;
+                state.plan = saved.checkpoint.host_plan;
+                state.obligations = state
+                    .plan
+                    .as_ref()
+                    .map(|p| {
+                        p.steps
+                            .iter()
+                            .skip(p.cursor)
+                            .map(|s| s.text.clone())
+                            .collect()
+                    })
+                    .unwrap_or_else(|| vec![state.goal.clone()]);
+            }
+            crate::CheckpointDiscovery::None | crate::CheckpointDiscovery::Rejected(_) => {
+                // A consumed/rejected canonical checkpoint overrides the older local cache.
+                // Without any checkpoint record, local retained work is still useful context.
+                if events.iter().any(|e| {
+                    let i = &e.body.interaction;
+                    &i.agent_id == agent
+                        && &i.thread_id == thread
+                        && matches!(
+                            i.provenance.metadata.get("record_type").map(String::as_str),
+                            Some(
+                                spine_runtime::HarnessCheckpoint::RECORD_TYPE
+                                    | crate::CHECKPOINT_CONSUMED_RECORD_TYPE
+                            )
+                        )
+                }) {
+                    state.obligations.clear();
+                    state.plan = None;
+                }
+            }
+        }
     }
     let goal = if state.goal.is_empty() || state.obligations.is_empty() {
         None
