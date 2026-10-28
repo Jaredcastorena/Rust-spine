@@ -66,6 +66,7 @@ struct PendingControls {
 pub struct ControlPlane {
     pending: Arc<Mutex<PendingControls>>,
     stop: Arc<AtomicBool>,
+    wake: Arc<tokio::sync::Notify>,
 }
 
 impl ControlPlane {
@@ -85,6 +86,19 @@ impl ControlPlane {
 
     pub fn request_graceful_stop(&self) {
         self.stop.store(true, Ordering::Release);
+        self.wake.notify_waiters();
+    }
+
+    async fn stopped(&self) {
+        loop {
+            let notified = self.wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.stop.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
     }
 
     fn drain(&self) -> OperatorControls {
@@ -355,6 +369,7 @@ fn invalid_checkpoint(message: impl Into<String>) -> RuntimeError {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HarnessEvent {
+    ModelProgress(crate::ModelProgress),
     ModelTurnCompleted,
     ToolStarted {
         id: String,
@@ -385,6 +400,31 @@ pub struct RunOutcome {
     pub host_plan: Option<HostPlan>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HarnessProgress {
+    pub run_id: String,
+    pub start_offset: usize,
+    pub messages: Vec<Message>,
+    pub pending_task: String,
+    pub host_plan: Option<HostPlan>,
+    pub policy: HarnessPolicy,
+    pub completed_tool_calls: u64,
+    pub completed_tool_rounds: u64,
+    pub completed_action_calls: usize,
+    pub finished: bool,
+    pub stopped: bool,
+}
+
+pub trait HarnessJournal: Send + Sync {
+    /// Returning an error prevents the next side effect from being dispatched.
+    fn save(&self, progress: &HarnessProgress) -> Result<()>;
+}
+
+struct JournalRun {
+    id: String,
+    start: usize,
+}
+
 pub struct Harness {
     id: String,
     provider: Arc<dyn ModelProvider>,
@@ -394,6 +434,7 @@ pub struct Harness {
     events: broadcast::Sender<HarnessEvent>,
     agent_id: Option<spine_heart::AgentId>,
     tool_metadata: std::collections::BTreeMap<String, String>,
+    journal: Option<Arc<dyn HarnessJournal>>,
 }
 
 impl Harness {
@@ -421,7 +462,58 @@ impl Harness {
             events,
             agent_id: None,
             tool_metadata: std::collections::BTreeMap::new(),
+            journal: None,
         })
+    }
+
+    pub fn with_provider(mut self, provider: Arc<dyn ModelProvider>) -> Self {
+        self.provider = provider;
+        self
+    }
+
+    pub fn with_tool(mut self, tool: impl crate::Tool + 'static) -> Result<Self> {
+        self.registry.register(tool)?;
+        Ok(self)
+    }
+
+    pub fn with_journal(mut self, journal: Arc<dyn HarnessJournal>) -> Self {
+        self.journal = Some(journal);
+        self
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn save_progress(
+        &self,
+        run: &JournalRun,
+        messages: &mut [Message],
+        task: &str,
+        completed: CompletedWork,
+        plan: &Option<HostPlan>,
+        policy: HarnessPolicy,
+        finished: bool,
+        stopped: bool,
+    ) -> Result<()> {
+        for (index, message) in messages.iter_mut().enumerate().skip(run.start) {
+            if message.record_id.is_none() {
+                message.record_id = Some(format!("{}:{index}", run.id));
+            }
+        }
+        if let Some(journal) = &self.journal {
+            journal.save(&HarnessProgress {
+                run_id: run.id.clone(),
+                start_offset: run.start,
+                messages: messages.to_vec(),
+                pending_task: task.into(),
+                host_plan: plan.clone(),
+                policy,
+                completed_tool_calls: completed.tool_calls,
+                completed_tool_rounds: completed.tool_rounds,
+                completed_action_calls: completed.action_calls,
+                finished,
+                stopped,
+            })?;
+        }
+        Ok(())
     }
 
     pub fn with_agent_id(mut self, agent_id: spine_heart::AgentId) -> Self {
@@ -596,26 +688,166 @@ impl Harness {
 
     async fn run_messages(
         &self,
+        messages: Vec<Message>,
+        task: String,
+        completed: CompletedWork,
+        host_plan: Option<HostPlan>,
+        policy: HarnessPolicy,
+    ) -> Result<RunOutcome> {
+        static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let run = JournalRun {
+            id: format!(
+                "{}-{now}-{}",
+                self.id,
+                NEXT_RUN.fetch_add(1, Ordering::Relaxed)
+            ),
+            start: messages.len(),
+        };
+        let mut result = self
+            .run_messages_inner(messages, task.clone(), completed, host_plan, policy, &run)
+            .await?;
+        self.save_progress(
+            &run,
+            &mut result.messages,
+            &task,
+            CompletedWork {
+                tool_calls: result.completed_tool_calls,
+                tool_rounds: result.completed_tool_rounds,
+                action_calls: result.completed_action_calls,
+            },
+            &result.host_plan,
+            result.policy,
+            true,
+            result.stopped_gracefully,
+        )?;
+        if let Some(checkpoint) = &mut result.checkpoint {
+            checkpoint.messages = result.messages.clone();
+        }
+        Ok(result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_messages_inner(
+        &self,
         mut messages: Vec<Message>,
         task: String,
         mut completed: CompletedWork,
         mut host_plan: Option<HostPlan>,
         policy: HarnessPolicy,
+        journal_run: &JournalRun,
     ) -> Result<RunOutcome> {
         let mut usage = TokenUsage::default();
         let mut empty_plan_continuations = 0_u64;
         let mut empty_model_retries = 0_u64;
         self.ensure_plan_guidance(&mut messages);
         loop {
-            let turn = self
-                .provider
-                .complete(CompletionRequest {
-                    messages: messages.clone(),
-                    tools: self.registry.specs(),
-                    allow_tool_calls: true,
-                    temperature: policy.temperature,
-                })
-                .await?;
+            self.save_progress(
+                journal_run,
+                &mut messages,
+                &task,
+                completed,
+                &host_plan,
+                policy,
+                false,
+                false,
+            )?;
+            let (updates, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+            let _ = self
+                .events
+                .send(HarnessEvent::ModelProgress(crate::ModelProgress::default()));
+            let mut partial = crate::ModelProgress::default();
+            let mut journal_tick = tokio::time::interval(std::time::Duration::from_millis(250));
+            let mut partial_dirty = false;
+            let initially_stopping = self.controls.stop.load(Ordering::Acquire);
+            let completion = self.provider.complete(CompletionRequest {
+                progress: Some(updates),
+                messages: messages.clone(),
+                tools: self.registry.specs(),
+                allow_tool_calls: true,
+                temperature: policy.temperature,
+            });
+            tokio::pin!(completion);
+            let turn = loop {
+                tokio::select! {
+                    result = &mut completion => break result,
+                    Some(update) = receiver.recv() => {
+                        partial = update.clone();
+                        partial_dirty = true;
+                        let _ = self.events.send(HarnessEvent::ModelProgress(update));
+                    }
+                    _ = journal_tick.tick(), if self.journal.is_some() => {
+                        if partial_dirty {
+                            let mut snapshot = messages.clone();
+                            snapshot.push(Message::assistant(partial.content.clone(), partial.reasoning.clone(), Vec::new()));
+                            self.save_progress(journal_run, &mut snapshot, &task, completed, &host_plan, policy, false, false)?;
+                            partial_dirty = false;
+                        }
+                    }
+                    () = self.controls.stopped(), if !initially_stopping => {
+                        break Err(RuntimeError::Provider("stopped by operator".into()));
+                    }
+                }
+            };
+            let turn = match turn {
+                Ok(turn) => turn,
+                Err(error) => {
+                    while let Ok(update) = receiver.try_recv() {
+                        partial = update;
+                    }
+                    if !partial.content.is_empty() || partial.reasoning.is_some() {
+                        messages.push(Message::assistant(
+                            partial.content,
+                            partial.reasoning,
+                            Vec::new(),
+                        ));
+                    }
+                    if !self.controls.stop.load(Ordering::Acquire) {
+                        self.save_progress(
+                            journal_run,
+                            &mut messages,
+                            &task,
+                            completed,
+                            &host_plan,
+                            policy,
+                            false,
+                            false,
+                        )?;
+                        return Err(error);
+                    }
+                    self.controls.drain();
+                    let response = format!(
+                        "Model request interrupted or failed: {error}. Completed tool results are retained. Resume when ready; do not repeat completed side effects."
+                    );
+                    messages.push(Message::new(MessageRole::Assistant, &response));
+                    let checkpoint = HarnessCheckpoint {
+                        schema: 1,
+                        harness_id: self.id.clone(),
+                        messages: messages.clone(),
+                        completed_tool_calls: completed.tool_calls,
+                        completed_tool_rounds: completed.tool_rounds,
+                        completed_action_calls: completed.action_calls,
+                        pending_task: task.clone(),
+                        host_plan: host_plan.clone(),
+                        policy: Some(policy),
+                    };
+                    return Ok(RunOutcome {
+                        response,
+                        stopped_gracefully: true,
+                        checkpoint: Some(checkpoint),
+                        completed_tool_calls: completed.tool_calls,
+                        completed_tool_rounds: completed.tool_rounds,
+                        completed_action_calls: completed.action_calls,
+                        policy,
+                        usage,
+                        messages,
+                        host_plan,
+                    });
+                }
+            };
             usage.add(turn.usage);
             let _ = self.events.send(HarnessEvent::ModelTurnCompleted);
             if turn.tool_calls.is_empty() {
@@ -742,6 +974,16 @@ impl Harness {
                 turn.reasoning,
                 turn.tool_calls.clone(),
             ));
+            self.save_progress(
+                journal_run,
+                &mut messages,
+                &task,
+                completed,
+                &host_plan,
+                policy,
+                false,
+                false,
+            )?;
             let mut boundary_controls = None;
             let mut plan_evidence = false;
             let calls = turn.tool_calls;
@@ -775,8 +1017,17 @@ impl Harness {
                         result.model_text(self.config.max_tool_result_chars),
                     ));
                 }
-                // A rejected action is also a safe boundary. Otherwise an
-                // exhausted budget could starve queued guidance/stop forever.
+                self.save_progress(
+                    journal_run,
+                    &mut messages,
+                    &task,
+                    completed,
+                    &host_plan,
+                    policy,
+                    false,
+                    false,
+                )?;
+                // Explicit operator controls still take priority at a safe boundary.
                 let controls = self.controls.drain();
                 if !controls.is_empty() {
                     for skipped in &calls[index + 1..] {
@@ -943,12 +1194,16 @@ impl Harness {
         let turn = self
             .provider
             .complete(CompletionRequest {
+                    progress: None,
                 messages: messages.clone(),
                 tools: Vec::new(),
                 allow_tool_calls: false,
                 temperature: policy.temperature,
             })
-            .await?;
+            .await.unwrap_or_else(|error| crate::ModelTurn {
+                content: format!("Stopped at a safe boundary. Completed tool results are retained; model summary unavailable: {error}"),
+                ..crate::ModelTurn::default()
+            });
         usage.add(turn.usage);
         let response = if turn.content.trim().is_empty() {
             "Stopped at a safe tool boundary; completed results are retained in the checkpoint."

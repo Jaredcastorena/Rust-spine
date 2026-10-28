@@ -4,6 +4,7 @@ mod agent_tools;
 #[cfg(test)]
 mod checkpoint_recovery_tests;
 mod cognition_tools;
+mod context_state;
 mod document_ingest;
 mod endpoint_prompt;
 mod grounding;
@@ -15,6 +16,7 @@ mod setup;
 mod terminal_input;
 #[cfg(test)]
 mod tool_smoke_tests;
+mod transcript;
 mod web_server;
 
 use std::{
@@ -40,7 +42,7 @@ use spine_models::{MiniLmAssets, MiniLmEncoder};
 use spine_runtime::{
     Harness, HarnessCheckpoint, HarnessConfig, HarnessEvent, HarnessPolicy, LlamaCppConfig,
     LlamaCppProvider, Message, MessageRole, ModulationConfig, ModulationInput, RunOutcome,
-    ToolCall, ToolRegistry,
+    ToolRegistry,
 };
 
 use resilience::{CircuitBreaker, ResilienceChannel};
@@ -147,7 +149,7 @@ enum Command {
         setup: bool,
         #[arg(
             long,
-            help = "Use local MiniLM files only; never download missing assets"
+            help = "Use local model files only; never download missing MiniLM or NLI assets"
         )]
         no_download: bool,
         #[arg(
@@ -291,7 +293,7 @@ enum Command {
             long,
             env = "SPINE_NLI_DIR",
             hide_env_values = true,
-            help = "Optional local NLI snapshot directory"
+            help = "Local NLI answer-checker snapshot (otherwise installed automatically)"
         )]
         nli_model_dir: Option<PathBuf>,
         #[arg(
@@ -721,13 +723,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let heart_target = ChatHeartTarget::resolve(path.or(saved.heart), incognito_mode)?;
             let path = &heart_target.path;
-            let nli_model_dir = if no_nli {
-                None
-            } else {
-                resolve_optional_nli_directory(nli_model_dir.or(saved.nli_model_dir))?
-                    .map(setup::absolute)
-                    .transpose()?
-            };
+            let configured_nli = nli_model_dir.or(saved.nli_model_dir);
             let resolved_api_key = api_key.filter(|value| !value.is_empty());
             let mut provider_config = LlamaCppConfig::new(server_url.clone());
             provider_config.api_key = resolved_api_key.clone();
@@ -770,6 +766,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 MiniLmAssets::from_directory(&model_dir),
                 256,
             )?);
+            let nli_model_dir = if no_nli {
+                None
+            } else {
+                Some(resolve_chat_nli_directory(configured_nli, no_download).await?)
+            };
             let grounding = nli_model_dir
                 .clone()
                 .map(grounding::GroundingGate::load)
@@ -832,6 +833,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let heart_was_empty = heart.stats()?.events == 0;
             let agent_id = AgentId::new(agent)?;
             let thread_id = ThreadId::new(thread)?;
+            transcript::recover(&heart, encoder.as_ref())?;
             let mut registry = ToolRegistry::default();
             cognition_tools::register_cognition_tools(
                 &mut registry,
@@ -857,6 +859,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 child_registry,
                 cognitive_config.model.dimension,
                 cognitive_config.thymos_channels,
+                Some(agent_tools::AgentMemory {
+                    heart: heart.clone(),
+                    encoder: encoder.clone(),
+                }),
             )?;
             let mut harness = Harness::new(
                 provider.clone(),
@@ -866,7 +872,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ..HarnessConfig::default()
                 },
             )?
-            .with_agent_id(agent_id.clone());
+            .with_agent_id(agent_id.clone())
+            .with_journal(Arc::new(transcript::HeartJournal::new(
+                heart.clone(),
+                agent_id.clone(),
+                thread_id.clone(),
+            )));
 
             let (line_sender, mut line_receiver) = tokio::sync::mpsc::unbounded_channel();
             let web_server = if enable_web_server {
@@ -927,6 +938,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             event_status.show("Stopping safely");
                             if let Some(web) = &event_web {
                                 web.activity("Stopping safely");
+                            }
+                        }
+                        HarnessEvent::ModelProgress(progress) => {
+                            if let Some(web) = &event_web {
+                                web.stream_progress(&progress);
                             }
                         }
                         HarnessEvent::ModelTurnCompleted => {
@@ -1147,8 +1163,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let triangle_context = if circuit_breaker
                             .allow(ResilienceChannel::Dcmdb, Instant::now())
                         {
-                            match cognition_tools::rehydrate_triangle_context(
+                            match context_state::rehydrate(
                                 &heart,
+                                encoder.as_ref(),
+                                &thread_id,
                                 &task_embedding,
                             ) {
                                 Ok(context) => {
@@ -1348,6 +1366,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     web.fail(&error.to_string());
                                 }
                                 eprintln!("[turn failed: {error}]");
+                                transcript::recover_thread(
+                                    &heart,
+                                    encoder.as_ref(),
+                                    Some(&thread_id),
+                                )?;
+                                let recovered_events = heart.events_canonical()?;
+                                checkpoint = match discover_persisted_checkpoint(
+                                    &recovered_events,
+                                    &agent_id,
+                                    &thread_id,
+                                ) {
+                                    CheckpointDiscovery::Available(saved) => Some(saved),
+                                    _ => None,
+                                };
+                                if let Some(saved) = &checkpoint {
+                                    history = saved
+                                        .checkpoint
+                                        .messages
+                                        .iter()
+                                        .filter(|m| m.role != MessageRole::System)
+                                        .cloned()
+                                        .collect();
+                                }
+                                if let Some(web) = &web_ui {
+                                    web.set_checkpoint_available(checkpoint.is_some());
+                                }
+
                                 if controlled.quit_after {
                                     break;
                                 }
@@ -1355,6 +1400,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         };
                         let Some(mut outcome) = outcome else {
+                            transcript::recover_thread(&heart, encoder.as_ref(), Some(&thread_id))?;
+                            let recovered_events = heart.events_canonical()?;
+                            checkpoint = match discover_persisted_checkpoint(
+                                &recovered_events,
+                                &agent_id,
+                                &thread_id,
+                            ) {
+                                CheckpointDiscovery::Available(saved) => Some(saved),
+                                _ => None,
+                            };
+                            if let Some(saved) = &checkpoint {
+                                history = saved
+                                    .checkpoint
+                                    .messages
+                                    .iter()
+                                    .filter(|m| m.role != MessageRole::System)
+                                    .cloned()
+                                    .collect();
+                            }
+
                             commit_control_text(
                                 &heart,
                                 &encoder,
@@ -1653,6 +1718,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 outcome.checkpoint.is_some(),
                             );
                         }
+                        if let Err(error) =
+                            context_state::remember(&heart, &agent_id, &thread_id, &outcome)
+                        {
+                            eprintln!("[retained context could not be saved: {error}]");
+                        }
                         finish_visible_turn(
                             &outcome,
                             &mut history,
@@ -1736,6 +1806,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 web.fail(&error.to_string());
                             }
                             eprintln!("[resumed turn failed: {error}]");
+                            transcript::recover_thread(&heart, encoder.as_ref(), Some(&thread_id))?;
+                            let recovered_events = heart.events_canonical()?;
+                            checkpoint = match discover_persisted_checkpoint(
+                                &recovered_events,
+                                &agent_id,
+                                &thread_id,
+                            ) {
+                                CheckpointDiscovery::Available(saved) => Some(saved),
+                                _ => None,
+                            };
+                            if let Some(saved) = &checkpoint {
+                                history = saved
+                                    .checkpoint
+                                    .messages
+                                    .iter()
+                                    .filter(|m| m.role != MessageRole::System)
+                                    .cloned()
+                                    .collect();
+                            }
+
                             if controlled.quit_after {
                                 break;
                             }
@@ -1743,6 +1833,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     };
                     let Some(mut outcome) = outcome else {
+                        transcript::recover_thread(&heart, encoder.as_ref(), Some(&thread_id))?;
+                        let recovered_events = heart.events_canonical()?;
+                        checkpoint = match discover_persisted_checkpoint(
+                            &recovered_events,
+                            &agent_id,
+                            &thread_id,
+                        ) {
+                            CheckpointDiscovery::Available(saved) => Some(saved),
+                            _ => None,
+                        };
+                        if let Some(saved) = &checkpoint {
+                            history = saved
+                                .checkpoint
+                                .messages
+                                .iter()
+                                .filter(|m| m.role != MessageRole::System)
+                                .cloned()
+                                .collect();
+                        }
+
                         commit_control_text(
                             &heart,
                             &encoder,
@@ -1831,6 +1941,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             outcome.checkpoint.is_some(),
                         );
                     }
+                    if let Err(error) =
+                        context_state::remember(&heart, &agent_id, &thread_id, &outcome)
+                    {
+                        eprintln!("[retained context could not be saved: {error}]");
+                    }
                     finish_visible_turn(
                         &outcome,
                         &mut history,
@@ -1906,6 +2021,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 onboarding::profile_context(onboarding_state.profile.as_ref())
             );
 
+            transcript::recover(&heart, encoder.as_ref())?;
             let mut registry = ToolRegistry::default();
             cognition_tools::register_cognition_tools(
                 &mut registry,
@@ -1931,6 +2047,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 child_registry,
                 cognitive_config.model.dimension,
                 cognitive_config.thymos_channels,
+                Some(agent_tools::AgentMemory {
+                    heart: heart.clone(),
+                    encoder: encoder.clone(),
+                }),
             )?;
             let mut harness = Harness::new(
                 provider,
@@ -1940,11 +2060,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ..HarnessConfig::default()
                 },
             )?
-            .with_agent_id(agent_id.clone());
+            .with_agent_id(agent_id.clone())
+            .with_journal(Arc::new(transcript::HeartJournal::new(
+                heart.clone(),
+                agent_id.clone(),
+                thread_id.clone(),
+            )));
 
             let task_embedding = encoder.encode(&task)?;
             let triangle_context =
-                cognition_tools::rehydrate_triangle_context(&heart, &task_embedding)?;
+                context_state::rehydrate(&heart, encoder.as_ref(), &thread_id, &task_embedding)?;
             let user_commit = commit_text(
                 &heart,
                 &encoder,
@@ -2032,6 +2157,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &thread_id,
                 &outcome.messages[2..],
             )?;
+            if let Err(error) = context_state::remember(&heart, &agent_id, &thread_id, &outcome) {
+                eprintln!("[retained context could not be saved: {error}]");
+            }
+            transcript::recover_thread(&heart, encoder.as_ref(), Some(&thread_id))?;
             println!("{}", outcome.response);
             println!(
                 "harness={} tool_calls={} tool_rounds={} prompt_tokens={} completion_tokens={}",
@@ -2338,6 +2467,32 @@ fn resolve_required_model_directory(explicit: Option<PathBuf>) -> io::Result<Pat
                 "MiniLM assets not found; pass --model-dir or set SPINE_MINILM_DIR",
             )
         })
+}
+
+async fn resolve_chat_nli_directory(
+    explicit: Option<PathBuf>,
+    offline: bool,
+) -> io::Result<PathBuf> {
+    if let Some(path) = explicit.or_else(|| {
+        std::env::var_os("SPINE_NLI_DIR")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    }) {
+        let path = setup::absolute(path)?;
+        if setup::nli_directory()
+            .and_then(setup::absolute)
+            .is_ok_and(|managed| path == managed)
+        {
+            setup::ensure_nli(&path, offline).await?;
+        }
+        return validate_model_directory(path, "NLI");
+    }
+    if let Some(path) = resolve_optional_nli_directory(None)? {
+        return setup::absolute(path);
+    }
+    let directory = setup::nli_directory()?;
+    setup::ensure_nli(&directory, offline).await?;
+    setup::absolute(directory)
 }
 
 fn resolve_optional_nli_directory(explicit: Option<PathBuf>) -> io::Result<Option<PathBuf>> {
@@ -3237,84 +3392,9 @@ fn persist_harness_messages(
     thread_id: &ThreadId,
     messages: &[Message],
 ) -> Result<Vec<ContextLeaf>, Box<dyn std::error::Error>> {
-    let mut calls = BTreeMap::<String, ToolCall>::new();
-    let mut leaves = Vec::new();
-    for message in messages {
-        match message.role {
-            MessageRole::System | MessageRole::User => {}
-            MessageRole::Assistant => {
-                if !message.content.trim().is_empty() {
-                    let commit = commit_text(
-                        heart,
-                        encoder,
-                        agent_id,
-                        thread_id,
-                        ParticipantRole::Assistant,
-                        EventKind::Message,
-                        &message.content,
-                        None,
-                    )?;
-                    leaves.push(ContextLeaf {
-                        node_id: commit.1.node_id,
-                        chronology: commit.0.event.body.device_sequence,
-                    });
-                }
-                for call in &message.tool_calls {
-                    calls.insert(call.id.clone(), call.clone());
-                    let arguments = serde_json::to_string(&call.arguments)?;
-                    let commit = commit_text(
-                        heart,
-                        encoder,
-                        agent_id,
-                        thread_id,
-                        ParticipantRole::Assistant,
-                        EventKind::ToolCall,
-                        &format!("{}({arguments})", call.name),
-                        Some(ToolExchange {
-                            operation_id: call.id.clone(),
-                            tool_name: call.name.clone(),
-                            arguments: Content::Inline(arguments),
-                            result: None,
-                            succeeded: None,
-                            background: false,
-                        }),
-                    )?;
-                    leaves.push(ContextLeaf {
-                        node_id: commit.1.node_id,
-                        chronology: commit.0.event.body.device_sequence,
-                    });
-                }
-            }
-            MessageRole::Tool => {
-                let operation_id = message.tool_call_id.clone().unwrap_or_default();
-                let call = calls.get(&operation_id);
-                let commit = commit_text(
-                    heart,
-                    encoder,
-                    agent_id,
-                    thread_id,
-                    ParticipantRole::Tool,
-                    EventKind::ToolResult,
-                    &message.content,
-                    Some(ToolExchange {
-                        operation_id,
-                        tool_name: call.map_or_else(|| "unknown".into(), |call| call.name.clone()),
-                        arguments: Content::Inline(
-                            call.map_or_else(|| "{}".into(), |call| call.arguments.to_string()),
-                        ),
-                        result: Some(Content::Inline(message.content.clone())),
-                        succeeded: None,
-                        background: false,
-                    }),
-                )?;
-                leaves.push(ContextLeaf {
-                    node_id: commit.1.node_id,
-                    chronology: commit.0.event.body.device_sequence,
-                });
-            }
-        }
-    }
-    Ok(leaves)
+    Ok(transcript::persist(
+        heart, encoder, agent_id, thread_id, messages,
+    )?)
 }
 
 #[cfg(test)]

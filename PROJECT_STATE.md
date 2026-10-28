@@ -1,6 +1,19 @@
 # Project state
 
-## Baseline
+## Unreleased desktop audit
+
+- [Behavior map and acceptance](docs/desktop-parity-audit.md): 253 Rust tests,
+  257 isolated Python tests, real MiniLM/NLI inference, desktop setup/browser
+  smoke tests and old-heart read/write/reopen checks pass.
+- Optional DCMDb controls and Thymos APIs restored with cross-language fixtures;
+  removed three unused direct dependencies and refreshed licenses/lockfiles.
+- Signed affect recall, query/goal-aware context, child check-ins/shared recall,
+  streamed responses and encrypted interrupted-tool recovery are integrated.
+- Chat automatically installs the NLI answer checker, preserving explicit local
+  paths, offline mode and `--no-nli`. Existing desktop action/round policies remain.
+- Separate Android and Codex-provider work is untouched. No release tag yet.
+
+## Released baseline
 
 - v0.3.1 includes first-run setup, the outstanding budget-aware file-pagination
   fix, stable dependency updates, Rust 1.99.1, and refreshed pinned CI/container images.

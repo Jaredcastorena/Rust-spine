@@ -12,6 +12,8 @@ use sha2::{Digest, Sha256};
 
 const REVISION: &str = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41";
 const REPOSITORY: &str = "sentence-transformers/all-MiniLM-L6-v2";
+const NLI_REVISION: &str = "b95119ce93d3e065de6214e38cd4a97b0f2f2c6d";
+const NLI_REPOSITORY: &str = "cross-encoder/nli-MiniLM2-L6-H768";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -147,6 +149,12 @@ pub fn minilm_directory() -> io::Result<PathBuf> {
         .join(REVISION))
 }
 
+pub fn nli_directory() -> io::Result<PathBuf> {
+    Ok(data_directory()?
+        .join("models/nli-MiniLM2-L6-H768")
+        .join(NLI_REVISION))
+}
+
 pub fn absolute(path: PathBuf) -> io::Result<PathBuf> {
     std::path::absolute(crate::expand_home(path))
 }
@@ -216,7 +224,39 @@ const ASSETS: &[Asset<'static>] = &[
     },
 ];
 
+const NLI_ASSETS: &[Asset<'static>] = &[
+    Asset {
+        name: "config.json",
+        size: 875,
+        sha256: "8b0e41caff7567c0f53e6983f35591c3dec59507c9173ab125c5823394fb57f3",
+    },
+    Asset {
+        name: "tokenizer.json",
+        size: 1_356_048,
+        sha256: "82139106e603ee4e1d5bc99d056ccbed5a92bc24848b1b5a7137c26e00d0dbf6",
+    },
+    Asset {
+        name: "model.safetensors",
+        size: 328_499_560,
+        sha256: "ec9c5b6a08b60d7a01b465c7ed44b496244dfd1bed3274c95875a74cea89ab35",
+    },
+];
+
 pub async fn ensure_minilm(directory: &Path, offline: bool) -> io::Result<()> {
+    ensure_model(directory, offline, REPOSITORY, REVISION, ASSETS).await
+}
+
+pub async fn ensure_nli(directory: &Path, offline: bool) -> io::Result<()> {
+    ensure_model(directory, offline, NLI_REPOSITORY, NLI_REVISION, NLI_ASSETS).await
+}
+
+async fn ensure_model(
+    directory: &Path,
+    offline: bool,
+    repository: &str,
+    revision: &str,
+    assets: &[Asset<'_>],
+) -> io::Result<()> {
     let client = reqwest::Client::builder()
         .https_only(true)
         .connect_timeout(Duration::from_secs(15))
@@ -224,8 +264,8 @@ pub async fn ensure_minilm(directory: &Path, offline: bool) -> io::Result<()> {
         .redirect(reqwest::redirect::Policy::limited(5))
         .build()
         .map_err(network_error)?;
-    let base = format!("https://huggingface.co/{REPOSITORY}/resolve/{REVISION}");
-    ensure_assets(directory, &base, ASSETS, &client, offline).await
+    let base = format!("https://huggingface.co/{repository}/resolve/{revision}");
+    ensure_assets(directory, &base, assets, &client, offline).await
 }
 
 fn verified(path: &Path, asset: &Asset<'_>) -> io::Result<bool> {
@@ -264,12 +304,12 @@ async fn ensure_assets(
         if offline {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                "MiniLM is missing or damaged. Run without --no-download to install it, or supply --model-dir.",
+                "A required model is missing or damaged. Run without --no-download, supply local --model-dir/--nli-model-dir assets, or use --no-nli to disable the answer checker.",
             ));
         }
         private_directory(directory)?;
         eprintln!(
-            "Installing memory model: {} ({:.1} MB)",
+            "Installing local model: {} ({:.1} MB)",
             asset.name,
             asset.size as f64 / 1_000_000.0
         );
@@ -285,7 +325,7 @@ async fn ensure_assets(
             .is_some_and(|size| size != asset.size)
         {
             return Err(invalid(
-                "MiniLM download has an unexpected size; rerun setup to retry.",
+                "Model download has an unexpected size; rerun setup to retry.",
             ));
         }
         let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
@@ -295,18 +335,18 @@ async fn ensure_assets(
         while let Some(chunk) = response.chunk().await.map_err(network_error)? {
             received += chunk.len() as u64;
             if received > asset.size {
-                return Err(invalid("MiniLM download exceeded its expected size."));
+                return Err(invalid("Model download exceeded its expected size."));
             }
             hasher.update(&chunk);
             temporary.write_all(&chunk)?;
             if received / 10_000_000 > progress {
                 progress = received / 10_000_000;
-                eprintln!("Memory model: {}%", received * 100 / asset.size);
+                eprintln!("Model download: {}%", received * 100 / asset.size);
             }
         }
         if received != asset.size || hex::encode(hasher.finalize()) != asset.sha256 {
             return Err(invalid(
-                "MiniLM checksum verification failed; rerun setup to retry.",
+                "Model checksum verification failed; rerun setup to retry.",
             ));
         }
         temporary.as_file().sync_all()?;
@@ -319,7 +359,7 @@ async fn ensure_assets(
 
 fn network_error(error: reqwest::Error) -> io::Error {
     io::Error::other(format!(
-        "Could not download MiniLM: {}. Rerun to retry; completed files are reused.",
+        "Could not download model: {}. Rerun to retry; completed files are reused.",
         error.without_url()
     ))
 }

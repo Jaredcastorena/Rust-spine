@@ -41,6 +41,7 @@ pub struct CreatedHeart {
 pub struct SpineHeart {
     config: HeartConfig,
     store: Store,
+    projection_gate: std::sync::Arc<std::sync::Mutex<()>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -67,14 +68,22 @@ impl SpineHeart {
             recovery_phrase,
         } = Store::create(&config.path, passphrase)?;
         Ok(CreatedHeart {
-            heart: Self { config, store },
+            heart: Self {
+                config,
+                store,
+                projection_gate: Default::default(),
+            },
             recovery_phrase,
         })
     }
 
     pub fn open(config: HeartConfig, keys: KeySource) -> Result<Self> {
         let store = Store::open(&config.path, keys)?;
-        let heart = Self { config, store };
+        let heart = Self {
+            config,
+            store,
+            projection_gate: Default::default(),
+        };
         heart.upgrade_risk_projection()?;
         Ok(heart)
     }
@@ -85,7 +94,11 @@ impl SpineHeart {
         passphrase: &str,
     ) -> Result<Self> {
         let store = Store::create_replica(&config.path, recovery_phrase, passphrase)?;
-        Ok(Self { config, store })
+        Ok(Self {
+            config,
+            store,
+            projection_gate: Default::default(),
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -97,6 +110,14 @@ impl SpineHeart {
     }
 
     pub fn commit_interaction(&self, interaction: InteractionInput) -> Result<CommitReceipt> {
+        let _guard = self
+            .projection_gate
+            .lock()
+            .expect("projection gate poisoned");
+        self.commit_interaction_unlocked(interaction)
+    }
+
+    fn commit_interaction_unlocked(&self, interaction: InteractionInput) -> Result<CommitReceipt> {
         validate_interaction(&interaction)?;
         let now = now_millis()?;
         let (device_sequence, timestamp) = self.store.reserve_clock(now)?;
@@ -114,6 +135,10 @@ impl SpineHeart {
     }
 
     pub fn initialize_cognition(&self, config: CognitiveConfig) -> Result<()> {
+        let _guard = self
+            .projection_gate
+            .lock()
+            .expect("projection gate poisoned");
         if config.generation != self.config.projection_generation {
             return Err(HeartError::InvalidInput(
                 "cognitive generation does not match HeartConfig".into(),
@@ -136,13 +161,25 @@ impl SpineHeart {
     }
 
     pub fn cognition(&self) -> Result<Option<CognitiveState>> {
+        let _guard = self
+            .projection_gate
+            .lock()
+            .expect("projection gate poisoned");
+        self.cognition_unlocked()
+    }
+
+    fn cognition_unlocked(&self) -> Result<Option<CognitiveState>> {
         self.store.get_projection(self.config.projection_generation)
     }
 
     /// Add all Python retrieval features while retaining released legacy weights
     /// in a distinct segment. CAS prevents overwriting concurrent learned state.
     pub fn upgrade_risk_projection(&self) -> Result<bool> {
-        let Some(previous) = self.cognition()? else {
+        let _guard = self
+            .projection_gate
+            .lock()
+            .expect("projection gate poisoned");
+        let Some(previous) = self.cognition_unlocked()? else {
             return Ok(false);
         };
         let mut replacement = previous.clone();
@@ -177,7 +214,11 @@ impl SpineHeart {
     /// inference and preserves DCMDb, affect, learned risk, context triangles and
     /// event frontiers exactly. A failed or concurrent upgrade installs nothing.
     pub fn upgrade_fact_projection(&self) -> Result<bool> {
-        let previous = self.current_cognition()?;
+        let _guard = self
+            .projection_gate
+            .lock()
+            .expect("projection gate poisoned");
+        let previous = self.current_cognition_unlocked()?;
         match previous.schema {
             CognitiveState::CURRENT_SCHEMA => return Ok(false),
             1..=3 => {}
@@ -213,17 +254,48 @@ impl SpineHeart {
         Ok(true)
     }
 
+    pub fn set_local_state(&self, name: &str, value: Option<&[u8]>) -> Result<()> {
+        self.store.set_local_state(name, value)
+    }
+
+    pub fn local_states(
+        &self,
+        prefix: &str,
+    ) -> Result<std::collections::BTreeMap<String, Vec<u8>>> {
+        self.store.local_states(prefix)
+    }
+
     pub fn commit_embedded(
         &self,
-        interaction: InteractionInput,
+        mut interaction: InteractionInput,
         embedding: Embedding,
     ) -> Result<(CommitReceipt, MemoryReceipt)> {
-        let mut state = self.cognition()?.ok_or(HeartError::NotFound)?;
+        let _guard = self
+            .projection_gate
+            .lock()
+            .expect("projection gate poisoned");
+        let mut state = self.cognition_unlocked()?.ok_or(HeartError::NotFound)?;
         if !state.is_current(&self.store.frontier()?) {
             return Err(HeartError::ProjectionStale);
         }
+        if embedding.as_slice().len() == state.config.model.dimension
+            && !interaction
+                .provenance
+                .metadata
+                .contains_key("affect_affinity")
+            && let Some(feeling) = state.feel(&interaction.agent_id, &embedding)?
+        {
+            interaction.provenance.metadata.insert(
+                "affect_affinity".into(),
+                serde_json::to_string(&feeling.activated)?,
+            );
+            interaction
+                .provenance
+                .metadata
+                .insert("affect_schema".into(), "thymos-affinity-v1".into());
+        }
         let previous = state.clone();
-        let receipt = self.commit_interaction(interaction)?;
+        let receipt = self.commit_interaction_unlocked(interaction)?;
         let events = self.store.events_canonical()?;
         if events.last().map(|event| event.id) != Some(receipt.event.id) {
             return Err(HeartError::ProjectionStale);
@@ -252,10 +324,14 @@ impl SpineHeart {
         &self,
         items: Vec<(InteractionInput, Embedding)>,
     ) -> Result<Vec<(CommitReceipt, MemoryReceipt)>> {
+        let _guard = self
+            .projection_gate
+            .lock()
+            .expect("projection gate poisoned");
         if items.is_empty() {
             return Ok(Vec::new());
         }
-        let mut state = self.cognition()?.ok_or(HeartError::NotFound)?;
+        let mut state = self.cognition_unlocked()?.ok_or(HeartError::NotFound)?;
         if !state.is_current(&self.store.frontier()?) {
             return Err(HeartError::ProjectionStale);
         }
@@ -271,7 +347,7 @@ impl SpineHeart {
 
         let mut commits = Vec::with_capacity(items.len());
         for (interaction, _) in &items {
-            commits.push(self.commit_interaction(interaction.clone())?);
+            commits.push(self.commit_interaction_unlocked(interaction.clone())?);
         }
 
         let canonical = self.store.events_canonical()?;
@@ -314,6 +390,10 @@ impl SpineHeart {
         config: CognitiveConfig,
         encoder: &dyn SemanticEncoder,
     ) -> Result<CognitiveState> {
+        let _guard = self
+            .projection_gate
+            .lock()
+            .expect("projection gate poisoned");
         if config.generation != self.config.projection_generation {
             return Err(HeartError::InvalidInput(
                 "cognitive generation does not match HeartConfig".into(),
@@ -324,7 +404,7 @@ impl SpineHeart {
                 "encoder manifest does not match cognitive projection".into(),
             ));
         }
-        let previous = self.cognition()?;
+        let previous = self.cognition_unlocked()?;
         let canonical = self.store.events_canonical()?;
         let mut state = CognitiveState::new(config)?;
         let mut samples = Vec::new();
@@ -359,8 +439,12 @@ impl SpineHeart {
     /// Unlike a full rebuild, this preserves projection-only learned state such
     /// as risk updates, maintenance results, and context triangles.
     pub fn catch_up_cognition(&self, encoder: &dyn SemanticEncoder) -> Result<CognitiveState> {
+        let _guard = self
+            .projection_gate
+            .lock()
+            .expect("projection gate poisoned");
         let mut state = self
-            .cognition()?
+            .cognition_unlocked()?
             .ok_or_else(|| HeartError::InvalidInput("heart has no cognitive projection".into()))?;
         if encoder.manifest() != &state.config.model {
             return Err(HeartError::InvalidInput(
@@ -561,7 +645,11 @@ impl SpineHeart {
         retrieval_stats: &[f32],
         tension: f32,
     ) -> Result<f32> {
-        let mut state = self.current_cognition()?;
+        let _guard = self
+            .projection_gate
+            .lock()
+            .expect("projection gate poisoned");
+        let mut state = self.current_cognition_unlocked()?;
         let feeling = state.feel(agent, context)?.map_or_else(
             || vec![0.0; state.config.thymos_channels],
             |item| item.activated,
@@ -614,7 +702,11 @@ impl SpineHeart {
 
     /// Run bounded DCMDb consolidation, pruning, and dream maintenance and persist the result.
     pub fn maintain_cognition(&self, maximum_rounds: usize) -> Result<crate::MaintenanceReport> {
-        let mut state = self.current_cognition()?;
+        let _guard = self
+            .projection_gate
+            .lock()
+            .expect("projection gate poisoned");
+        let mut state = self.current_cognition_unlocked()?;
         state.triangles.verify(&state.dcmdb)?;
         let now = now_millis()? as f64 / 1_000.0;
         let protected = state.triangles.referenced_nodes();
@@ -639,7 +731,11 @@ impl SpineHeart {
         leaves: impl IntoIterator<Item = crate::ContextLeaf>,
         target_roots: usize,
     ) -> Result<Vec<crate::ContextBranch>> {
-        let mut state = self.current_cognition()?;
+        let _guard = self
+            .projection_gate
+            .lock()
+            .expect("projection gate poisoned");
+        let mut state = self.current_cognition_unlocked()?;
         state
             .triangles
             .compact(leaves, &state.dcmdb, target_roots)?;
@@ -666,7 +762,11 @@ impl SpineHeart {
         expected: &Embedding,
         actual: &Embedding,
     ) -> Result<FeelingVector> {
-        let mut state = self.current_cognition()?;
+        let _guard = self
+            .projection_gate
+            .lock()
+            .expect("projection gate poisoned");
+        let mut state = self.current_cognition_unlocked()?;
         let previous = state.clone();
         let canonical = self.events_canonical()?;
         let predecessor_hash = agent_observation_frontier(&state, agent)?.1;
@@ -699,7 +799,11 @@ impl SpineHeart {
     }
 
     pub fn promote_agent_thymos(&self, agent: AgentId, thymos: crate::Thymos) -> Result<()> {
-        let mut state = self.current_cognition()?;
+        let _guard = self
+            .projection_gate
+            .lock()
+            .expect("projection gate poisoned");
+        let mut state = self.current_cognition_unlocked()?;
         state.promote_thymos(agent, thymos)?;
         self.store
             .put_projection(self.config.projection_generation, &state)
@@ -789,10 +893,18 @@ impl SpineHeart {
     }
 
     pub fn import_delta(&self, delta: EncryptedDelta) -> Result<ImportReceipt> {
+        let _guard = self
+            .projection_gate
+            .lock()
+            .expect("projection gate poisoned");
         sync::import_delta(&self.store, delta)
     }
 
     pub fn redact(&self, target: TombstoneTarget, reason: Option<String>) -> Result<TombstoneId> {
+        let _guard = self
+            .projection_gate
+            .lock()
+            .expect("projection gate poisoned");
         let wall = now_millis()?;
         let (device_sequence, _) = self.store.reserve_clock(wall)?;
         let mut tombstone = Tombstone {
@@ -827,7 +939,15 @@ impl SpineHeart {
     }
 
     fn current_cognition(&self) -> Result<CognitiveState> {
-        let state = self.cognition()?.ok_or(HeartError::NotFound)?;
+        let _guard = self
+            .projection_gate
+            .lock()
+            .expect("projection gate poisoned");
+        self.current_cognition_unlocked()
+    }
+
+    fn current_cognition_unlocked(&self) -> Result<CognitiveState> {
+        let state = self.cognition_unlocked()?.ok_or(HeartError::NotFound)?;
         if !state.is_current(&self.store.frontier()?) {
             return Err(HeartError::ProjectionStale);
         }

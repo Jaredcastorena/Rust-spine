@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+- Restore optional DCMDb source/PMI/merge policies, presets, tuning and inspection;
+  correct concentration and split-promotion differences found with Python fixtures.
+- Restore raw Thymos queries, affinities, learning-rate overrides and presets;
+  correct tied-channel selection and compare every activation/valence mode.
+- Capture signed memory affinity, rank context by query and retained goals,
+  and give child agents shared recall, meaningful check-ins and durable results.
+- Preserve interrupted tool work in encrypted local journals; never automatically
+  replay uncertain side effects. Retain existing desktop tool and action limits.
+- Stream model output, separate inline thoughts, support advertised text-only
+  tool interfaces and keep cancellation scoped to its request.
+- Automatically install the pinned NLI answer checker with verified downloads;
+  preserve local paths, offline operation and the explicit disable option.
+- Remove unused direct dependencies and refresh lockfiles/license attribution.
+  Existing heart layouts and older executable interoperability are preserved.
+
 ## 0.3.1 — 2026-10-24
 
 - Includes the automatic setup and maintenance changes below.

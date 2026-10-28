@@ -189,3 +189,40 @@ fn nested_triangle_identity_uses_the_full_overlapping_chronology_range() {
     );
     forest.verify(&memory).unwrap();
 }
+
+#[test]
+fn ranked_roots_reach_old_relevant_context_without_changing_geometry() {
+    let mut config = DcmdbConfig::dense(3);
+    config.theta_similarity = 0.99999;
+    let mut memory = Dcmdb::new(config).unwrap();
+    let vectors = [
+        [1., 0., 0.],
+        [0., 1., 0.],
+        [0., 0., 1.],
+        [-1., 0., 0.],
+        [0., -1., 0.],
+    ];
+    let leaves: Vec<_> = vectors
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| ContextLeaf {
+            node_id: add(&mut memory, i as u8 + 1, v, i as f64),
+            chronology: i as u64,
+        })
+        .collect();
+    let oldest = leaves[0].node_id;
+    let mut forest = ContextForest::default();
+    forest.compact(leaves, &memory, 5).unwrap();
+    let before = postcard::to_allocvec(&forest).unwrap();
+    let nodes = postcard::to_allocvec(&memory).unwrap();
+    let query = Embedding::normalized(vec![1., 0., 0.], 3).unwrap();
+    let roots = forest.ranked_roots(&memory, &query, None, 3).unwrap();
+    assert_eq!(roots[0].handle, ContextHandle::Node(oldest));
+    assert_eq!(postcard::to_allocvec(&forest).unwrap(), before);
+    assert_eq!(postcard::to_allocvec(&memory).unwrap(), nodes);
+    let reopened: ContextForest = postcard::from_bytes(&before).unwrap();
+    assert_eq!(
+        reopened.ranked_roots(&memory, &query, None, 3).unwrap(),
+        roots
+    );
+}

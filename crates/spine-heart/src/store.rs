@@ -525,6 +525,46 @@ impl Store {
             .collect()
     }
 
+    /// Device-local recovery state, encrypted inside the heart and durably committed.
+    /// This is deliberately outside canonical cognition and replica synchronization.
+    pub fn set_local_state(&self, name: &str, value: Option<&[u8]>) -> Result<()> {
+        if name.is_empty() || name.len() > 512 {
+            return Err(HeartError::InvalidInput("invalid local state key".into()));
+        }
+        let key = format!("local:{name}");
+        let encrypted = value
+            .map(|bytes| encrypt_record(&self.keys, key.as_bytes(), bytes))
+            .transpose()?;
+        let write = self.db.begin_write()?;
+        {
+            let mut table = write.open_table(META)?;
+            if let Some(bytes) = encrypted {
+                table.insert(key.as_str(), bytes.as_slice())?;
+            } else {
+                table.remove(key.as_str())?;
+            }
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    pub fn local_states(&self, prefix: &str) -> Result<BTreeMap<String, Vec<u8>>> {
+        let read = self.db.begin_read()?;
+        let table = read.open_table(META)?;
+        let mut records = BTreeMap::new();
+        let prefix = format!("local:{prefix}");
+        for row in table.iter()? {
+            let (key, value) = row?;
+            if key.value().starts_with(&prefix) {
+                records.insert(
+                    key.value()[6..].to_owned(),
+                    decrypt_record(&self.keys, key.value().as_bytes(), value.value())?,
+                );
+            }
+        }
+        Ok(records)
+    }
+
     pub fn put_projection<T: Serialize>(&self, generation: u64, value: &T) -> Result<()> {
         let key = self.projection_key(generation);
         self.put_encrypted(PROJECTIONS, &key, value)

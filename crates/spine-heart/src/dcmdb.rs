@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{EventId, HeartError, NodeId, Result, vector};
+use crate::{
+    DcmdbPolicy, EventId, HeartError, NodeId, PmiMode, PmiSignificance, PmiVariant, Result, vector,
+};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DcmdbConfig {
@@ -367,6 +369,20 @@ impl Dcmdb {
     }
 
     pub fn update(&mut self, observation: MemoryObservation) -> Result<NodeId> {
+        self.update_with_policy(observation, &DcmdbPolicy::default())
+    }
+
+    pub fn update_with_policy(
+        &mut self,
+        observation: MemoryObservation,
+        policy: &DcmdbPolicy,
+    ) -> Result<NodeId> {
+        policy.validate()?;
+        if !observation.time.is_finite() {
+            return Err(HeartError::InvalidInput(
+                "DCMDb observation time must be finite".into(),
+            ));
+        }
         vector::validate_dimension(&observation.vector, self.config.dimension)?;
         let input = vector::unit(&observation.vector, self.config.eps);
         if vector::norm(&input) < self.config.eps {
@@ -385,20 +401,51 @@ impl Dcmdb {
         let mut candidates: Vec<(NodeId, f32)> = knn
             .iter()
             .copied()
-            .filter(|(_, similarity)| *similarity >= self.config.theta_similarity)
+            .filter(|(id, similarity)| {
+                *similarity
+                    + policy.source_prior_weight
+                        * self.source_probability(*id, observation.source.as_deref())
+                    >= self.config.theta_similarity
+            })
             .collect();
         candidates.sort_by(|left, right| {
-            right
-                .1
-                .total_cmp(&left.1)
-                .then_with(|| left.0.cmp(&right.0))
+            (right.1
+                + policy.source_prior_weight
+                    * self.source_probability(right.0, observation.source.as_deref()))
+            .total_cmp(
+                &(left.1
+                    + policy.source_prior_weight
+                        * self.source_probability(left.0, observation.source.as_deref())),
+            )
+            .then_with(|| left.0.cmp(&right.0))
         });
-        let pmi_ids: Vec<NodeId> = knn
+        let decoupled: Vec<NodeId> = knn
             .iter()
             .filter(|(_, similarity)| *similarity >= self.config.pmi_angle_max.cos())
             .take(self.config.pmi_neighbors)
             .map(|(id, _)| *id)
             .collect();
+        let coupled: Vec<_> = candidates
+            .iter()
+            .take(self.config.pmi_neighbors)
+            .map(|(id, _)| *id)
+            .collect();
+        let pmi_ids = match policy.pmi_mode {
+            PmiMode::Decoupled => decoupled,
+            PmiMode::Coupled => coupled,
+            PmiMode::Hybrid => {
+                let mut picks = coupled;
+                for id in decoupled {
+                    if picks.len() >= self.config.pmi_neighbors {
+                        break;
+                    }
+                    if !picks.contains(&id) {
+                        picks.push(id);
+                    }
+                }
+                picks
+            }
+        };
 
         if candidates.is_empty() {
             self.record_coactivation(&pmi_ids);
@@ -410,7 +457,7 @@ impl Dcmdb {
                 observation.metadata,
             );
             *self.visit_counts.entry(id).or_default() += 1.0;
-            self.refresh_edges();
+            self.refresh_edges(policy);
             return Ok(id);
         }
 
@@ -435,7 +482,11 @@ impl Dcmdb {
         ) {
             winner = promoted;
         }
-        for (id, similarity) in candidates.into_iter().skip(1) {
+        for (id, similarity) in candidates
+            .into_iter()
+            .skip(1)
+            .take(policy.maximum_secondary_updates.unwrap_or(usize::MAX))
+        {
             self.update_node(
                 id,
                 observation.event_id,
@@ -446,11 +497,28 @@ impl Dcmdb {
             );
         }
         self.record_coactivation(&pmi_ids);
-        self.refresh_edges();
+        self.refresh_edges(policy);
         Ok(winner)
     }
 
     pub fn query(&self, query: &[f32], now: f64, top_k: usize) -> Result<Vec<RecallHit>> {
+        self.query_with_policy(query, now, top_k, None, &DcmdbPolicy::default())
+    }
+
+    pub fn query_with_policy(
+        &self,
+        query: &[f32],
+        now: f64,
+        top_k: usize,
+        source: Option<&str>,
+        policy: &DcmdbPolicy,
+    ) -> Result<Vec<RecallHit>> {
+        policy.validate()?;
+        if !now.is_finite() {
+            return Err(HeartError::InvalidInput(
+                "DCMDb query time must be finite".into(),
+            ));
+        }
         vector::validate_dimension(query, self.config.dimension)?;
         let query = vector::unit(query, self.config.eps);
         if self.nodes.is_empty() || top_k == 0 {
@@ -462,15 +530,23 @@ impl Dcmdb {
             .map(|(id, node)| (*id, vector::dot(&node.centroid, &query)))
             .collect();
         semantic.sort_by(|left, right| {
-            right
-                .1
-                .total_cmp(&left.1)
+            (right.1 + policy.source_prior_weight * self.source_probability(right.0, source))
+                .total_cmp(
+                    &(left.1
+                        + policy.source_prior_weight * self.source_probability(left.0, source)),
+                )
                 .then_with(|| left.0.cmp(&right.0))
         });
         let seeds: Vec<(NodeId, f32)> = semantic
             .iter()
             .take(self.config.neighbors)
-            .map(|(id, score)| (*id, score.max(0.0)))
+            .map(|(id, score)| {
+                (
+                    *id,
+                    (score + policy.source_prior_weight * self.source_probability(*id, source))
+                        .max(0.0),
+                )
+            })
             .collect();
         let pagerank = self.personalized_pagerank(&seeds);
         let mut hits = Vec::with_capacity(self.nodes.len());
@@ -484,6 +560,7 @@ impl Dcmdb {
                 + self.config.graph_weight * graph_score
                 + self.config.freshness_weight * freshness
                 + self.config.confidence_weight * node.confidence
+                + policy.source_score_weight * self.source_probability(id, source)
                 - if tensioned {
                     self.config.tension_penalty
                 } else {
@@ -507,7 +584,7 @@ impl Dcmdb {
         });
         if self.config.mmr_weight > 0.0 && top_k > 1 && hits.len() > 1 {
             let weight = self.config.mmr_weight;
-            let pool_length = (top_k * 3).min(hits.len());
+            let pool_length = top_k.saturating_mul(3).min(hits.len());
             let mut remaining = hits[..pool_length].to_vec();
             let mut selected = vec![remaining.remove(0)];
             while selected.len() < top_k && !remaining.is_empty() {
@@ -543,6 +620,29 @@ impl Dcmdb {
 
     pub fn node(&self, id: NodeId) -> Option<&MemoryNode> {
         self.nodes.get(&id).or_else(|| self.absorbed.get(&id))
+    }
+
+    pub fn source_probability(&self, id: NodeId, source: Option<&str>) -> f32 {
+        let Some(source) = source else {
+            return 0.0;
+        };
+        let Some(node) = self.nodes.get(&id) else {
+            return 0.0;
+        };
+        let total: f32 = node
+            .source_counts
+            .values()
+            .map(|value| value.max(0.0))
+            .sum();
+        if total <= 0.0 {
+            return 0.0;
+        }
+        node.source_counts
+            .get(source)
+            .copied()
+            .unwrap_or_default()
+            .max(0.0)
+            / total
     }
 
     /// Select exact evidence across a bounded absorbed-node subtree. Parent
@@ -660,6 +760,15 @@ impl Dcmdb {
     }
 
     pub fn consolidate_pass(&mut self) -> usize {
+        self.consolidate_with_policy(&DcmdbPolicy::default())
+    }
+
+    pub fn consolidate_pass_with_policy(&mut self, policy: &DcmdbPolicy) -> Result<usize> {
+        policy.validate()?;
+        Ok(self.consolidate_with_policy(policy))
+    }
+
+    fn consolidate_with_policy(&mut self, policy: &DcmdbPolicy) -> usize {
         if self.nodes.len() < 2 {
             return 0;
         }
@@ -684,6 +793,17 @@ impl Dcmdb {
                     .map(|(right, similarity)| (*left, right, similarity))
             })
             .collect();
+        let gate = if policy.adaptive_merge_angle {
+            let mut angles: Vec<_> = nearest
+                .iter()
+                .map(|(_, _, score)| vector::clamp_unit(*score).acos())
+                .collect();
+            self.config
+                .merge_angle
+                .min(crate::dcmdb_policy::quantile(&mut angles, 0.9) + policy.merge_angle_margin)
+        } else {
+            self.config.merge_angle
+        };
         let maximum = self.config.max_merges_per_pass.unwrap_or(self.nodes.len());
         let mut merges = 0;
         let mut cool = BTreeSet::new();
@@ -693,7 +813,7 @@ impl Dcmdb {
                 || cool.contains(&right)
                 || !self.nodes.contains_key(&left)
                 || !self.nodes.contains_key(&right)
-                || vector::clamp_unit(similarity).acos() > self.config.merge_angle
+                || vector::clamp_unit(similarity).acos() > gate
             {
                 continue;
             }
@@ -734,8 +854,13 @@ impl Dcmdb {
             let merged_ll = merged_count * log_c_vmf(merged_kappa, self.config.dimension)
                 + merged_kappa * merged_resultant;
             let delta_ll = merged_ll - left_ll - right_ll;
-            let effective_samples =
-                (left_node.visits + right_node.visits).max(self.config.effective_sample_minimum);
+            let samples = if policy.use_decayed_effective_samples {
+                self.visit_counts.get(&left).copied().unwrap_or_default()
+                    + self.visit_counts.get(&right).copied().unwrap_or_default()
+            } else {
+                left_node.visits + right_node.visits
+            };
+            let effective_samples = samples.max(self.config.effective_sample_minimum);
             let bic = effective_samples.max(self.config.eps).ln();
             let kappa_drop = (left_kappa.min(right_kappa) - merged_kappa).max(0.0);
             if self.config.maximum_kappa_drop > 0.0 && kappa_drop > self.config.maximum_kappa_drop {
@@ -790,6 +915,24 @@ impl Dcmdb {
     }
 
     pub fn dream_pass(&mut self, now: f64) -> MaintenanceReport {
+        self.dream_with_policy(now, &DcmdbPolicy::default())
+    }
+
+    pub fn dream_pass_with_policy(
+        &mut self,
+        now: f64,
+        policy: &DcmdbPolicy,
+    ) -> Result<MaintenanceReport> {
+        policy.validate()?;
+        if !now.is_finite() {
+            return Err(HeartError::InvalidInput(
+                "DCMDb dream time must be finite".into(),
+            ));
+        }
+        Ok(self.dream_with_policy(now, policy))
+    }
+
+    fn dream_with_policy(&mut self, now: f64, policy: &DcmdbPolicy) -> MaintenanceReport {
         let ids: Vec<_> = self.nodes.keys().copied().collect();
         if ids.len() < 2 || self.config.dream_walks == 0 {
             return MaintenanceReport::default();
@@ -866,13 +1009,13 @@ impl Dcmdb {
             *self.coactivations.entry((left, right)).or_default() += count;
             *self.coactivations.entry((right, left)).or_default() += count;
         }
-        self.refresh_edges();
+        self.refresh_edges(policy);
         for id in &visited_global {
             let node = self.nodes.get_mut(id).expect("visited dream node exists");
             node.tau = (node.tau * (1.0 + self.config.dream_stickiness))
                 .clamp(self.config.tau_min, self.config.tau_max);
         }
-        let merges = self.consolidate_pass();
+        let merges = self.consolidate_with_policy(policy);
         MaintenanceReport {
             merges,
             pruned: 0,
@@ -891,21 +1034,47 @@ impl Dcmdb {
         maximum_rounds: usize,
         protected: &BTreeSet<NodeId>,
     ) -> MaintenanceReport {
+        self.maintain_using_policy(now, maximum_rounds, protected, &DcmdbPolicy::default())
+    }
+
+    pub fn maintain_with_policy(
+        &mut self,
+        now: f64,
+        maximum_rounds: usize,
+        protected: &BTreeSet<NodeId>,
+        policy: &DcmdbPolicy,
+    ) -> Result<MaintenanceReport> {
+        policy.validate()?;
+        if !now.is_finite() {
+            return Err(HeartError::InvalidInput(
+                "DCMDb maintenance time must be finite".into(),
+            ));
+        }
+        Ok(self.maintain_using_policy(now, maximum_rounds, protected, policy))
+    }
+
+    fn maintain_using_policy(
+        &mut self,
+        now: f64,
+        maximum_rounds: usize,
+        protected: &BTreeSet<NodeId>,
+        policy: &DcmdbPolicy,
+    ) -> MaintenanceReport {
         let mut report = MaintenanceReport::default();
         for _ in 0..maximum_rounds {
-            let merged = self.consolidate_pass();
+            let merged = self.consolidate_with_policy(policy);
             report.merges += merged;
             if merged == 0 {
                 break;
             }
         }
         report.pruned = self.prune_pass_protected(now, protected);
-        let dream = self.dream_pass(now);
+        let dream = self.dream_with_policy(now, policy);
         report.merges += dream.merges;
         report.walks_completed = dream.walks_completed;
         report.nodes_reactivated = dream.nodes_reactivated;
         for _ in 0..maximum_rounds {
-            let merged = self.consolidate_pass();
+            let merged = self.consolidate_with_policy(policy);
             report.merges += merged;
             if merged == 0 {
                 break;
@@ -1249,13 +1418,18 @@ impl Dcmdb {
             vector::sigmoid(tension.log_bayes_factor) > self.config.split_probability
         };
         if should_spawn {
-            let spawn_vector = if vector::norm(&tension.sufficient_sum) > self.config.eps {
+            let bayesian = tension.evidence_count >= self.config.minimum_tension_evidence;
+            let spawn_vector = if !bayesian {
+                // The early counter fallback promotes the center between the
+                // parent and atypical input, not the raw first tension sample.
+                tension.center.clone()
+            } else if vector::norm(&tension.sufficient_sum) > self.config.eps {
                 vector::unit(&tension.sufficient_sum, self.config.eps)
             } else {
                 input.to_vec()
             };
             let node = self.nodes.get_mut(&node_id)?;
-            if tension.evidence_count >= self.config.minimum_tension_evidence {
+            if bayesian {
                 for (sum, tension_sum) in
                     node.sufficient_sum.iter_mut().zip(&tension.sufficient_sum)
                 {
@@ -1264,6 +1438,14 @@ impl Dcmdb {
                 node.effective_count =
                     (node.effective_count - tension.effective_count).max(self.config.eps);
                 node.centroid = vector::unit(&node.sufficient_sum, self.config.eps);
+                let mean =
+                    vector::norm(&node.sufficient_sum) / node.effective_count.max(self.config.eps);
+                node.kappa = kappa_from_m(mean, self.config.dimension, self.config.eps);
+                node.confidence = vector::sigmoid(
+                    self.config.concentration_scale * node.kappa - self.config.concentration_bias,
+                ) * (node.effective_count
+                    / self.config.confidence_mass_minimum.max(self.config.eps))
+                .min(1.0);
             }
             node.atypical_count = 0;
             node.tension = None;
@@ -1311,7 +1493,7 @@ impl Dcmdb {
         }
     }
 
-    fn refresh_edges(&mut self) {
+    fn refresh_edges(&mut self, policy: &DcmdbPolicy) {
         let total: f32 = self.visit_counts.values().sum::<f32>() + self.config.pmi_epsilon;
         if total <= 0.0 {
             return;
@@ -1323,7 +1505,25 @@ impl Dcmdb {
                 self.visit_counts.get(right).copied().unwrap_or_default() + self.config.pmi_epsilon;
             let joint = (joint_count + self.config.pmi_epsilon) / total;
             let independent = (left_count / total) * (right_count / total);
-            let ppmi = (joint.max(1e-12) / independent.max(1e-12)).ln().max(0.0);
+            let log_ratio = (joint.max(1e-12) / independent.max(1e-12)).ln();
+            let mut ppmi = match policy.pmi_variant {
+                PmiVariant::Positive => log_ratio.max(0.0),
+                PmiVariant::Normalized => {
+                    (log_ratio / (-joint.max(1e-12).ln()).max(1e-12)).max(0.0)
+                }
+                PmiVariant::Shifted => (log_ratio - policy.pmi_shift).max(0.0),
+            };
+            let significance = match policy.pmi_significance {
+                PmiSignificance::None => None,
+                PmiSignificance::G2 => Some((2.0 * joint_count * log_ratio).max(0.0)),
+                PmiSignificance::ChiSquared => {
+                    let expected = left_count * right_count / total.max(1e-12);
+                    Some((joint_count - expected).powi(2) / expected.max(1e-12))
+                }
+            };
+            if let Some(significance) = significance {
+                ppmi *= 1.0 + significance.powf(policy.significance_power);
+            }
             let previous = self
                 .graph
                 .entry(*left)
@@ -1472,11 +1672,13 @@ fn update_split_bayes_factor(node: &mut MemoryNode, config: &DcmdbConfig) {
 }
 
 pub fn kappa_from_m(mean_resultant: f32, dimension: usize, eps: f32) -> f32 {
-    let mean = mean_resultant.clamp(0.0, 1.0 - 1e-9);
-    if mean <= eps {
+    // The Python cap 1 - 1e-9 rounds to 1 in f32. Evaluate the singular
+    // denominator in f64 so unit-resultant nodes retain the same regularization.
+    let mean = f64::from(mean_resultant).clamp(0.0, 1.0 - 1e-9);
+    if mean <= f64::from(eps) {
         return 0.0;
     }
-    (mean * (dimension as f32 - mean * mean) / (1.0 - mean * mean + eps)).max(0.0)
+    (mean * (dimension as f64 - mean * mean) / (1.0 - mean * mean + f64::from(eps))).max(0.0) as f32
 }
 
 fn log_c_vmf(kappa: f32, dimension: usize) -> f32 {

@@ -21,4 +21,3 @@ tokio.workspace = true
 [dev-dependencies]
 axum.workspace = true
 proptest = "1.9.0"
-tempfile = "3.23.0"

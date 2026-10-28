@@ -3,7 +3,7 @@ use std::{
     error::Error as _,
     sync::{
         OnceLock,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU8, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -55,6 +55,7 @@ pub struct LlamaCppProvider {
     client: reqwest::Client,
     detected_context_tokens: AtomicUsize,
     detected_model: OnceLock<String>,
+    detected_tools: AtomicU8,
 }
 
 impl LlamaCppProvider {
@@ -92,6 +93,7 @@ impl LlamaCppProvider {
         Ok(Self {
             detected_context_tokens: AtomicUsize::new(config.max_context_tokens.unwrap_or(0)),
             detected_model: OnceLock::new(),
+            detected_tools: AtomicU8::new(0),
             config,
             client,
         })
@@ -130,6 +132,32 @@ impl LlamaCppProvider {
         let (props, props_error) = discovery_json(props_response).await;
         let (models, models_error) = discovery_json(models_response).await;
         let discovery_ok = props.is_some() || models.is_some();
+        let selected = models
+            .as_ref()
+            .and_then(|v| v.get("data"))
+            .and_then(Value::as_array)
+            .and_then(|models| {
+                self.config
+                    .model
+                    .as_deref()
+                    .and_then(|id| {
+                        models
+                            .iter()
+                            .find(|m| m.get("id").and_then(Value::as_str) == Some(id))
+                    })
+                    .or_else(|| models.first())
+            });
+        let supports_tools = selected
+            .and_then(advertised_tools)
+            .or_else(|| props.as_ref().and_then(advertised_tools));
+        self.detected_tools.store(
+            match supports_tools {
+                Some(false) => 1,
+                Some(true) => 2,
+                None => 0,
+            },
+            Ordering::Relaxed,
+        );
         if self.config.max_context_tokens.is_none()
             && let Some(tokens) = props
                 .as_ref()
@@ -173,6 +201,22 @@ impl LlamaCppProvider {
     }
 }
 
+fn advertised_tools(value: &Value) -> Option<bool> {
+    value
+        .get("tool_calls")
+        .and_then(Value::as_bool)
+        .or_else(|| {
+            value
+                .pointer("/capabilities/tool_calls")
+                .and_then(Value::as_bool)
+        })
+        .or_else(|| {
+            value
+                .pointer("/capabilities/tools")
+                .and_then(Value::as_bool)
+        })
+}
+
 async fn discovery_json(
     response: std::result::Result<reqwest::Response, reqwest::Error>,
 ) -> (Option<Value>, Option<RuntimeError>) {
@@ -188,7 +232,7 @@ async fn discovery_json(
 
 #[async_trait]
 impl ModelProvider for LlamaCppProvider {
-    async fn complete(&self, request: CompletionRequest) -> Result<ModelTurn> {
+    async fn complete(&self, mut request: CompletionRequest) -> Result<ModelTurn> {
         let temperature = request.temperature.unwrap_or(self.config.temperature);
         if !temperature.is_finite() || temperature < 0.0 {
             return Err(RuntimeError::InvalidConfig(
@@ -218,11 +262,29 @@ impl ModelProvider for LlamaCppProvider {
         let maximum_context_tokens = self.context_tokens();
         let completion_tokens =
             bounded_completion_tokens(self.config.max_tokens, maximum_context_tokens);
-        let reserved_tool_tokens = if allow_tool_calls {
+        let native_tools = self.detected_tools.load(Ordering::Relaxed) != 1;
+        let reserved_tool_tokens = if allow_tool_calls && native_tools {
             estimated_json_tokens(&tools)
         } else {
             0
         };
+        if allow_tool_calls && !native_tools && !tools.is_empty() {
+            let catalogue = format!(
+                "\n[TEXT TOOL INTERFACE] Tools are available through text calls. To execute a tool, emit a JSON object outside any thoughts or examples: {{\"tool\":\"name\",\"args\":{{...}}}}. Call only tools needed now. Available functions and argument schemas:\n{}",
+                serde_json::to_string(&tools)?
+            );
+            if let Some(system) = request
+                .messages
+                .iter_mut()
+                .find(|m| m.role == MessageRole::System)
+            {
+                system.content.push_str(&catalogue);
+            } else {
+                request
+                    .messages
+                    .insert(0, crate::Message::new(MessageRole::System, catalogue));
+            }
+        }
         let prepared = prepare_messages(
             request.messages,
             maximum_context_tokens,
@@ -271,7 +333,8 @@ impl ModelProvider for LlamaCppProvider {
             "messages": messages,
             "temperature": temperature,
             "max_tokens": completion_tokens,
-            "stream": false,
+            "stream": true,
+            "stream_options": {"include_usage": true},
         });
         if let Some(model) = self.model() {
             payload["model"] = json!(model);
@@ -279,21 +342,51 @@ impl ModelProvider for LlamaCppProvider {
         if let Some(reasoning_effort) = &self.config.reasoning_effort {
             payload["reasoning_effort"] = json!(reasoning_effort);
         }
-        if allow_tool_calls && !tools.is_empty() {
+        if allow_tool_calls && native_tools && !tools.is_empty() {
             payload["tools"] = Value::Array(tools);
             payload["tool_choice"] = json!("auto");
         }
 
+        static NEXT_REQUEST: AtomicUsize = AtomicUsize::new(1);
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let conversation_id = format!(
+            "spine-{timestamp}-{}",
+            NEXT_REQUEST.fetch_add(1, Ordering::Relaxed)
+        );
+        let mut cancellation = CancellationGuard {
+            client: self.client.clone(),
+            url: self.endpoint("/v1/stream"),
+            id: conversation_id.clone(),
+            armed: true,
+        };
         let mut attempt = 0_u32;
+        let mut stream_fallback = false;
         let response = loop {
             let response = self
                 .client
                 .post(self.endpoint("/v1/chat/completions"))
+                .header("X-Conversation-Id", &conversation_id)
                 .json(&payload)
                 .send()
                 .await;
             match response {
                 Ok(response) => {
+                    if matches!(response.status().as_u16(), 400 | 422) && !stream_fallback {
+                        let status = response.status();
+                        let body = response.text().await.map_err(provider_error)?;
+                        if body.to_ascii_lowercase().contains("stream") {
+                            payload["stream"] = json!(false);
+                            payload.as_object_mut().unwrap().remove("stream_options");
+                            stream_fallback = true;
+                            continue;
+                        }
+                        cancellation.armed = false;
+                        let body: String = body.chars().take(2000).collect();
+                        return Err(RuntimeError::Provider(format!("HTTP {status}: {body}")));
+                    }
                     if response.status().is_success()
                         || !retryable_status(response.status())
                         || attempt >= self.config.maximum_retries
@@ -311,9 +404,22 @@ impl ModelProvider for LlamaCppProvider {
             attempt = attempt.saturating_add(1);
         };
         if !response.status().is_success() {
+            cancellation.armed = false;
             return Err(http_error(response).await);
         }
-        let response: ChatResponse = response.json().await.map_err(provider_error)?;
+        let response: ChatResponse = if response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("text/event-stream"))
+        {
+            serde_json::from_value(
+                crate::streaming::read_response(response, request.progress.as_ref()).await?,
+            )?
+        } else {
+            response.json().await.map_err(provider_error)?
+        };
+        cancellation.armed = false;
         let message = response
             .choices
             .into_iter()
@@ -339,11 +445,13 @@ impl ModelProvider for LlamaCppProvider {
                 name: call.function.name,
                 arguments,
             };
-            if seen_calls.insert((call.name.clone(), call.arguments.to_string())) {
-                tool_calls.push(call);
-            }
+            seen_calls.insert((call.name.clone(), call.arguments.to_string()));
+            tool_calls.push(call);
         }
-        let mut content = message.content.unwrap_or_default();
+        let (mut content, reasoning) = crate::streaming::separate_thoughts(
+            &message.content.unwrap_or_default(),
+            message.reasoning_content.as_deref(),
+        );
         if allow_tool_calls {
             let (cleaned, fallback_calls) =
                 parse_text_tool_calls(&content, &allowed_tool_names, tool_calls.len());
@@ -356,7 +464,7 @@ impl ModelProvider for LlamaCppProvider {
         }
         Ok(ModelTurn {
             content,
-            reasoning: message.reasoning_content,
+            reasoning,
             tool_calls,
             usage: TokenUsage {
                 prompt: response.usage.prompt_tokens,
@@ -591,6 +699,47 @@ fn estimated_json_tokens(values: &[Value]) -> usize {
         .unwrap_or(0)
 }
 
+struct CancellationGuard {
+    client: reqwest::Client,
+    url: String,
+    id: String,
+    armed: bool,
+}
+
+impl Drop for CancellationGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let client = self.client.clone();
+        let url = self.url.clone();
+        let id = self.id.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                // A scoped request ID prevents cancellation of another child/model request.
+                for delay in [0, 250, 750] {
+                    if delay > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                    if let Ok(response) = client
+                        .delete(&url)
+                        .query(&[("conv_id", &id)])
+                        .timeout(Duration::from_secs(2))
+                        .send()
+                        .await
+                        && response.status().is_success()
+                    {
+                        return;
+                    }
+                }
+                eprintln!(
+                    "[remote model cancellation was requested but not confirmed by the endpoint]"
+                );
+            });
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct ChatResponse {
     #[serde(default)]
@@ -644,6 +793,163 @@ mod tests {
         extract::State,
         routing::{get, post},
     };
+
+    #[tokio::test]
+    async fn streaming_thoughts_and_calls_are_ordered_and_scoped_cancel_reaches_server() {
+        use axum::{
+            body::Body,
+            extract::Query,
+            http::{HeaderMap, Response},
+            routing::delete,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let ids = Arc::new(Mutex::new(Vec::<String>::new()));
+        let post_ids = ids.clone();
+        let delete_ids = ids.clone();
+        let app = Router::new().route("/v1/chat/completions", post(move |headers: HeaderMap, Json(body): Json<Value>| {
+            let ids=post_ids.clone();
+            async move {
+                assert_eq!(body["stream"],true);
+                ids.lock().unwrap().push(headers["x-conversation-id"].to_str().unwrap().into());
+                if body["messages"][0]["content"] == "hang" {
+                    std::future::pending::<()>().await;
+                }
+                let events = [
+                    json!({"choices":[{"delta":{"content":"<think>private 🦀 example {\"tool\":\"shell\"}</think>"}}]}),
+                    json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"file_read","arguments":"{\"path\":"}}]}}]}),
+                    json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"note.txt\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"completion_tokens":8}})
+                ];
+                let wire=events.iter().map(|v|format!("data: {v}\r\n\r\n")).collect::<String>()+"data: [DONE]\r\n\r\n";
+                Response::builder().header("content-type","text/event-stream").body(Body::from(wire)).unwrap()
+            }
+        })).route("/v1/stream",delete(move |Query(params):Query<std::collections::HashMap<String,String>>| {
+            let ids=delete_ids.clone(); async move {ids.lock().unwrap().push(format!("DELETE:{}",params["conv_id"]));"ok"}
+        }));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let provider =
+            LlamaCppProvider::new(LlamaCppConfig::new(format!("http://{address}"))).unwrap();
+        let request = |text: &str| CompletionRequest {
+            progress: None,
+            messages: vec![Message::new(MessageRole::User, text)],
+            tools: vec![],
+            allow_tool_calls: true,
+            temperature: None,
+        };
+        let turn = provider.complete(request("stream")).await.unwrap();
+        assert!(turn.content.is_empty());
+        assert_eq!(
+            turn.reasoning.as_deref(),
+            Some("private 🦀 example {\"tool\":\"shell\"}")
+        );
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].arguments, json!({"path":"note.txt"}));
+        assert_eq!(turn.usage.completion, 8);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(150),
+                provider.complete(request("hang"))
+            )
+            .await
+            .is_err()
+        );
+        for _ in 0..50 {
+            if ids.lock().unwrap().len() == 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let ids = ids.lock().unwrap();
+        assert_eq!(ids.len(), 3, "{ids:?}");
+        assert_ne!(ids[0], ids[1]);
+        assert_eq!(ids[2], format!("DELETE:{}", ids[1]));
+        server.abort();
+    }
+    #[tokio::test]
+    async fn distinct_native_calls_with_equal_arguments_survive_parsing() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route("/v1/chat/completions", post(|| async {
+            Json(json!({"choices":[{"message":{"content":"", "tool_calls":[
+                {"id":"first", "type":"function", "function":{"name":"file_read","arguments":"{\"path\":\"a\"}"}},
+                {"id":"second", "type":"function", "function":{"name":"file_read","arguments":"{\"path\":\"a\"}"}}
+            ]}}]}))
+        }));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let provider =
+            LlamaCppProvider::new(LlamaCppConfig::new(format!("http://{address}"))).unwrap();
+        let turn = provider
+            .complete(CompletionRequest {
+                progress: None,
+                messages: vec![Message::new(MessageRole::User, "read twice")],
+                tools: vec![],
+                allow_tool_calls: true,
+                temperature: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(turn.tool_calls.len(), 2);
+        assert_eq!(turn.tool_calls[0].id, "first");
+        assert_eq!(turn.tool_calls[1].id, "second");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn advertised_text_tools_and_stream_rejection_keep_tools_available() {
+        use axum::http::StatusCode;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let recorded = requests.clone();
+        let app = Router::new()
+            .route("/v1/models", get(|| async { Json(json!({"data":[{"id":"text-model","capabilities":{"tool_calls":false}}]})) }))
+            .route("/v1/chat/completions", post(move |Json(body): Json<Value>| {
+                let recorded = recorded.clone();
+                async move {
+                    recorded.lock().unwrap().push(body.clone());
+                    if body["stream"] == true {
+                        return (StatusCode::BAD_REQUEST, Json(json!({"error":"stream unsupported"})));
+                    }
+                    (StatusCode::OK, Json(json!({"choices":[{"message":{"content":"<think>Example {\"tool\":\"file_read\",\"args\":{\"path\":\"wrong\"}}</think>{\"tool\":\"file_read\",\"args\":{\"path\":\"note.txt\"}}"}}]})))
+                }
+            }));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let provider =
+            LlamaCppProvider::new(LlamaCppConfig::new(format!("http://{address}"))).unwrap();
+        provider.health().await.unwrap();
+        let turn = provider
+            .complete(CompletionRequest {
+                progress: None,
+                messages: vec![Message::new(MessageRole::User, "read")],
+                tools: vec![ToolSpec {
+                    name: "file_read".into(),
+                    description: "Read a file".into(),
+                    category: ToolCategory::Internal,
+                    risk: ToolRisk::ReadOnly,
+                    parameters: json!({"type":"object","properties":{"path":{"type":"string"}}}),
+                }],
+                allow_tool_calls: true,
+                temperature: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].arguments["path"], "note.txt");
+        assert!(turn.content.is_empty());
+        assert!(turn.reasoning.unwrap().contains("wrong"));
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|r| {
+            r.get("tools").is_none()
+                && r["messages"][0]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("TEXT TOOL INTERFACE")
+        }));
+        assert_eq!(requests[1]["stream"], false);
+        assert!(requests[1].get("stream_options").is_none());
+        server.abort();
+    }
 
     async fn capture_completion_request(
         State(requests): State<Arc<Mutex<Vec<Value>>>>,
@@ -813,6 +1119,7 @@ mod tests {
     async fn request_serializes_tool_arguments_as_json_strings_and_omits_default_reasoning() {
         let request = send_and_capture(
             CompletionRequest {
+                progress: None,
                 messages: vec![
                     Message::new(MessageRole::System, "system"),
                     Message::new(MessageRole::User, "read the file"),
@@ -885,6 +1192,7 @@ mod tests {
     async fn request_includes_reasoning_effort_only_when_explicitly_configured() {
         let request = send_and_capture(
             CompletionRequest {
+                progress: None,
                 messages: vec![Message::new(MessageRole::User, "hello")],
                 tools: Vec::new(),
                 allow_tool_calls: false,
@@ -957,6 +1265,7 @@ mod tests {
 
         let turn = provider
             .complete(CompletionRequest {
+                progress: None,
                 messages: vec![Message::new(MessageRole::User, "hello")],
                 tools: Vec::new(),
                 allow_tool_calls: false,

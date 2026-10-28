@@ -234,6 +234,7 @@ mod tests {
                 provider.health().await?;
                 provider
                     .complete(CompletionRequest {
+                        progress: None,
                         messages: vec![Message::new(MessageRole::User, "hello")],
                         tools: Vec::new(),
                         allow_tool_calls: false,

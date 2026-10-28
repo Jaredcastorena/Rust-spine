@@ -54,7 +54,15 @@ no synthetic triangle scaffold or periodic three-to-one folding, no Python
 production dependency, and no legacy Python state import requirement. New device
 revocation and smaller-model selection remain separate projects.
 
-## Acceptance evidence
+## Current desktop audit
+
+The [desktop audit](docs/desktop-parity-audit.md) supersedes the historical
+acceptance counts below: 253 Rust tests and 257 isolated Python tests pass.
+It restores optional DCMDb policies/diagnostics, checks all Thymos modes against
+Python fixtures, and closes affect recall, context, child reporting, streaming
+and interrupted-tool durability gaps. Saved-heart compatibility is preserved.
+
+## Historical acceptance evidence
 
 The reviewed correction passes 206 Rust workspace tests and all 149 Python
 oracle regression tests from an isolated source-only copy. Independent review
@@ -69,6 +77,6 @@ unmaintained `paste` warning. A release-CLI acceptance run with genuine MiniLM a
 a local scripted provider verifies two native tool rounds, JSON-string arguments,
 applied temperature, optional reasoning omission, and incognito cleanup.
 
-PR #16 contains the current integrated changes. Its checks are the authoritative
+PR #16 contained the earlier integrated corrections. Its checks are the authoritative
 remote acceptance status. No merge or production rollout is implied by this
 checklist; the intentional architecture boundaries above remain in force.

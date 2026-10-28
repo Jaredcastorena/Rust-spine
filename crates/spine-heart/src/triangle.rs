@@ -120,6 +120,62 @@ pub struct RehydratedContext {
 }
 
 impl ContextForest {
+    /// Select existing verified roots by relevance, retained goal, tension and diversity.
+    /// This never changes compaction geometry or manufactures ancestry nodes.
+    pub fn ranked_roots(
+        &self,
+        dcmdb: &Dcmdb,
+        query: &Embedding,
+        goal: Option<&Embedding>,
+        limit: usize,
+    ) -> Result<Vec<ContextBranch>> {
+        self.verify(dcmdb)?;
+        crate::vector::validate_dimension(query.as_slice(), dcmdb.config.dimension)?;
+        if let Some(goal) = goal {
+            crate::vector::validate_dimension(goal.as_slice(), dcmdb.config.dimension)?;
+        }
+        let latest = self
+            .roots
+            .iter()
+            .map(|r| r.chronology_end)
+            .max()
+            .unwrap_or(1)
+            .max(1) as f32;
+        let mut candidates = Vec::new();
+        for root in &self.roots {
+            let node_id = match root.handle {
+                ContextHandle::Node(id) => id,
+                ContextHandle::Triangle(id) => self.triangles[&id].apex,
+            };
+            if let Some(node) = dcmdb.node(node_id) {
+                let score = 0.7 * crate::vector::dot(&node.centroid, query.as_slice())
+                    + goal.map_or(0.0, |g| {
+                        0.25 * crate::vector::dot(&node.centroid, g.as_slice())
+                    })
+                    + if node.tension.is_some() { 0.1 } else { 0.0 }
+                    + 0.001 * root.chronology_end as f32 / latest;
+                candidates.push((*root, node.centroid.clone(), score));
+            }
+        }
+        let mut selected: Vec<(ContextBranch, Vec<f32>)> = Vec::new();
+        while selected.len() < limit && !candidates.is_empty() {
+            let score = |candidate: &(ContextBranch, Vec<f32>, f32)| {
+                candidate.2
+                    - 0.2
+                        * selected
+                            .iter()
+                            .map(|(_, v)| crate::vector::dot(v, &candidate.1).max(0.0))
+                            .fold(0.0, f32::max)
+            };
+            let index = (0..candidates.len())
+                .max_by(|a, b| score(&candidates[*a]).total_cmp(&score(&candidates[*b])))
+                .unwrap();
+            let (root, vector, _) = candidates.remove(index);
+            selected.push((root, vector));
+        }
+        Ok(selected.into_iter().map(|(root, _)| root).collect())
+    }
+
     pub fn with_config(config: TriangleConfig) -> Result<Self> {
         if !config.minimum_coherence.is_finite()
             || !(-1.0..=1.0).contains(&config.minimum_coherence)

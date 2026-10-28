@@ -13,7 +13,7 @@ model service once, and choose a heart passphrase.
 
 Spine connects to an existing OpenAI-compatible chat model service. It installs
 its small memory model, MiniLM, automatically when needed. MiniLM is not the chat
-model. The optional NLI answer checker can be configured later.
+model. The NLI answer checker is also installed automatically; `--no-nli` disables it.
 
 ### 1. Install Spine
 
@@ -98,7 +98,7 @@ Model server URL [http://127.0.0.1:8080]:
 
 Press Enter for that address, or paste your server URL including its port.
 Spine checks the connection (with a 20-second deadline), discovers the model and
-context size when advertised, then downloads about **91 MB** of MiniLM assets
+context size when advertised, then downloads about **91 MB** of MiniLM assets and **330 MB** for the NLI answer checker
 from Hugging Face if they are not already available. Downloads use a pinned
 revision and SHA-256 checks, show progress, and reuse completed files on retry.
 No model download prompt or manual file placement is needed.
@@ -116,7 +116,7 @@ a separate, unencrypted `*.action-audit.jsonl` file, so treat that file as
 sensitive.
 
 Model weights stay outside Spine. Historical size measurements are available below; they predate v0.3.0 and its
-updated dependencies. MiniLM is about 91 MB; your chat model is additional. See
+updated dependencies. MiniLM is about 91 MB and NLI about 330 MB; your chat model is additional. See
 [Honest size numbers](#honest-size-numbers) for the full measurements.
 
 ### Next launches and saved settings
@@ -143,7 +143,8 @@ spine chat --web                         # Remember browser mode
 spine chat --terminal                    # Switch back to terminal mode
 spine chat --workspace "/path/to/project"
 spine chat --skip-onboarding             # Go straight to chat
-spine chat --no-download                 # Never download MiniLM
+spine chat --no-download                 # Never download local models
+spine chat --no-nli                      # Disable answer checking
 spine chat --no-settings                 # Ignore saved settings and do not save
 ```
 
@@ -163,7 +164,8 @@ environment on each launch. Incognito, managed llama.cpp, and `--no-settings`
 runs neither read nor write this file. Other chat tuning flags remain per-run.
 
 MiniLM is stored under the platform's Spine app-data directory in
-`models/all-MiniLM-L6-v2/<revision>/`, separate from the executable and heart.
+`models/all-MiniLM-L6-v2/<revision>/`; NLI uses
+`models/nli-MiniLM2-L6-H768/<revision>/`. Both are separate from the executable and heart.
 Explicit `--model-dir`/`SPINE_MINILM_DIR` and existing Hugging Face cache snapshots
 are reused. An invalid explicit path produces an error instead of silently
 replacing your model. Missing or damaged files in Spine's managed model directory
@@ -515,7 +517,7 @@ command-line names for each setting.
 | `SPINE_HEART_PATH` | positional `HEART` argument | Location of the encrypted heart. |
 | `SPINE_HEART_PASSPHRASE` | `--passphrase` | Heart passphrase. Let Spine prompt when practical. |
 | `SPINE_MINILM_DIR` | `--model-dir` | Location of the required MiniLM snapshot. |
-| `SPINE_NLI_DIR` | `--nli-model-dir` | Location of the optional NLI snapshot. |
+| `SPINE_NLI_DIR` | `--nli-model-dir` | Override the automatically installed NLI snapshot. |
 | `SPINE_LLM_URL` | `--server-url` | Base URL or full chat-completions endpoint; skips endpoint/port prompts. |
 | `SPINE_LLM_MODEL` | `--server-model` | Model name, when the server cannot report it. |
 | `SPINE_LLM_API_KEY` | `--api-key` (hidden; environment preferred) | Model-server credential, when one is required. |
@@ -571,9 +573,15 @@ may support 262,144 tokens but report only 4,096 when the server allocated a 4K
 context. Onboarding fits at 4K, but 16K or more is a practical starting point
 for normal tool use.
 
-### Enable the optional answer checker
+### Answer checker and offline installation
 
-Outside the `Rust-spine` checkout, create a folder named
+Normal chat installs and enables the NLI answer checker automatically.
+Use `--no-nli` to disable it, or supply an existing snapshot with
+`--nli-model-dir`/`SPINE_NLI_DIR`. `--no-download` prevents all model downloads
+and requires local assets for enabled models. This default applies to the
+current source; v0.3.1 release binaries require the manual NLI setup below.
+
+For offline installation, outside the `Rust-spine` checkout, create a folder named
 `nli-MiniLM2-L6-H768`, then download
 [`config.json`](https://huggingface.co/cross-encoder/nli-MiniLM2-L6-H768/resolve/b95119ce93d3e065de6214e38cd4a97b0f2f2c6d/config.json?download=true),
 [`tokenizer.json`](https://huggingface.co/cross-encoder/nli-MiniLM2-L6-H768/resolve/b95119ce93d3e065de6214e38cd4a97b0f2f2c6d/tokenizer.json?download=true),
