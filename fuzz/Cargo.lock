@@ -643,7 +643,7 @@ checksum = "28d567dcbaf0049cb8ac2608a76cd95ff9e4412e1899d389ee400918ca7537f5"
 
 [[package]]
 name = "spine-heart"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "argon2",
  "bip39",

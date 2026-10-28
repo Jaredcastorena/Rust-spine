@@ -1,11 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.3.2 — 2026-10-28
 
 - Bound safe-stop summaries and streamed-response memory, recover failed-child
   results immediately, reject malformed recovery records, and prevent consumed
   checkpoints from resurfacing as cached obligations. Extend whole-workspace
-  PR tests to Windows, both macOS architectures and ARM Linux.
+  PR tests to Windows, both macOS architectures and ARM Linux. Release packages
+  must pass the complete workspace tests on every target before publication.
 
 - Restore optional DCMDb source/PMI/merge policies, presets, tuning and inspection;
   correct concentration and split-promotion differences found with Python fixtures.
