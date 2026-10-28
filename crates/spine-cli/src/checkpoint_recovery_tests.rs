@@ -228,3 +228,29 @@ fn consumption_of_another_exact_id_does_not_consume_the_selected_checkpoint() {
         .unwrap()
     );
 }
+
+#[test]
+fn consumed_checkpoint_cannot_reappear_as_a_retained_obligation() {
+    let (_temp, heart, encoder, checkpoint) = setup();
+    let agent = AgentId::new("main").unwrap();
+    let thread = ThreadId::new("test").unwrap();
+    heart.set_local_state("context/test", Some(br#"{"schema":1,"goal":"obsolete task","plan":null,"obligations":["obsolete task"],"working_evidence":[],"evidence_records":[],"trajectory":null,"tensions":[],"dormant_handles":[]}"#)).unwrap();
+    mark_checkpoint_consumed(
+        &heart,
+        &encoder,
+        &agent,
+        &thread,
+        checkpoint.as_ref().unwrap(),
+    )
+    .unwrap();
+    let context = crate::context_state::rehydrate(
+        &heart,
+        &encoder,
+        &thread,
+        &encoder.encode("new task").unwrap(),
+    )
+    .unwrap();
+    let context: serde_json::Value = serde_json::from_str(&context).unwrap();
+    assert_eq!(context["open_obligations"], serde_json::json!([]));
+    assert!(context["host_plan"].is_null());
+}

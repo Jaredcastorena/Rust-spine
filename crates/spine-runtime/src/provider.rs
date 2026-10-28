@@ -72,7 +72,7 @@ pub struct ModelProgress {
 
 #[derive(Clone, Debug)]
 pub struct CompletionRequest {
-    pub progress: Option<tokio::sync::mpsc::UnboundedSender<ModelProgress>>,
+    pub progress: Option<tokio::sync::watch::Sender<ModelProgress>>,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSpec>,
     pub allow_tool_calls: bool,

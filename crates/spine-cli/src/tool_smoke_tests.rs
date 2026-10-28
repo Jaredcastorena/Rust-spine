@@ -1380,3 +1380,80 @@ async fn retained_open_goal_and_evidence_survive_cold_reopen() {
     drop(heart);
     drop(_directory);
 }
+
+#[tokio::test]
+async fn failed_child_recovers_completed_tools_without_restarting_the_parent() {
+    let fixture = fixture(true, false);
+    let provider = Arc::new(ScriptedProvider {
+        turns: Mutex::new(VecDeque::from([ModelTurn {
+            tool_calls: vec![ToolCall {
+                id: "read".into(),
+                name: "check_in".into(),
+                arguments: json!({"message":"durable evidence before failure"}),
+            }],
+            ..Default::default()
+        }])),
+    });
+    let mut registry = ToolRegistry::default();
+    agent_tools::register_subagent_tools(
+        &mut registry,
+        provider,
+        ToolRegistry::default(),
+        3,
+        2,
+        Some(agent_tools::AgentMemory {
+            heart: fixture.heart.clone(),
+            encoder: Arc::new(TinyEncoder::new()),
+        }),
+    )
+    .unwrap();
+    assert!(
+        execute(&registry, "delegate", json!({"task":"inspect evidence"}))
+            .await
+            .success
+    );
+    let mut reports = String::new();
+    for _ in 0..200 {
+        reports.push_str(&execute(&registry, "check_results", json!({})).await.output);
+        if reports.contains("FINAL ERROR") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(reports.contains("FINAL ERROR"), "{reports}");
+    assert!(
+        fixture
+            .heart
+            .events_canonical()
+            .unwrap()
+            .iter()
+            .any(|e| e.body.interaction.kind == EventKind::ToolResult),
+        "completed child results must already be canonical"
+    );
+    assert!(fixture.heart.local_states("harness/").unwrap().is_empty());
+}
+
+#[test]
+fn malformed_finished_journal_is_retained_without_panicking_during_cleanup() {
+    let fixture = fixture(false, false);
+    let bytes = serde_json::to_vec(&json!({"schema":1,"agent":"main","thread":"test","progress":{
+        "run_id":"bad-offset","start_offset":9,"messages":[],"pending_task":"work","host_plan":null,"policy":{},
+        "completed_tool_calls":0,"completed_tool_rounds":0,"completed_action_calls":0,"finished":true,"stopped":false
+    }})).unwrap();
+    fixture
+        .heart
+        .set_local_state("harness/bad-offset", Some(&bytes))
+        .unwrap();
+    let result = crate::transcript::persist(
+        &fixture.heart,
+        &TinyEncoder::new(),
+        &AgentId::new("main").unwrap(),
+        &ThreadId::new("test").unwrap(),
+        &[],
+    );
+    assert!(result.is_err());
+    assert_eq!(
+        fixture.heart.local_states("harness/").unwrap()["harness/bad-offset"],
+        bytes
+    );
+}

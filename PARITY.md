@@ -57,7 +57,7 @@ revocation and smaller-model selection remain separate projects.
 ## Current desktop audit
 
 The [desktop audit](docs/desktop-parity-audit.md) supersedes the historical
-acceptance counts below: 253 Rust tests and 257 isolated Python tests pass.
+acceptance counts below: 261 Rust tests and 257 isolated Python tests pass.
 It restores optional DCMDb policies/diagnostics, checks all Thymos modes against
 Python fixtures, and closes affect recall, context, child reporting, streaming
 and interrupted-tool durability gaps. Saved-heart compatibility is preserved.
