@@ -1,6 +1,6 @@
 # Project state
 
-## Unreleased desktop audit
+## v0.3.2 desktop audit
 
 - [Behavior map and acceptance](docs/desktop-parity-audit.md): 261 Rust tests,
   257 isolated Python tests, real MiniLM/NLI inference, desktop setup/browser
@@ -11,9 +11,12 @@
   streamed responses and encrypted interrupted-tool recovery are integrated.
 - Chat automatically installs the NLI answer checker, preserving explicit local
   paths, offline mode and `--no-nli`. Existing desktop action/round policies remain.
-- Separate Android and Codex-provider work is untouched. No release tag yet.
+- Full workspace CI passes on x86/ARM Linux, Intel/Apple Silicon macOS, and
+  Windows: 261 Unix tests and 258 applicable Windows tests. Release packaging
+  checks every workspace component before publishing archives.
+- Separate Android and Codex-provider work is untouched.
 
-## Released baseline
+## Inherited v0.3.1 baseline
 
 - v0.3.1 includes first-run setup, the outstanding budget-aware file-pagination
   fix, stable dependency updates, Rust 1.99.1, and refreshed pinned CI/container images.

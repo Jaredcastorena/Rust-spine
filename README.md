@@ -7,7 +7,7 @@ Python, Node.js, npm, or separate web server to install.
 
 ## First-time setup
 
-Spine v0.3.1 includes automatic memory-model setup and remembers successful
+Spine v0.3.2 includes automatic memory-model setup and remembers successful
 launch settings. Download the package for your platform, open Spine, connect your
 model service once, and choose a heart passphrase.
 
@@ -578,8 +578,8 @@ for normal tool use.
 Normal chat installs and enables the NLI answer checker automatically.
 Use `--no-nli` to disable it, or supply an existing snapshot with
 `--nli-model-dir`/`SPINE_NLI_DIR`. `--no-download` prevents all model downloads
-and requires local assets for enabled models. This default applies to the
-current source; v0.3.1 release binaries require the manual NLI setup below.
+and requires local assets for enabled models. Automatic NLI installation is available
+starting with v0.3.2; older releases require the manual setup below.
 
 For offline installation, outside the `Rust-spine` checkout, create a folder named
 `nli-MiniLM2-L6-H768`, then download
