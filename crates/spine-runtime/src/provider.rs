@@ -13,6 +13,9 @@ pub enum MessageRole {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Message {
+    /// Host-owned durable transcript identity; never sent to the model endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_id: Option<String>,
     pub role: MessageRole,
     pub content: String,
     pub tool_call_id: Option<String>,
@@ -25,6 +28,7 @@ pub struct Message {
 impl Message {
     pub fn new(role: MessageRole, content: impl Into<String>) -> Self {
         Self {
+            record_id: None,
             role,
             content: content.into(),
             tool_call_id: None,
@@ -39,6 +43,7 @@ impl Message {
         tool_calls: Vec<ToolCall>,
     ) -> Self {
         Self {
+            record_id: None,
             role: MessageRole::Assistant,
             content: content.into(),
             tool_call_id: None,
@@ -49,6 +54,7 @@ impl Message {
 
     pub fn tool(call_id: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
+            record_id: None,
             role: MessageRole::Tool,
             content: content.into(),
             tool_call_id: Some(call_id.into()),
@@ -58,8 +64,15 @@ impl Message {
     }
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ModelProgress {
+    pub content: String,
+    pub reasoning: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct CompletionRequest {
+    pub progress: Option<tokio::sync::mpsc::UnboundedSender<ModelProgress>>,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSpec>,
     pub allow_tool_calls: bool,

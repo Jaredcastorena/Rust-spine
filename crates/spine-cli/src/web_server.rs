@@ -49,6 +49,8 @@ pub struct WebSnapshot {
     messages: Vec<WebMessage>,
     tools: Vec<WebTool>,
     notice: Option<String>,
+    streaming_content: String,
+    streaming_reasoning: Option<String>,
 }
 
 #[derive(Clone)]
@@ -86,6 +88,12 @@ impl WebUi {
             .write()
             .expect("web state poisoned")
             .checkpoint_available = available;
+    }
+
+    pub fn stream_progress(&self, progress: &spine_runtime::ModelProgress) {
+        let mut state = self.state.write().expect("web state poisoned");
+        state.streaming_content = progress.content.clone();
+        state.streaming_reasoning = progress.reasoning.clone();
     }
 
     pub fn activity(&self, text: &str) {
@@ -150,6 +158,8 @@ impl WebUi {
                 content: response.into(),
             });
         }
+        state.streaming_content.clear();
+        state.streaming_reasoning = None;
         state.busy = false;
         state.phase = if stopped { "stopped" } else { "idle" }.into();
         state.activity = if stopped { "Stopped safely" } else { "Ready" }.into();
@@ -163,6 +173,8 @@ impl WebUi {
 
     pub fn fail(&self, message: &str) {
         let mut state = self.state.write().expect("web state poisoned");
+        state.streaming_content.clear();
+        state.streaming_reasoning = None;
         state.busy = false;
         state.phase = "error".into();
         state.activity = "Turn failed".into();
@@ -203,6 +215,8 @@ impl WebUi {
                 content: response.into(),
             });
         }
+        state.streaming_content.clear();
+        state.streaming_reasoning = None;
         state.busy = false;
         state.phase = if complete { "idle" } else { "onboarding" }.into();
         state.activity = if complete {
@@ -220,6 +234,8 @@ impl WebUi {
 
     pub fn pause_onboarding(&self, message: &str) {
         let mut state = self.state.write().expect("web state poisoned");
+        state.streaming_content.clear();
+        state.streaming_reasoning = None;
         state.busy = false;
         state.phase = "idle".into();
         state.activity = "Ready".into();
@@ -299,6 +315,8 @@ pub async fn start(
             messages: Vec::new(),
             tools: Vec::new(),
             notice: None,
+            streaming_content: String::new(),
+            streaming_reasoning: None,
         })),
     };
     let app_state = AppState {
@@ -692,6 +710,56 @@ mod tests {
             .trim_end_matches('/');
         let token = server.access_url.split('#').nth(1).unwrap();
         let client = reqwest::Client::new();
+
+        server.ui().stream_progress(&spine_runtime::ModelProgress {
+            content: "partial".into(),
+            reasoning: Some("checking".into()),
+        });
+        assert_eq!(
+            server.ui().state.read().unwrap().streaming_content,
+            "partial"
+        );
+        assert_eq!(
+            server
+                .ui()
+                .state
+                .read()
+                .unwrap()
+                .streaming_reasoning
+                .as_deref(),
+            Some("checking")
+        );
+        server.ui().complete("final", false, false);
+        assert!(
+            server
+                .ui()
+                .state
+                .read()
+                .unwrap()
+                .streaming_content
+                .is_empty()
+        );
+        assert!(
+            server
+                .ui()
+                .state
+                .read()
+                .unwrap()
+                .streaming_reasoning
+                .is_none()
+        );
+        assert_eq!(
+            server
+                .ui()
+                .state
+                .read()
+                .unwrap()
+                .messages
+                .last()
+                .unwrap()
+                .content,
+            "final"
+        );
 
         for command in ["/circuit", "/reset llm", "ordinary next turn"] {
             let response = client

@@ -139,6 +139,9 @@ impl CognitiveState {
         metadata.insert("agent_id".into(), interaction.agent_id.to_string());
         metadata.insert("thread_id".into(), interaction.thread_id.to_string());
         metadata.insert("role".into(), format!("{:?}", interaction.role));
+        if let Some(affinity) = interaction.provenance.metadata.get("affect_affinity") {
+            metadata.insert("affect_affinity".into(), affinity.clone());
+        }
         let time = event.body.timestamp.wall_millis as f64 / 1_000.0;
         let node_id = self.dcmdb.update(MemoryObservation {
             event_id: event.id,
@@ -280,7 +283,10 @@ impl CognitiveState {
 fn extract_event_facts(event: &SignedEvent) -> Result<Vec<FactCandidate>> {
     let interaction = &event.body.interaction;
     if interaction.role != ParticipantRole::User
-        || interaction.provenance.provider.as_deref() == Some("spine-document-ingest")
+        || matches!(
+            interaction.provenance.provider.as_deref(),
+            Some("spine-document-ingest" | "spine-subagent-task")
+        )
         || interaction
             .provenance
             .metadata

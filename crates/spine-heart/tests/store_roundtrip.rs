@@ -184,3 +184,33 @@ fn two_offline_writers_converge() {
     assert_eq!(first_ids, second_ids);
     assert_eq!(first.stats().unwrap(), second.stats().unwrap());
 }
+
+#[test]
+fn local_recovery_state_is_encrypted_durable_and_not_a_canonical_event() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("journal.spine");
+    let created = SpineHeart::create(HeartConfig::new(&path), "journal-passphrase").unwrap();
+    let plaintext = b"PRIVATE_TOOL_RESULT_DO_NOT_LEAK_24";
+    created
+        .heart
+        .set_local_state("harness/test", Some(plaintext))
+        .unwrap();
+    assert_eq!(created.heart.stats().unwrap().events, 0);
+    drop(created);
+    let raw = std::fs::read(&path).unwrap();
+    assert!(
+        !raw.windows(plaintext.len())
+            .any(|window| window == plaintext)
+    );
+    let reopened = SpineHeart::open(
+        HeartConfig::new(&path),
+        KeySource::Passphrase("journal-passphrase".into()),
+    )
+    .unwrap();
+    assert_eq!(
+        reopened.local_states("harness/").unwrap()["harness/test"],
+        plaintext
+    );
+    reopened.set_local_state("harness/test", None).unwrap();
+    assert!(reopened.local_states("harness/").unwrap().is_empty());
+}

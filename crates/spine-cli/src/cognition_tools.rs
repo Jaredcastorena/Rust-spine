@@ -227,12 +227,17 @@ pub fn automatic_recall_context(
         top_k.clamp(1, 16),
         Some(excluded_event),
         Some(expansion_depth.min(3)),
+        heart
+            .event(excluded_event)?
+            .map(|e| e.body.interaction.agent_id)
+            .as_ref(),
     )
 }
 
-pub fn rehydrate_triangle_context(
+pub fn rehydrate_triangle_context_for_goal(
     heart: &SpineHeart,
     query: &Embedding,
+    goal: Option<&Embedding>,
 ) -> spine_runtime::Result<String> {
     let Some(state) = heart.cognition()? else {
         return Ok("[]".into());
@@ -244,14 +249,14 @@ pub fn rehydrate_triangle_context(
         .collect();
     let mut seen_nodes = BTreeSet::new();
     let mut result = Vec::new();
-    for root in state.triangles.roots.iter().rev().take(3) {
+    for root in state.triangles.ranked_roots(&state.dcmdb, query, goal, 3)? {
         let rehydrated = heart.rehydrate_context(
             root.handle,
             Some(query),
             RehydrateBudget {
-                max_depth: 2,
+                max_depth: 8,
                 max_fanout: 3,
-                max_nodes: 8,
+                max_nodes: 16,
                 max_tokens: 1_024,
             },
         )?;
@@ -275,7 +280,7 @@ pub fn rehydrate_triangle_context(
                         "text": bounded_text(text, 1_000),
                     }));
                 }
-                if result.len() >= 6 {
+                if result.len() >= 12 {
                     return Ok(serde_json::to_string(&result)?);
                 }
             }
@@ -389,7 +394,7 @@ impl Tool for MemoryRecallTool {
     async fn execute(
         &self,
         call: &ToolCall,
-        _context: &ToolContext,
+        context: &ToolContext,
     ) -> spine_runtime::Result<ToolResult> {
         let Some(query) = call.arguments.get("query").and_then(|value| value.as_str()) else {
             return Ok(ToolResult::failure(format!(
@@ -403,25 +408,22 @@ impl Tool for MemoryRecallTool {
             .and_then(|value| value.as_u64())
             .unwrap_or(5)
             .clamp(1, 16) as usize;
-        Ok(ToolResult::success(hybrid_recall_json(
-            &self.heart,
-            self.encoder.as_ref(),
-            query,
-            top_k,
-        )?))
+        Ok(ToolResult::success(
+            hybrid_recall(
+                &self.heart,
+                &self.encoder.encode(query)?,
+                query,
+                top_k,
+                None,
+                None,
+                context.agent_id.as_ref(),
+            )?
+            .context,
+        ))
     }
 }
 
-fn hybrid_recall_json(
-    heart: &SpineHeart,
-    encoder: &dyn SemanticEncoder,
-    query: &str,
-    top_k: usize,
-) -> spine_runtime::Result<String> {
-    let embedding = encoder.encode(query)?;
-    Ok(hybrid_recall(heart, &embedding, query, top_k, None, None)?.context)
-}
-
+#[allow(clippy::too_many_arguments)]
 fn hybrid_recall(
     heart: &SpineHeart,
     embedding: &Embedding,
@@ -429,6 +431,7 @@ fn hybrid_recall(
     top_k: usize,
     excluded_event: Option<EventId>,
     expansion_depth: Option<usize>,
+    agent: Option<&AgentId>,
 ) -> spine_runtime::Result<AutomaticRecall> {
     let dense_limit = top_k
         .saturating_mul(2)
@@ -450,6 +453,51 @@ fn hybrid_recall(
             (!memory.events.is_empty()).then_some(memory)
         })
         .collect::<Vec<_>>();
+    let cognition = heart
+        .cognition()?
+        .ok_or(spine_heart::HeartError::NotFound)?;
+    if let Some(agent) = agent
+        && let Some(feeling) = cognition.feel(agent, embedding)?
+    {
+        let provisional = AutomaticRecall {
+            context: "[]".into(),
+            hits: dense.iter().take(top_k).map(|m| m.hit.clone()).collect(),
+            hierarchy_depth: cognition
+                .dcmdb
+                .nodes
+                .values()
+                .map(|n| n.level)
+                .max()
+                .unwrap_or(0),
+            total_nodes: cognition.dcmdb.nodes.len(),
+            retrieval_stat_dimensions: cognition.config.retrieval_stat_dimensions,
+        };
+        let risk = heart.predict_risk(agent, embedding, &provisional.risk_stats())?;
+        for memory in &mut dense {
+            // Average canonical event affinities, so consolidation cannot discard an
+            // absorbed node's affect and old unstamped memories remain neutral.
+            let affinities = memory
+                .events
+                .iter()
+                .filter_map(|event| {
+                    event
+                        .body
+                        .interaction
+                        .provenance
+                        .metadata
+                        .get("affect_affinity")
+                        .and_then(|value| serde_json::from_str::<Vec<f32>>(value).ok())
+                })
+                .collect::<Vec<_>>();
+            memory.hit.score += affect_bias(&feeling.activated, &affinities, risk);
+        }
+        dense.sort_by(|a, b| {
+            b.hit
+                .score
+                .total_cmp(&a.hit.score)
+                .then_with(|| a.hit.node_id.cmp(&b.hit.node_id))
+        });
+    }
     let hits = dense
         .iter()
         .take(top_k)
@@ -1150,4 +1198,66 @@ mod tests {
         );
         assert_eq!(created.heart.cognition().unwrap().unwrap().thymos, before);
     }
+}
+
+/// Python's lambda * risk * cosine rule; malformed/legacy affinities are neutral.
+fn affect_bias(current: &[f32], memories: &[Vec<f32>], risk: f32) -> f32 {
+    if current.is_empty() || current.iter().any(|x| !x.is_finite()) || !risk.is_finite() {
+        return 0.0;
+    }
+    let valid = memories
+        .iter()
+        .filter(|v| v.len() == current.len() && v.iter().all(|x| x.is_finite()))
+        .collect::<Vec<_>>();
+    if valid.is_empty() {
+        return 0.0;
+    }
+    let mean = (0..current.len())
+        .map(|i| valid.iter().map(|v| f64::from(v[i])).sum::<f64>() / valid.len() as f64)
+        .collect::<Vec<_>>();
+    let norm_a = current
+        .iter()
+        .map(|x| f64::from(*x).powi(2))
+        .sum::<f64>()
+        .sqrt()
+        + 1e-8;
+    let norm_b = mean.iter().map(|x| x * x).sum::<f64>().sqrt() + 1e-8;
+    let cosine = current
+        .iter()
+        .zip(&mean)
+        .map(|(a, b)| f64::from(*a) * b)
+        .sum::<f64>()
+        / (norm_a * norm_b);
+    (0.15 * f64::from(risk.clamp(0.0, 1.0)) * cosine) as f32
+}
+
+#[cfg(test)]
+mod affect_tests {
+    use super::*;
+    #[test]
+    fn python_affect_rule_changes_ranking_and_handles_legacy_vectors() {
+        let aligned = affect_bias(&[1.0, 0.0], &[vec![1.0, 0.0]], 1.0);
+        let opposite = affect_bias(&[1.0, 0.0], &[vec![-1.0, 0.0]], 1.0);
+        assert!((aligned - 0.15).abs() < 1e-6);
+        assert!((opposite + 0.15).abs() < 1e-6);
+        assert!(0.5 + aligned > 0.6 + opposite);
+        assert_eq!(affect_bias(&[0.0, 0.0], &[vec![1.0, 0.0]], 1.0), 0.0);
+        assert_eq!(affect_bias(&[1.0, 0.0], &[], 1.0), 0.0);
+        assert_eq!(affect_bias(&[1.0, 0.0], &[vec![f32::NAN, 0.0]], 1.0), 0.0);
+        assert_eq!(affect_bias(&[1.0, 0.0], &[vec![1.0, 0.0]], 0.0), 0.0);
+        assert_eq!(
+            affect_bias(&[1.0, 0.0], &[vec![1.0, 0.0], vec![-1.0, 0.0]], 1.0),
+            0.0
+        );
+    }
+}
+
+pub fn child_recall(
+    heart: &SpineHeart,
+    encoder: &dyn SemanticEncoder,
+    agent: &AgentId,
+    task: &str,
+) -> spine_runtime::Result<String> {
+    let embedding = encoder.encode(task)?;
+    Ok(hybrid_recall(heart, &embedding, task, 5, None, Some(2), Some(agent))?.context)
 }

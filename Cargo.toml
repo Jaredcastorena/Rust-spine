@@ -42,9 +42,7 @@ thiserror = "2.0.21"
 tempfile = "3.27.0"
 tokenizers = "0.23.2"
 tokio = { version = "1.54.1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "signal", "time"] }
-uuid = { version = "1.29.0", features = ["v7", "serde"] }
 walkdir = "2.5.0"
-x25519-dalek = { version = "3.0.0", features = ["static_secrets", "zeroize"] }
 zeroize = { version = "1.9.1", features = ["derive"] }
 
 [profile.release]

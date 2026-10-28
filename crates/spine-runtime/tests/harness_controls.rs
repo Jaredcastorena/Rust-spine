@@ -944,3 +944,159 @@ fn rejected_duplicate_registration_preserves_the_original_tool() {
         ToolRisk::ReadOnly
     );
 }
+
+#[derive(Default)]
+struct RecordingJournal(Mutex<Vec<spine_runtime::HarnessProgress>>);
+impl spine_runtime::HarnessJournal for RecordingJournal {
+    fn save(&self, progress: &spine_runtime::HarnessProgress) -> Result<()> {
+        self.0.lock().unwrap().push(progress.clone());
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn provider_failure_keeps_completed_results_and_failure_signal() {
+    struct FailAfterTool(std::sync::atomic::AtomicUsize);
+    #[async_trait]
+    impl ModelProvider for FailAfterTool {
+        async fn complete(&self, _: CompletionRequest) -> Result<ModelTurn> {
+            if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Ok(tool_turn(vec![call(1)]))
+            } else {
+                Err(spine_runtime::RuntimeError::Provider(
+                    "connection lost".into(),
+                ))
+            }
+        }
+    }
+    let executed = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = ToolRegistry::default();
+    registry
+        .register(Probe {
+            executed: executed.clone(),
+            risk: ToolRisk::ReadOnly,
+        })
+        .unwrap();
+    let journal = Arc::new(RecordingJournal::default());
+    let harness = Harness::new(
+        Arc::new(FailAfterTool(0.into())),
+        registry,
+        HarnessConfig::default(),
+    )
+    .unwrap()
+    .with_journal(journal.clone());
+    assert!(
+        harness
+            .run("system", "inspect once")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("connection lost")
+    );
+    assert_eq!(*executed.lock().unwrap(), ["1"]);
+    let states = journal.0.lock().unwrap();
+    let intent = states
+        .iter()
+        .position(|s| s.messages.iter().any(|m| !m.tool_calls.is_empty()))
+        .unwrap();
+    let completed = states
+        .iter()
+        .position(|s| s.messages.iter().any(|m| m.content == "checked 1"))
+        .unwrap();
+    assert!(intent < completed);
+    let last = states.last().unwrap();
+    assert!(!last.finished);
+    assert_eq!(last.completed_tool_calls, 1);
+    assert!(last.messages.iter().any(|m| m.content == "checked 1"));
+    assert!(
+        last.messages
+            .iter()
+            .skip(last.start_offset)
+            .all(|m| m.record_id.is_some())
+    );
+}
+
+#[tokio::test]
+async fn journal_failure_prevents_the_next_side_effect() {
+    struct RejectIntent;
+    impl spine_runtime::HarnessJournal for RejectIntent {
+        fn save(&self, progress: &spine_runtime::HarnessProgress) -> Result<()> {
+            if progress.messages.iter().any(|m| !m.tool_calls.is_empty()) {
+                return Err(spine_runtime::RuntimeError::Tool(
+                    "journal unavailable".into(),
+                ));
+            }
+            Ok(())
+        }
+    }
+    let executed = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = ToolRegistry::default();
+    registry
+        .register(Probe {
+            executed: executed.clone(),
+            risk: ToolRisk::Mutating,
+        })
+        .unwrap();
+    let harness = Harness::new(
+        Arc::new(ScriptedProvider::new(vec![tool_turn(vec![call(1)])])),
+        registry,
+        HarnessConfig::default(),
+    )
+    .unwrap()
+    .with_journal(Arc::new(RejectIntent));
+    assert!(harness.run("system", "inspect").await.is_err());
+    assert!(executed.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn stopping_inflight_completion_keeps_partial_text_in_checkpoint() {
+    struct PendingProvider(Arc<tokio::sync::Notify>);
+    #[async_trait]
+    impl ModelProvider for PendingProvider {
+        async fn complete(&self, request: CompletionRequest) -> Result<ModelTurn> {
+            request
+                .progress
+                .unwrap()
+                .send(spine_runtime::ModelProgress {
+                    content: "partial answer".into(),
+                    reasoning: Some("partial reasoning".into()),
+                })
+                .unwrap();
+            self.0.notify_one();
+            std::future::pending().await
+        }
+    }
+    let started = Arc::new(tokio::sync::Notify::new());
+    let journal = Arc::new(RecordingJournal::default());
+    let harness = Arc::new(
+        Harness::new(
+            Arc::new(PendingProvider(started.clone())),
+            ToolRegistry::default(),
+            HarnessConfig::default(),
+        )
+        .unwrap()
+        .with_journal(journal.clone()),
+    );
+    let task_harness = harness.clone();
+    let task = tokio::spawn(async move { task_harness.run("system", "inspect").await });
+    started.notified().await;
+    harness.controls().request_graceful_stop();
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(outcome.stopped_gracefully);
+    let checkpoint = outcome.checkpoint.unwrap();
+    checkpoint.validate().unwrap();
+    assert!(
+        checkpoint
+            .messages
+            .iter()
+            .any(|m| m.content == "partial answer"
+                && m.reasoning.as_deref() == Some("partial reasoning"))
+    );
+    let states = journal.0.lock().unwrap();
+    assert!(states.last().unwrap().finished);
+    assert!(states.last().unwrap().stopped);
+}

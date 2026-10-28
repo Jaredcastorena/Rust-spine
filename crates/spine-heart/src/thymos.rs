@@ -33,6 +33,25 @@ pub struct ThymosConfig {
 }
 
 impl ThymosConfig {
+    pub fn for_minilm(channels: usize) -> Result<Self> {
+        Self::new(384, channels)
+    }
+
+    pub fn for_large_embed(dimension: usize, channels: usize) -> Result<Self> {
+        let mut config = Self::new(dimension, channels)?;
+        config.learning_rate = 0.005;
+        config.decay = 0.0005;
+        Ok(config)
+    }
+
+    pub fn minimal(dimension: usize) -> Result<Self> {
+        let mut config = Self::new(dimension, 3)?;
+        config.learning_rate = 0.02;
+        config.decay = 0.002;
+        config.channel_labels = Some(vec!["approach".into(), "avoid".into(), "neutral".into()]);
+        Ok(config)
+    }
+
     pub fn new(dimension: usize, channels: usize) -> Result<Self> {
         let config = Self {
             dimension,
@@ -235,9 +254,23 @@ impl Thymos {
     }
 
     pub fn query(&self, input: &[f32]) -> Result<FeelingVector> {
+        self.query_with_normalization(input, true)
+    }
+
+    /// Query raw-magnitude inputs when requested, matching Python's optional
+    /// `normalize_input`. The default query keeps spherical normalization.
+    pub fn query_with_normalization(
+        &self,
+        input: &[f32],
+        normalize_input: bool,
+    ) -> Result<FeelingVector> {
         vector::validate_dimension(input, self.config.dimension)?;
         let input_norm = vector::norm(input);
-        let input = vector::unit(input, self.config.eps);
+        let input = if normalize_input {
+            vector::unit(input, self.config.eps)
+        } else {
+            input.to_vec()
+        };
         let raw = self.multiply(&input);
         let activated = self.activate(&raw);
         let valence = activated.iter().sum::<f32>() / activated.len() as f32;
@@ -245,7 +278,7 @@ impl Thymos {
         let dominant_channel = activated
             .iter()
             .enumerate()
-            .max_by(|left, right| left.1.total_cmp(right.1))
+            .max_by(|left, right| left.1.total_cmp(right.1).then_with(|| right.0.cmp(&left.0)))
             .map(|(index, _)| index)
             .unwrap_or_default();
         let dominant_label = self
@@ -263,6 +296,36 @@ impl Thymos {
             dominant_label,
             input_norm,
         })
+    }
+
+    /// Raw channel responses in descending order; equal responses retain channel order.
+    pub fn channel_affinities(&self, input: &[f32]) -> Result<Vec<(usize, f32, Option<String>)>> {
+        let feeling = self.query(input)?;
+        let mut affinities: Vec<_> = feeling
+            .raw
+            .into_iter()
+            .enumerate()
+            .map(|(channel, value)| {
+                let label = self
+                    .config
+                    .channel_labels
+                    .as_ref()
+                    .map(|labels| labels[channel].clone());
+                (channel, value, label)
+            })
+            .collect();
+        affinities.sort_by(|left, right| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        Ok(affinities)
+    }
+
+    /// The context that generated the current prediction, without mutating trajectory state.
+    pub fn trajectory_position(&self) -> Option<&[f32]> {
+        self.previous_position.as_deref()
     }
 
     pub fn compute_valence(&self, expected: &[f32], actual: &[f32]) -> Result<Vec<f32>> {
@@ -316,6 +379,21 @@ impl Thymos {
         {
             return Err(HeartError::InvalidInput(
                 "invalid Thymos learning multiplier".into(),
+            ));
+        }
+        self.update_with_learning_rate(context, eligibility, learning_rate)
+    }
+
+    /// An absolute per-observation rate, including when the configured rate is zero.
+    pub fn update_with_learning_rate(
+        &mut self,
+        context: &[f32],
+        eligibility: &[f32],
+        learning_rate: f32,
+    ) -> Result<()> {
+        if !learning_rate.is_finite() || learning_rate < 0.0 {
+            return Err(HeartError::InvalidInput(
+                "invalid Thymos learning rate".into(),
             ));
         }
         vector::validate_dimension(context, self.config.dimension)?;

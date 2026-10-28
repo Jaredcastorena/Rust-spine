@@ -2,6 +2,8 @@
 
 mod crypto;
 mod dcmdb;
+mod dcmdb_inspection;
+mod dcmdb_policy;
 mod diagnostics;
 mod embedding;
 mod error;
@@ -23,6 +25,8 @@ pub use dcmdb::{
     Dcmdb, DcmdbConfig, MaintenanceReport, MemoryNode, MemoryObservation, RecallHit, TensionInfo,
     kappa_from_m,
 };
+pub use dcmdb_inspection::CorpusMode;
+pub use dcmdb_policy::{DcmdbPolicy, PmiMode, PmiSignificance, PmiVariant};
 pub use embedding::{Embedding, ModelManifest, SemanticEncoder};
 pub use error::{HeartError, Result};
 pub use event::{

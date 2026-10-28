@@ -265,6 +265,7 @@ fn fixture(model_memory_writes: bool, subagents: bool) -> Fixture {
             child_registry,
             3,
             2,
+            None,
         )
         .expect("register sub-agent tools");
     }
@@ -1000,6 +1001,7 @@ async fn subagent_tools_start_report_finish_and_cancel() {
         ToolRegistry::default(),
         3,
         2,
+        None,
     )
     .expect("register final sub-agent tools");
     let delegated = execute(
@@ -1041,6 +1043,7 @@ async fn subagent_tools_start_report_finish_and_cancel() {
         ToolRegistry::default(),
         3,
         2,
+        None,
     )
     .expect("register pending sub-agent tools");
     let delegated = execute(
@@ -1052,7 +1055,7 @@ async fn subagent_tools_start_report_finish_and_cancel() {
     assert!(delegated.output.contains("sa1"));
     let cancelled = execute(&pending_registry, "cancel_agent", json!({"agent_id":"sa1"})).await;
     assert!(cancelled.success);
-    assert_eq!(cancelled.output, "Cancelled sub-agent sa1");
+    assert!(cancelled.output.starts_with("Cancelled sub-agent(s): sa1."));
 }
 
 #[tokio::test]
@@ -1090,4 +1093,290 @@ async fn harness_blocks_a_real_destructive_shell_call_by_default() {
                 .content
                 .contains("destructive tool call blocked by this harness")
     }));
+}
+
+#[test]
+fn interrupted_journal_keeps_results_marks_unknown_actions_and_never_replays() {
+    use spine_runtime::{HarnessJournal, HarnessPolicy, HarnessProgress, Message, MessageRole};
+    let fixture = fixture(false, false);
+    let agent = AgentId::new("main").unwrap();
+    let thread = ThreadId::new("journal-test").unwrap();
+    let mut intent = Message::assistant(
+        "",
+        Some("Preserve this thought".into()),
+        vec![
+            ToolCall {
+                id: "one".into(),
+                name: "shell".into(),
+                arguments: json!({"command":"first"}),
+            },
+            ToolCall {
+                id: "two".into(),
+                name: "shell".into(),
+                arguments: json!({"command":"second"}),
+            },
+        ],
+    );
+    intent.record_id = Some("durable:2".into());
+    let mut result = Message::tool("one", "first action definitely completed");
+    result.record_id = Some("durable:3".into());
+    let messages = vec![
+        Message::new(MessageRole::System, "system"),
+        Message::new(MessageRole::User, "work"),
+        intent,
+        result,
+    ];
+    let journal =
+        crate::transcript::HeartJournal::new(fixture.heart.clone(), agent.clone(), thread.clone());
+    journal
+        .save(&HarnessProgress {
+            run_id: "durable".into(),
+            start_offset: 2,
+            messages: messages.clone(),
+            pending_task: "work".into(),
+            host_plan: None,
+            policy: HarnessPolicy::default(),
+            completed_tool_calls: 1,
+            completed_tool_rounds: 1,
+            completed_action_calls: 1,
+            finished: false,
+            stopped: false,
+        })
+        .unwrap();
+    // Simulate a crash after part of the canonical transcript was already committed.
+    crate::transcript::persist(
+        &fixture.heart,
+        &TinyEncoder::new(),
+        &agent,
+        &thread,
+        &messages[2..3],
+    )
+    .unwrap();
+    assert_eq!(
+        crate::transcript::recover(&fixture.heart, &TinyEncoder::new()).unwrap(),
+        1
+    );
+    let events = fixture.heart.events_canonical().unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.body.interaction.kind == EventKind::ToolCall)
+            .count(),
+        2
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.body.interaction.kind == EventKind::ToolResult)
+            .count(),
+        2
+    );
+    assert!(events.iter().any(|e| matches!(&e.body.interaction.content, Content::Inline(s) if s.contains("first action definitely completed"))));
+    assert!(events.iter().any(|e| matches!(&e.body.interaction.content, Content::Inline(s) if s.contains("may or may not have executed"))));
+    assert_eq!(
+        crate::transcript::recover(&fixture.heart, &TinyEncoder::new()).unwrap(),
+        0
+    );
+    assert_eq!(
+        fixture.heart.events_canonical().unwrap().len(),
+        events.len()
+    );
+    assert!(!fixture.audit_path.exists()); // Recovery never dispatched shell.
+}
+
+#[tokio::test]
+async fn child_checkins_finish_without_an_extra_model_call_and_retain_transcript() {
+    let fixture = fixture(true, false);
+    let encoder = Arc::new(TinyEncoder::new());
+    let provider = Arc::new(ScriptedProvider {
+        turns: Mutex::new(VecDeque::from([
+            ModelTurn {
+                tool_calls: vec![ToolCall {
+                    id: "progress".into(),
+                    name: "check_in".into(),
+                    arguments: json!({"message":"found evidence"}),
+                }],
+                ..Default::default()
+            },
+            ModelTurn {
+                reasoning: Some("checked the evidence".into()),
+                tool_calls: vec![ToolCall {
+                    id: "final".into(),
+                    name: "check_in".into(),
+                    arguments: json!({"message":"verified child answer","final":true}),
+                }],
+                ..Default::default()
+            },
+        ])),
+    });
+    let mut registry = ToolRegistry::default();
+    agent_tools::register_subagent_tools(
+        &mut registry,
+        provider.clone(),
+        ToolRegistry::default(),
+        3,
+        2,
+        Some(agent_tools::AgentMemory {
+            heart: fixture.heart.clone(),
+            encoder,
+        }),
+    )
+    .unwrap();
+    execute(
+        &registry,
+        "delegate",
+        json!({"task":"I am 29 years old. Inspect evidence."}),
+    )
+    .await;
+    let mut reports = String::new();
+    for _ in 0..100 {
+        reports.push_str(&execute(&registry, "check_results", json!({})).await.output);
+        if reports.contains("[sa1 | FINAL]") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        reports.contains("[sa1 | check-in] found evidence"),
+        "{reports}"
+    );
+    assert!(
+        reports.contains("[sa1 | FINAL]\nverified child answer"),
+        "{reports}"
+    );
+    assert!(!reports.contains("partial response"));
+    assert!(provider.turns.lock().unwrap().is_empty());
+    assert!(
+        fixture
+            .heart
+            .cognition()
+            .unwrap()
+            .unwrap()
+            .facts
+            .facts()
+            .next()
+            .is_none(),
+        "delegated model text must not create personal facts"
+    );
+    let events = fixture.heart.events_canonical().unwrap();
+    assert!(events.iter().any(
+        |e| matches!(&e.body.interaction.content,Content::Inline(t) if t == "checked the evidence")
+    ));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.body.interaction.kind == EventKind::ToolResult)
+            .count(),
+        2
+    );
+    assert!(
+        events
+            .iter()
+            .all(|e| e.body.interaction.thread_id.as_str().starts_with("child-"))
+    );
+}
+
+#[test]
+fn concurrent_children_preserve_projection_and_signed_affinity() {
+    let fixture = fixture(true, false);
+    std::thread::scope(|scope| {
+        for worker in 0..3 {
+            let heart = fixture.heart.clone();
+            scope.spawn(move || {
+                let encoder = TinyEncoder::new();
+                for round in 0..5 {
+                    let text = format!("worker {worker} round {round}");
+                    let input = InteractionInput {
+                        agent_id: AgentId::new(format!("worker{worker}")).unwrap(),
+                        thread_id: ThreadId::new("concurrent").unwrap(),
+                        role: ParticipantRole::User,
+                        kind: EventKind::Message,
+                        content: Content::Inline(text.clone()),
+                        causal_parents: vec![],
+                        provenance: Provenance::default(),
+                        tool: None,
+                        attachments: vec![],
+                        outcome: None,
+                    };
+                    heart
+                        .commit_embedded(input, encoder.encode(&text).unwrap())
+                        .unwrap();
+                    heart.maintain_cognition(1).unwrap();
+                }
+            });
+        }
+    });
+    assert!(fixture.heart.cognition_is_current().unwrap());
+    let events = fixture.heart.events_canonical().unwrap();
+    assert_eq!(events.len(), 15);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e
+                .body
+                .interaction
+                .provenance
+                .metadata
+                .contains_key("affect_affinity"))
+            .count(),
+        12
+    );
+    fixture
+        .heart
+        .catch_up_cognition(&TinyEncoder::new())
+        .unwrap();
+    assert_eq!(fixture.heart.events_canonical().unwrap(), events);
+}
+
+#[tokio::test]
+async fn retained_open_goal_and_evidence_survive_cold_reopen() {
+    let fixture = fixture(true, false);
+    let path = fixture.heart.path().to_path_buf();
+    let harness = Harness::new(
+        Arc::new(FinalProvider),
+        ToolRegistry::default(),
+        HarnessConfig::default(),
+    )
+    .unwrap();
+    let mut outcome = harness
+        .run("system", "finish the unfinished inspection")
+        .await
+        .unwrap();
+    outcome.stopped_gracefully = true;
+    outcome.messages.push(spine_runtime::Message::tool(
+        "known",
+        "durable working evidence",
+    ));
+    let agent = AgentId::new("main").unwrap();
+    let thread = ThreadId::new("cold-context").unwrap();
+    crate::context_state::remember(&fixture.heart, &agent, &thread, &outcome).unwrap();
+    let Fixture {
+        _directory,
+        heart,
+        registry,
+        ..
+    } = fixture;
+    drop(registry);
+    drop(heart);
+    let heart = SpineHeart::open(
+        HeartConfig::new(path),
+        spine_heart::KeySource::Passphrase("tool-smoke-passphrase".into()),
+    )
+    .unwrap();
+    let encoder = TinyEncoder::new();
+    let restored = crate::context_state::rehydrate(
+        &heart,
+        &encoder,
+        &thread,
+        &encoder.encode("inspection").unwrap(),
+    )
+    .unwrap();
+    let restored: serde_json::Value = serde_json::from_str(&restored).unwrap();
+    assert_eq!(
+        restored["open_obligations"][0],
+        "finish the unfinished inspection"
+    );
+    assert_eq!(restored["working_evidence"][0], "durable working evidence");
+    drop(heart);
+    drop(_directory);
 }

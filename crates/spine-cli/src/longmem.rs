@@ -4,7 +4,6 @@ use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
 struct DatasetItem {
-    #[allow(dead_code)]
     question_id: String,
     haystack_dates: Vec<String>,
     haystack_session_ids: Vec<String>,

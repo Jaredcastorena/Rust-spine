@@ -297,6 +297,7 @@ async fn request_turn(
     }
     let turn = provider
         .complete(CompletionRequest {
+            progress: None,
             messages,
             tools: Vec::new(),
             allow_tool_calls: false,
