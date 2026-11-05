@@ -7,8 +7,10 @@ Python, Node.js, npm, or separate web server to install.
 
 ## First-time setup
 
-Spine v0.3.2 includes automatic memory-model setup and remembers successful
-launch settings. Download the package for your platform, open Spine, connect your
+Spine v0.3.3 adds evidence-scoped answer checking, one repair attempt with
+rechecking, and consistent uncertainty notices across recovery. It includes
+automatic memory-model setup and remembers successful launch settings.
+Download the package for your platform, open Spine, connect your
 model service once, and choose a heart passphrase.
 
 Spine connects to an existing OpenAI-compatible chat model service. It installs
@@ -576,6 +578,11 @@ for normal tool use.
 ### Answer checker and offline installation
 
 Normal chat installs and enables the NLI answer checker automatically.
+It checks statements against current-turn user input, eligible recalled memories,
+and successful tool results, combining exact value checks with semantic checks.
+Unresolved claims trigger one repair attempt; failures or remaining uncertainty
+receive an explicit caveat in the final answer and its saved transcript.
+See [Answer grounding](docs/grounding.md) for evidence handling, recovery, and limits.
 Use `--no-nli` to disable it, or supply an existing snapshot with
 `--nli-model-dir`/`SPINE_NLI_DIR`. `--no-download` prevents all model downloads
 and requires local assets for enabled models. Automatic NLI installation is available

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.3 — 2026-11-05
+
+- Check full answer statements so ASCII and Unicode string assertions cannot
+  bypass grounding. Combine exact identifier, number and date checks with
+  semantic checks; preserve uncertainty when evidence is missing or ambiguous.
+- Use current-turn user input, eligible canonical memories and successful tools
+  as evidence. Keep delegated/model-authored output, failed tools and ambiguous
+  tool identities from gaining trust through persistence or later recall.
+- Recheck after one repair attempt. Preserve caveats in displayed answers,
+  transcripts and checkpoints; reconcile completed actions immediately after
+  failed or interrupted repairs without replaying them.
+- Reject oversized NLI pairs instead of silently truncating evidence. Add pinned
+  native/reference inference checks, fixed-case replays and recovery regressions.
+- Document source scope, failure handling and limits in [Answer grounding](docs/grounding.md).
+
 ## 0.3.2 — 2026-10-28
 
 - Bound safe-stop summaries and streamed-response memory, recover failed-child

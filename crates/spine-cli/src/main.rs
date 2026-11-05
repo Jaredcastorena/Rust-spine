@@ -873,11 +873,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             )?
             .with_agent_id(agent_id.clone())
-            .with_journal(Arc::new(transcript::HeartJournal::new(
-                heart.clone(),
-                agent_id.clone(),
-                thread_id.clone(),
-            )));
+            .with_journal(Arc::new(
+                transcript::HeartJournal::new(heart.clone(), agent_id.clone(), thread_id.clone())
+                    .with_grounding(grounding.is_some()),
+            ));
 
             let (line_sender, mut line_receiver) = tokio::sync::mpsc::unbounded_channel();
             let web_server = if enable_web_server {
@@ -1438,6 +1437,170 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             continue;
                         };
+                        let mut quit_after = controlled.quit_after;
+                        if let Some(gate) = &grounding {
+                            status.show("Verifying answer");
+                            if let Some(web) = &web_ui {
+                                web.activity("Verifying answer");
+                            }
+                            let grounding_recall =
+                                grounding::recall_with_rehydrated(&recalled, &triangle_context);
+                            let mut grounded = grounding::ground_answer(
+                                outcome,
+                                &grounding_recall,
+                                persist_start.saturating_sub(1),
+                                policy.coverage_threshold,
+                                |response, evidence, threshold| {
+                                    gate.verify(response, evidence, threshold)
+                                },
+                                |previous, repair_task| {
+                                    let (
+                                        heart,
+                                        agent_id,
+                                        thread_id,
+                                        harness,
+                                        status,
+                                        web_ui,
+                                        line_receiver,
+                                        quit_after,
+                                    ) = (
+                                        &heart,
+                                        &agent_id,
+                                        &thread_id,
+                                        &harness,
+                                        &status,
+                                        &web_ui,
+                                        &mut line_receiver,
+                                        &mut quit_after,
+                                    );
+                                    async move {
+                                        // Sync the rejected draft's caveat before another model/tool
+                                        // call can fail or be interrupted. No draft is projected yet.
+                                        transcript::finalize_grounding(
+                                            heart,
+                                            agent_id,
+                                            thread_id,
+                                            &previous,
+                                            persist_start,
+                                        )?;
+                                        status.show("Repairing answer");
+                                        if let Some(web) = &web_ui {
+                                            web.activity("Repairing answer");
+                                        }
+                                        let repair =
+                                            Box::pin(harness.repair(&previous, repair_task))
+                                                as std::pin::Pin<Box<dyn Future<Output = _>>>;
+                                        let repaired = run_with_operator_controls(
+                                            harness,
+                                            repair,
+                                            line_receiver,
+                                            status.as_ref(),
+                                        )
+                                        .await;
+                                        *quit_after |= repaired.quit_after;
+                                        repaired.outcome
+                                    }
+                                },
+                            )
+                            .await;
+                            if matches!(
+                                grounded.repair,
+                                grounding::RepairState::Interrupted
+                                    | grounding::RepairState::Failed(_)
+                            ) {
+                                transcript::reconcile_grounding_repair(
+                                    &heart,
+                                    encoder.as_ref(),
+                                    &agent_id,
+                                    &thread_id,
+                                    &mut grounded.outcome,
+                                    persist_start,
+                                )?;
+                            }
+                            if let Some(error) = &grounded.verifier_error {
+                                commit_control_text(
+                                    &heart,
+                                    &encoder,
+                                    &agent_id,
+                                    &thread_id,
+                                    &format!("grounding verification failed: {error}"),
+                                    "grounding_verifier_error",
+                                )?;
+                            }
+                            match &grounded.repair {
+                                grounding::RepairState::Completed => {
+                                    circuit_breaker.record_success(ResilienceChannel::Llm)
+                                }
+                                grounding::RepairState::Interrupted => {
+                                    circuit_breaker
+                                        .record_cancelled(ResilienceChannel::Llm, Instant::now());
+                                    commit_control_text(
+                                        &heart,
+                                        &encoder,
+                                        &agent_id,
+                                        &thread_id,
+                                        "operator interrupted the grounding repair; retained draft is caveated",
+                                        "interrupted",
+                                    )?;
+                                }
+                                grounding::RepairState::Failed(error) => {
+                                    circuit_breaker
+                                        .record_failure(ResilienceChannel::Llm, Instant::now());
+                                    commit_control_text(
+                                        &heart,
+                                        &encoder,
+                                        &agent_id,
+                                        &thread_id,
+                                        &format!("grounding repair failed: {error}"),
+                                        "grounding_repair_error",
+                                    )?;
+                                }
+                                grounding::RepairState::NotNeeded => {}
+                            }
+                            if let Some(tension) = grounded
+                                .initial_decision
+                                .as_ref()
+                                .or(grounded.final_decision.as_ref())
+                                .and_then(|decision| decision.risk_target())
+                                && circuit_breaker.allow(ResilienceChannel::Thymos, Instant::now())
+                            {
+                                match heart.update_risk(
+                                    &agent_id,
+                                    &task_embedding,
+                                    &retrieval_stats,
+                                    tension,
+                                ) {
+                                    Ok(_) => {
+                                        circuit_breaker.record_success(ResilienceChannel::Thymos)
+                                    }
+                                    Err(error) => {
+                                        circuit_breaker.record_failure(
+                                            ResilienceChannel::Thymos,
+                                            Instant::now(),
+                                        );
+                                        eprintln!("[risk update unavailable: {error}]");
+                                    }
+                                }
+                            }
+                            status.show(grounded.status());
+                            if let Some(web) = &web_ui {
+                                web.notice(grounded.status());
+                            }
+                            outcome = grounded.outcome;
+                            if let Err(error) = transcript::finalize_grounding(
+                                &heart,
+                                &agent_id,
+                                &thread_id,
+                                &outcome,
+                                persist_start,
+                            ) {
+                                grounding::append_terminal_caveat(&mut outcome);
+                                eprintln!("[grounding journal finalization deferred: {error}]");
+                                if let Some(web) = &web_ui {
+                                    web.notice("Grounding journal finalization was deferred; answer is caveated");
+                                }
+                            }
+                        }
                         if circuit_breaker.allow(ResilienceChannel::Dcmdb, Instant::now()) {
                             match persist_harness_messages(
                                 &heart,
@@ -1463,196 +1626,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         } else {
                             eprintln!("[turn-message persistence deferred: DCMDB circuit is open]");
-                        }
-                        let mut quit_after = controlled.quit_after;
-                        if let Some(gate) = &grounding
-                            && !outcome.response.trim().is_empty()
-                            && !outcome.stopped_gracefully
-                        {
-                            status.show("Verifying answer");
-                            if let Some(web) = &web_ui {
-                                web.activity("Verifying answer");
-                            }
-                            let evidence = grounding::evidence_from_recall_and_messages(
-                                &recalled,
-                                &outcome.messages,
-                            );
-                            let decision = gate.verify(
-                                &outcome.response,
-                                &evidence,
-                                policy.coverage_threshold,
-                            );
-                            if let Err(error) = &decision {
-                                commit_control_text(
-                                    &heart,
-                                    &encoder,
-                                    &agent_id,
-                                    &thread_id,
-                                    &format!("grounding verification failed: {error}"),
-                                    "grounding_verifier_error",
-                                )?;
-                                status.show("Verifier unavailable; using answer");
-                                if let Some(web) = &web_ui {
-                                    web.notice("Grounding verifier unavailable; using answer");
-                                }
-                            }
-                            if let Ok(decision) = decision {
-                                if let Some(tension) = decision.risk_target()
-                                    && circuit_breaker
-                                        .allow(ResilienceChannel::Thymos, Instant::now())
-                                {
-                                    match heart.update_risk(
-                                        &agent_id,
-                                        &task_embedding,
-                                        &retrieval_stats,
-                                        tension,
-                                    ) {
-                                        Ok(_) => circuit_breaker
-                                            .record_success(ResilienceChannel::Thymos),
-                                        Err(error) => {
-                                            circuit_breaker.record_failure(
-                                                ResilienceChannel::Thymos,
-                                                Instant::now(),
-                                            );
-                                            eprintln!("[risk update unavailable: {error}]");
-                                        }
-                                    }
-                                }
-                                if decision.needs_repair {
-                                    status.show("Repairing answer");
-                                    if let Some(web) = &web_ui {
-                                        web.activity("Repairing answer");
-                                    }
-                                    let repair_start = outcome.messages.len() + 1;
-                                    let repair_task = format!(
-                                        "[HOST GROUNDING REPAIR] The draft's factual coverage was {:.3} and contradiction risk was {:.3}. Re-check the supplied evidence and tool results. Use more recall/tools if needed, correct unsupported claims, and abstain explicitly where evidence remains insufficient. Return the corrected final answer.",
-                                        decision.report.coverage, decision.report.contradiction
-                                    );
-                                    assert!(
-                                        circuit_breaker
-                                            .allow(ResilienceChannel::Llm, Instant::now()),
-                                        "a successful draft leaves the LLM circuit available for repair"
-                                    );
-                                    let repair = Box::pin(harness.repair(&outcome, repair_task))
-                                        as std::pin::Pin<Box<dyn Future<Output = _>>>;
-                                    let repaired = run_with_operator_controls(
-                                        &harness,
-                                        repair,
-                                        &mut line_receiver,
-                                        status.as_ref(),
-                                    )
-                                    .await;
-                                    quit_after |= repaired.quit_after;
-                                    match repaired.outcome {
-                                        Ok(Some(mut repaired_outcome)) => {
-                                            circuit_breaker.record_success(ResilienceChannel::Llm);
-                                            let repaired_evidence =
-                                                grounding::evidence_from_recall_and_messages(
-                                                    &recalled,
-                                                    &repaired_outcome.messages,
-                                                );
-                                            let still_unverified = gate
-                                                .verify(
-                                                    &repaired_outcome.response,
-                                                    &repaired_evidence,
-                                                    policy.coverage_threshold,
-                                                )
-                                                .map_or(true, |decision| decision.needs_repair);
-                                            if still_unverified {
-                                                grounding::append_terminal_caveat(
-                                                    &mut repaired_outcome,
-                                                );
-                                                status
-                                                    .show("Answer caveated after grounding repair");
-                                                if let Some(web) = &web_ui {
-                                                    web.notice(concat!(
-                                                    "Some claims remained unverified after repair; ",
-                                                    "a terminal caveat was added"
-                                                ));
-                                                }
-                                            }
-                                            if circuit_breaker
-                                                .allow(ResilienceChannel::Dcmdb, Instant::now())
-                                            {
-                                                match persist_harness_messages(
-                                                    &heart,
-                                                    &encoder,
-                                                    &agent_id,
-                                                    &thread_id,
-                                                    &repaired_outcome.messages[repair_start
-                                                        .min(repaired_outcome.messages.len())..],
-                                                ) {
-                                                    Ok(leaves) => {
-                                                        circuit_breaker.record_success(
-                                                            ResilienceChannel::Dcmdb,
-                                                        );
-                                                        turn_leaves.extend(leaves);
-                                                    }
-                                                    Err(error) => {
-                                                        circuit_breaker.record_failure(
-                                                            ResilienceChannel::Dcmdb,
-                                                            Instant::now(),
-                                                        );
-                                                        let recovered = catch_up_stale_cognition(
-                                                            &heart,
-                                                            encoder.as_ref(),
-                                                        )
-                                                        .unwrap_or(false);
-                                                        eprintln!(
-                                                            "[repair-message persistence incomplete: {error}; projection_caught_up={recovered}]"
-                                                        );
-                                                    }
-                                                }
-                                            } else {
-                                                eprintln!(
-                                                    "[repair-message persistence deferred: DCMDB circuit is open]"
-                                                );
-                                            }
-                                            outcome = repaired_outcome;
-                                        }
-                                        Ok(None) => {
-                                            circuit_breaker.record_cancelled(
-                                                ResilienceChannel::Llm,
-                                                Instant::now(),
-                                            );
-                                            commit_control_text(
-                                                &heart,
-                                                &encoder,
-                                                &agent_id,
-                                                &thread_id,
-                                                "operator interrupted the grounding repair",
-                                                "interrupted",
-                                            )?;
-                                            status.show("Repair interrupted; using draft");
-                                            if let Some(web) = &web_ui {
-                                                web.notice("Repair interrupted; using draft");
-                                            }
-                                        }
-                                        Err(error) => {
-                                            circuit_breaker.record_failure(
-                                                ResilienceChannel::Llm,
-                                                Instant::now(),
-                                            );
-                                            commit_control_text(
-                                                &heart,
-                                                &encoder,
-                                                &agent_id,
-                                                &thread_id,
-                                                &format!("grounding repair failed: {error}"),
-                                                "grounding_repair_error",
-                                            )?;
-                                            status.show("Repair unavailable; using draft");
-                                            if let Some(web) = &web_ui {
-                                                web.notice("Repair unavailable; using draft");
-                                            }
-                                        }
-                                    }
-                                } else if decision.claim_count == 0 {
-                                    status.show("Answer ready");
-                                } else {
-                                    status.show("Answer verified");
-                                }
-                            }
                         }
                         if !turn_leaves.is_empty() {
                             status.show("Saving context");
@@ -1871,6 +1844,139 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         continue;
                     };
+                    let mut quit_after = controlled.quit_after;
+                    if let Some(gate) = &grounding {
+                        status.show("Verifying resumed answer");
+                        // Legacy checkpoints do not carry an evidence-scope boundary.
+                        // Resume may recall sources again; historical messages alone
+                        // cannot silently become fresh verification evidence.
+                        let mut grounded = grounding::ground_answer(
+                            outcome,
+                            "[]",
+                            persist_start,
+                            0.8,
+                            |response, evidence, threshold| {
+                                gate.verify(response, evidence, threshold)
+                            },
+                            |previous, repair_task| {
+                                let (
+                                    heart,
+                                    agent_id,
+                                    thread_id,
+                                    harness,
+                                    status,
+                                    web_ui,
+                                    line_receiver,
+                                    quit_after,
+                                ) = (
+                                    &heart,
+                                    &agent_id,
+                                    &thread_id,
+                                    &harness,
+                                    &status,
+                                    &web_ui,
+                                    &mut line_receiver,
+                                    &mut quit_after,
+                                );
+                                async move {
+                                    transcript::finalize_grounding(
+                                        heart,
+                                        agent_id,
+                                        thread_id,
+                                        &previous,
+                                        persist_start,
+                                    )?;
+                                    status.show("Repairing resumed answer");
+                                    if let Some(web) = web_ui {
+                                        web.activity("Repairing resumed answer");
+                                    }
+                                    let repair = Box::pin(harness.repair(&previous, repair_task))
+                                        as std::pin::Pin<Box<dyn Future<Output = _>>>;
+                                    let repaired = run_with_operator_controls(
+                                        harness,
+                                        repair,
+                                        line_receiver,
+                                        status.as_ref(),
+                                    )
+                                    .await;
+                                    *quit_after |= repaired.quit_after;
+                                    repaired.outcome
+                                }
+                            },
+                        )
+                        .await;
+                        if matches!(
+                            grounded.repair,
+                            grounding::RepairState::Interrupted | grounding::RepairState::Failed(_)
+                        ) {
+                            transcript::reconcile_grounding_repair(
+                                &heart,
+                                encoder.as_ref(),
+                                &agent_id,
+                                &thread_id,
+                                &mut grounded.outcome,
+                                persist_start,
+                            )?;
+                        }
+                        if let Some(error) = &grounded.verifier_error {
+                            commit_control_text(
+                                &heart,
+                                &encoder,
+                                &agent_id,
+                                &thread_id,
+                                &format!("resumed grounding verification failed: {error}"),
+                                "grounding_verifier_error",
+                            )?;
+                        }
+                        match &grounded.repair {
+                            grounding::RepairState::Completed => {
+                                circuit_breaker.record_success(ResilienceChannel::Llm)
+                            }
+                            grounding::RepairState::Interrupted => {
+                                circuit_breaker
+                                    .record_cancelled(ResilienceChannel::Llm, Instant::now());
+                                commit_control_text(
+                                    &heart,
+                                    &encoder,
+                                    &agent_id,
+                                    &thread_id,
+                                    "operator interrupted resumed grounding repair; retained draft is caveated",
+                                    "interrupted",
+                                )?;
+                            }
+                            grounding::RepairState::Failed(error) => {
+                                circuit_breaker
+                                    .record_failure(ResilienceChannel::Llm, Instant::now());
+                                commit_control_text(
+                                    &heart,
+                                    &encoder,
+                                    &agent_id,
+                                    &thread_id,
+                                    &format!("resumed grounding repair failed: {error}"),
+                                    "grounding_repair_error",
+                                )?;
+                            }
+                            grounding::RepairState::NotNeeded => {}
+                        }
+                        status.show(grounded.status());
+                        if let Some(web) = &web_ui {
+                            web.notice(grounded.status());
+                        }
+                        outcome = grounded.outcome;
+                        if let Err(error) = transcript::finalize_grounding(
+                            &heart,
+                            &agent_id,
+                            &thread_id,
+                            &outcome,
+                            persist_start,
+                        ) {
+                            grounding::append_terminal_caveat(&mut outcome);
+                            eprintln!("[resumed grounding journal finalization deferred: {error}]");
+                            if let Some(web) = &web_ui {
+                                web.notice("Grounding journal finalization was deferred; answer is caveated");
+                            }
+                        }
+                    }
                     let leaves = if circuit_breaker.allow(ResilienceChannel::Dcmdb, Instant::now())
                     {
                         match persist_harness_messages(
@@ -1952,7 +2058,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         max_history_turns,
                         max_history_chars,
                     );
-                    if controlled.quit_after {
+                    if quit_after {
                         break;
                     }
                 }
@@ -3200,6 +3306,15 @@ fn checkpoint_from_outcome(
     circuit_breaker: &mut CircuitBreaker,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(resumable) = outcome.checkpoint.clone() {
+        // Immediate repair recovery may already have committed this exact
+        // checkpoint. Reuse its durable identity instead of duplicating it.
+        if let CheckpointDiscovery::Available(saved) =
+            discover_persisted_checkpoint(&heart.events_canonical()?, agent_id, thread_id)
+            && saved.checkpoint == resumable
+        {
+            *checkpoint = Some(saved);
+            return Ok(());
+        }
         let interaction = resumable.to_interaction(agent_id.clone(), thread_id.clone())?;
         let text = match &interaction.content {
             Content::Inline(text) => text.clone(),

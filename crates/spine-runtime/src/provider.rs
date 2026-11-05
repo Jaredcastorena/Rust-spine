@@ -19,6 +19,10 @@ pub struct Message {
     pub role: MessageRole,
     pub content: String,
     pub tool_call_id: Option<String>,
+    /// Host-observed result status. Legacy transcripts have no status and must
+    /// not be treated as confirmed evidence merely because they contain text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_succeeded: Option<bool>,
     #[serde(default)]
     pub tool_calls: Vec<ToolCall>,
     #[serde(default)]
@@ -32,6 +36,7 @@ impl Message {
             role,
             content: content.into(),
             tool_call_id: None,
+            tool_succeeded: None,
             tool_calls: Vec::new(),
             reasoning: None,
         }
@@ -47,6 +52,7 @@ impl Message {
             role: MessageRole::Assistant,
             content: content.into(),
             tool_call_id: None,
+            tool_succeeded: None,
             tool_calls,
             reasoning,
         }
@@ -58,9 +64,20 @@ impl Message {
             role: MessageRole::Tool,
             content: content.into(),
             tool_call_id: Some(call_id.into()),
+            tool_succeeded: None,
             tool_calls: Vec::new(),
             reasoning: None,
         }
+    }
+
+    pub fn tool_result(
+        call_id: impl Into<String>,
+        content: impl Into<String>,
+        succeeded: bool,
+    ) -> Self {
+        let mut message = Self::tool(call_id, content);
+        message.tool_succeeded = Some(succeeded);
+        message
     }
 }
 

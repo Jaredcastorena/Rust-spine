@@ -1,5 +1,17 @@
 # Project state
 
+## v0.3.3 grounding repair
+
+- [Answer grounding](docs/grounding.md) describes full-statement verification,
+  exact and semantic checks, current-turn evidence scope and explicit uncertainty.
+- Repair is limited to one attempt and rechecked. Failed/interrupted work retains
+  completed actions and caveated output consistently in history and checkpoints.
+- Successful tool provenance survives recall; delegated/model-authored output and
+  ambiguous tool IDs cannot become independent corroboration through persistence.
+- Fixed synthetic replay: 94/94 correct repair decisions and 88/94 exact verdict
+  labels. These are regression results; live generation quality and source truth
+  are not established by that score.
+
 ## v0.3.2 desktop audit
 
 - [Behavior map and acceptance](docs/desktop-parity-audit.md): 261 Rust tests,
@@ -62,7 +74,7 @@
   demographics. The resulting encrypted profile is bounded, treated as data,
   and cannot override current user instructions or host safety policy.
 - Destructive actions remain host-gated.
-- A failed grounding verifier is non-fatal; if a completed repair remains unsupported, the visible and persisted answer receives an explicit terminal caveat.
+- Grounding covers full response statements with exact and semantic checks over current-turn evidence. Verifier errors, interrupted/failed repairs, and unresolved completed repairs receive an explicit caveat in visible and persisted output; pending journals preserve that uncertainty during recovery. See [Answer grounding](docs/grounding.md).
 - Heart data, blob sidecars, audit logs, model weights, credentials, and recovery material are not tracked by Git.
 - Runtime defaults and documentation contain no developer-specific hostnames, paths, addresses, or credentials.
 
