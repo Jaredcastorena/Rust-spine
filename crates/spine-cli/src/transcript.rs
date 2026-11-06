@@ -20,6 +20,8 @@ struct Envelope {
     agent: AgentId,
     thread: ThreadId,
     progress: HarnessProgress,
+    #[serde(default)]
+    grounding_pending: bool,
 }
 
 fn decode(bytes: &[u8]) -> Result<Envelope> {
@@ -39,6 +41,7 @@ pub struct HeartJournal {
     heart: Arc<SpineHeart>,
     agent: AgentId,
     thread: ThreadId,
+    grounding_enabled: bool,
 }
 
 impl HeartJournal {
@@ -47,7 +50,13 @@ impl HeartJournal {
             heart,
             agent,
             thread,
+            grounding_enabled: false,
         }
+    }
+
+    pub fn with_grounding(mut self, enabled: bool) -> Self {
+        self.grounding_enabled = enabled;
+        self
     }
 }
 
@@ -58,6 +67,7 @@ impl HarnessJournal for HeartJournal {
             agent: self.agent.clone(),
             thread: self.thread.clone(),
             progress: progress.clone(),
+            grounding_pending: self.grounding_enabled,
         };
         self.heart.set_local_state(
             &format!("harness/{}", progress.run_id),
@@ -65,6 +75,149 @@ impl HarnessJournal for HeartJournal {
         )?;
         Ok(())
     }
+}
+
+fn caveat_unfinalized_message(message: &mut Message) {
+    const NOTICE: &str = "[Grounding was not finalized for this recovered output; factual details remain unverified.]";
+    if message.role == MessageRole::Assistant
+        && !message.content.trim().is_empty()
+        && !message.content.trim_end().ends_with(NOTICE)
+    {
+        message.content.push_str("\n\n");
+        message.content.push_str(NOTICE);
+    }
+}
+
+/// Replace only device-local journal copies before canonical projection. Event
+/// records are immutable: callers must run this before persisting the turn.
+/// An unfinished repair remains recoverable, with its partial output caveated.
+pub fn finalize_grounding(
+    heart: &SpineHeart,
+    agent: &AgentId,
+    thread: &ThreadId,
+    outcome: &spine_runtime::RunOutcome,
+    persist_start: usize,
+) -> Result<()> {
+    let current = outcome.messages[persist_start.min(outcome.messages.len())..]
+        .iter()
+        .filter_map(|message| message.record_id.as_deref().map(|id| (id, message)))
+        .collect::<BTreeMap<_, _>>();
+    for (key, bytes) in heart.local_states("harness/")? {
+        let mut saved = decode(&bytes)?;
+        if &saved.agent != agent
+            || &saved.thread != thread
+            || !saved.progress.messages.iter().any(|message| {
+                message
+                    .record_id
+                    .as_deref()
+                    .is_some_and(|id| current.contains_key(id))
+            })
+        {
+            continue;
+        }
+        for message in &mut saved.progress.messages {
+            if let Some(finalized) = message.record_id.as_deref().and_then(|id| current.get(id)) {
+                *message = (*finalized).clone();
+            }
+        }
+        let has_unreturned_output = saved.progress.messages[saved.progress.start_offset..]
+            .iter()
+            .any(|message| {
+                message
+                    .record_id
+                    .as_deref()
+                    .is_none_or(|id| !current.contains_key(id))
+            });
+        // A cancelled repair may have saved its initial request but emitted no
+        // new message yet. It still has not completed grounding.
+        saved.grounding_pending = !saved.progress.finished || has_unreturned_output;
+        heart.set_local_state(&key, Some(&serde_json::to_vec(&saved)?))?;
+    }
+    Ok(())
+}
+
+/// Reconcile a failed/cancelled repair before accepting another user turn.
+/// Durable tool results and unknown actions become visible immediately and the
+/// returned checkpoint is safe to resume explicitly. Recovery never runs tools.
+pub fn reconcile_grounding_repair(
+    heart: &SpineHeart,
+    encoder: &dyn SemanticEncoder,
+    agent: &AgentId,
+    thread: &ThreadId,
+    outcome: &mut spine_runtime::RunOutcome,
+    persist_start: usize,
+) -> Result<bool> {
+    finalize_grounding(heart, agent, thread, outcome, persist_start)?;
+    let current = outcome.messages[persist_start.min(outcome.messages.len())..]
+        .iter()
+        .filter_map(|message| message.record_id.as_deref())
+        .collect::<BTreeSet<_>>();
+    let mut repair_runs = BTreeSet::new();
+    for bytes in heart.local_states("harness/")?.values() {
+        let saved = decode(bytes)?;
+        if &saved.agent == agent
+            && &saved.thread == thread
+            && (!saved.progress.finished || saved.progress.stopped)
+            && saved.progress.start_offset > persist_start
+            && saved.progress.messages.iter().any(|message| {
+                message
+                    .record_id
+                    .as_deref()
+                    .is_some_and(|id| current.contains(id))
+            })
+        {
+            repair_runs.insert(saved.progress.run_id);
+        }
+    }
+    if repair_runs.is_empty() {
+        return Ok(false);
+    }
+    recover_thread(heart, encoder, Some(thread))?;
+    let checkpoint = heart.events_canonical()?.iter().rev().find_map(|event| {
+        let input = &event.body.interaction;
+        if &input.agent_id != agent || &input.thread_id != thread { return None; }
+        HarnessCheckpoint::from_interaction(input).ok().filter(|checkpoint| repair_runs.contains(&checkpoint.harness_id))
+    }).ok_or_else(|| spine_runtime::RuntimeError::InvalidConfig("repair recovery did not yield a durable checkpoint; inspect retained journals before retrying actions".into()))?;
+    outcome.response = checkpoint
+        .messages
+        .last()
+        .map(|message| message.content.clone())
+        .unwrap_or_default();
+    outcome.messages = checkpoint.messages.clone();
+    outcome.completed_tool_calls = checkpoint.completed_tool_calls;
+    outcome.completed_tool_rounds = checkpoint.completed_tool_rounds;
+    outcome.completed_action_calls = checkpoint.completed_action_calls;
+    outcome.host_plan = checkpoint.host_plan.clone();
+    outcome.policy = checkpoint.policy.unwrap_or(outcome.policy);
+    outcome.stopped_gracefully = true;
+    outcome.checkpoint = Some(checkpoint);
+    Ok(true)
+}
+
+fn recovered_result_summary(messages: &[Message], start: usize) -> String {
+    let calls = messages
+        .iter()
+        .flat_map(|message| &message.tool_calls)
+        .map(|call| (call.id.as_str(), call.name.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let results = messages[start.min(messages.len())..]
+        .iter()
+        .filter(|message| message.role == MessageRole::Tool)
+        .collect::<Vec<_>>();
+    if results.is_empty() {
+        return String::new();
+    }
+    let displayed = results.iter().rev().take(8).rev().map(|message| {
+        let id = message.tool_call_id.as_deref().unwrap_or_default();
+        serde_json::json!({"tool": calls.get(id).copied().unwrap_or("unknown"), "call_id": id,
+            "succeeded": message.tool_succeeded, "result_excerpt": message.content.chars().take(1500).collect::<String>()})
+    }).collect::<Vec<_>>();
+    format!(
+        "\n\nDurable tool results ({} total; latest {} shown as quoted source data):\n{}\nDo not repeat these actions without checking their recorded effects. Complete results remain in the checkpoint.",
+        results.len(),
+        displayed.len(),
+        serde_json::to_string(&displayed).expect("JSON values serialize")
+    )
 }
 
 /// Call before replaying chat history. Unknown actions are disclosed, never dispatched.
@@ -85,6 +238,11 @@ pub fn recover_thread(
             continue;
         }
         let p = &mut saved.progress;
+        if saved.grounding_pending {
+            for message in &mut p.messages[p.start_offset..] {
+                caveat_unfinalized_message(message);
+            }
+        }
         if !p.finished {
             let mut pending = BTreeMap::new();
             for message in &p.messages {
@@ -96,21 +254,31 @@ pub fn recover_thread(
                 }
             }
             for id in pending.keys() {
-                let mut result = Message::tool(
+                let mut result = Message::tool_result(
                     id,
                     "[interrupted: no durable result exists. This action may or may not have executed. Inspect its effects before retrying; never automatically replay it.]",
+                    false,
                 );
                 result.record_id = Some(format!("{}:unknown:{}", p.run_id, p.messages.len()));
                 p.messages.push(result);
             }
+            let recovered_task = if p.pending_task.starts_with("[HOST GROUNDING REPAIR]") {
+                "answer grounding repair".to_owned()
+            } else {
+                p.pending_task.chars().take(600).collect::<String>()
+            };
             let mut summary = Message::new(
                 MessageRole::Assistant,
                 format!(
-                    "Recovered interrupted work: {}. Completed results are retained. {} action(s) have unknown completion; inspect their effects before retrying. No action was replayed. Resume explicitly to continue open obligations.",
-                    p.pending_task,
-                    pending.len()
+                    "Recovered interrupted work: {}. Completed results are retained. {} action(s) have unknown completion; inspect their effects before retrying. No action was replayed. Resume explicitly to continue open obligations.{}",
+                    recovered_task,
+                    pending.len(),
+                    recovered_result_summary(&p.messages, p.start_offset),
                 ),
             );
+            if saved.grounding_pending {
+                caveat_unfinalized_message(&mut summary);
+            }
             summary.record_id = Some(format!("{}:recovery", p.run_id));
             p.messages.push(summary);
         }
@@ -189,9 +357,22 @@ pub fn persist(
                 .cloned()
         })
         .collect::<BTreeSet<_>>();
-    let mut calls = BTreeMap::<String, ToolCall>::new();
+    // Resolve identity over the entire projected batch before writing results.
+    // Duplicate IDs are ambiguous even when a later call has a plausible name.
+    let mut calls = BTreeMap::<String, Option<(usize, ToolCall)>>::new();
+    for (index, message) in messages.iter().enumerate() {
+        if message.role != MessageRole::Assistant {
+            continue;
+        }
+        for call in &message.tool_calls {
+            calls
+                .entry(call.id.clone())
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some((index, call.clone())));
+        }
+    }
     let mut leaves = Vec::new();
-    for message in messages {
+    for (message_index, message) in messages.iter().enumerate() {
         let mut items = Vec::<(
             String,
             ParticipantRole,
@@ -222,7 +403,6 @@ pub fn persist(
                     ));
                 }
                 for (index, call) in message.tool_calls.iter().enumerate() {
-                    calls.insert(call.id.clone(), call.clone());
                     let args = call.arguments.to_string();
                     items.push((
                         format!("call{index}"),
@@ -242,7 +422,11 @@ pub fn persist(
             }
             MessageRole::Tool => {
                 let id = message.tool_call_id.clone().unwrap_or_default();
-                let call = calls.get(&id);
+                let call = calls
+                    .get(&id)
+                    .and_then(Option::as_ref)
+                    .filter(|(index, _)| *index < message_index)
+                    .map(|(_, call)| call);
                 items.push((
                     "result".into(),
                     ParticipantRole::Tool,
@@ -255,7 +439,7 @@ pub fn persist(
                             call.map_or_else(|| "{}".into(), |c| c.arguments.to_string()),
                         ),
                         result: Some(Content::Inline(message.content.clone())),
-                        succeeded: None,
+                        succeeded: message.tool_succeeded,
                         background: false,
                     }),
                 ));
@@ -272,6 +456,13 @@ pub fn persist(
             }
             if let Some(id) = &identity {
                 metadata.insert("harness_record".into(), id.clone());
+            }
+            if let Some(exchange) = &tool {
+                metadata.insert("tool_name".into(), exchange.tool_name.clone());
+                if crate::grounding::model_output_tool(&exchange.tool_name) {
+                    metadata.insert("contains_model_output".into(), "true".into());
+                    metadata.insert("evidence_class".into(), "unverified_model_claim".into());
+                }
             }
             let embedded = encoder.encode(&text)?;
             let (commit, memory) = heart.commit_embedded(

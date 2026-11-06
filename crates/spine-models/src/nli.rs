@@ -7,7 +7,11 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::{Linear, Module, VarBuilder, linear};
 use candle_transformers::models::bert::{BertModel, Config};
 use spine_heart::{HeartError, ModelManifest, NliLabelOrder, NliModel, Result};
-use tokenizers::{EncodeInput, PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
+use tokenizers::{EncodeInput, PaddingParams, PaddingStrategy, Tokenizer};
+
+const MAX_PAIR_TOKENS: usize = 512;
+const MAX_PAIR_BYTES: usize = 128 * 1024;
+const INFERENCE_BATCH_SIZE: usize = 8;
 
 #[derive(Clone, Debug)]
 pub struct NliAssets {
@@ -50,11 +54,10 @@ impl MiniLmNli {
         }
         let mut tokenizer = Tokenizer::from_bytes(&tokenizer_bytes)
             .map_err(|error| HeartError::Model(error.to_string()))?;
+        // A truncated pair can omit precisely the fact being checked. Reject
+        // oversized complete encodings below instead of silently scoring them.
         tokenizer
-            .with_truncation(Some(TruncationParams {
-                max_length: 512,
-                ..TruncationParams::default()
-            }))
+            .with_truncation(None)
             .map_err(|error| HeartError::Model(error.to_string()))?;
         tokenizer.with_padding(Some(PaddingParams {
             strategy: PaddingStrategy::BatchLongest,
@@ -67,7 +70,7 @@ impl MiniLmNli {
         let builder = VarBuilder::from_buffered_safetensors(weight_bytes, DType::F32, &device)
             .map_err(model_error)?;
         // BertModel's transformer blocks are architecture-compatible with
-        // RoBERTa. `forward_roberta` below supplies RoBERTa's +2 positional
+        // RoBERTa. The forward path below supplies RoBERTa's +2 positional
         // offset by adding two masked padding positions.
         let model = BertModel::load(builder.clone(), &config).map_err(model_error)?;
         let classifier_dense = linear(
@@ -101,8 +104,23 @@ impl MiniLmNli {
     }
 
     fn predict(&self, pairs: &[(String, String)]) -> Result<Vec<[f32; 3]>> {
+        let mut results = Vec::with_capacity(pairs.len());
+        for batch in pairs.chunks(INFERENCE_BATCH_SIZE) {
+            results.extend(self.predict_batch(batch)?);
+        }
+        Ok(results)
+    }
+
+    fn predict_batch(&self, pairs: &[(String, String)]) -> Result<Vec<[f32; 3]>> {
         if pairs.is_empty() {
             return Ok(Vec::new());
+        }
+        if pairs.iter().any(|(premise, hypothesis)| {
+            premise.len().saturating_add(hypothesis.len()) > MAX_PAIR_BYTES
+        }) {
+            return Err(HeartError::InvalidInput(
+                "NLI pair exceeds the input size limit; no verification was performed".into(),
+            ));
         }
         let inputs: Vec<EncodeInput<'_>> = pairs
             .iter()
@@ -116,6 +134,11 @@ impl MiniLmNli {
         let mut types = Vec::with_capacity(encodings.len());
         let mut masks = Vec::with_capacity(encodings.len());
         for encoding in encodings {
+            if encoding.len() > MAX_PAIR_TOKENS {
+                return Err(HeartError::InvalidInput(
+                    "NLI pair exceeds 512 tokens; refusing to verify truncated evidence".into(),
+                ));
+            }
             let mut row_ids = Vec::with_capacity(encoding.len() + 2);
             row_ids.extend_from_slice(&[1, 1]);
             row_ids.extend_from_slice(encoding.get_ids());

@@ -1,0 +1,149 @@
+{
+  "description": "Reference CPU Transformers inference using the locked cross-encoder/nli-MiniLM2-L6-H768 snapshot. Pairs are (premise, hypothesis); labels contradiction, entailment, neutral.",
+  "transformers": "5.19.0",
+  "torch": "2.14.1+xpu",
+  "artifact_hash": [
+    95,
+    229,
+    23,
+    108,
+    238,
+    102,
+    90,
+    161,
+    135,
+    160,
+    18,
+    13,
+    209,
+    87,
+    58,
+    23,
+    255,
+    137,
+    197,
+    103,
+    231,
+    178,
+    237,
+    94,
+    205,
+    18,
+    54,
+    197,
+    54,
+    0,
+    135,
+    206
+  ],
+  "tokenizer_hash": [
+    171,
+    139,
+    216,
+    181,
+    249,
+    126,
+    234,
+    59,
+    14,
+    168,
+    145,
+    20,
+    105,
+    236,
+    48,
+    148,
+    122,
+    8,
+    97,
+    228,
+    7,
+    108,
+    70,
+    155,
+    119,
+    103,
+    137,
+    74,
+    252,
+    189,
+    101,
+    27
+  ],
+  "pairs": [
+    [
+      "A man is eating pizza.",
+      "A man eats something."
+    ],
+    [
+      "A man eats something.",
+      "A man is eating pizza."
+    ],
+    [
+      "Nobody is outdoors.",
+      "A person is outdoors."
+    ],
+    [
+      "Cedar's badge code is Q7.",
+      "Cedar's badge code is Q7."
+    ],
+    [
+      "Cedar's badge code is Q7.",
+      "Cedar's badge code is Q8."
+    ],
+    [
+      "Cedar's badge code is Q7.",
+      "Cedar's badge code is not Q7."
+    ],
+    [
+      "The recovery label is CORRECT_Ω.",
+      "The recovery label is WRONG_Ω."
+    ],
+    [
+      "The office is in Denver.",
+      "The office is located in Denver."
+    ]
+  ],
+  "logits": [
+    [
+      -4.006165981292725,
+      3.784679412841797,
+      -0.2718657851219177
+    ],
+    [
+      -1.5753949880599976,
+      -2.3054583072662354,
+      4.005380153656006
+    ],
+    [
+      3.1613147258758545,
+      -1.2344852685928345,
+      -1.8990240097045898
+    ],
+    [
+      -3.141688585281372,
+      3.7782115936279297,
+      -1.1205806732177734
+    ],
+    [
+      3.756382703781128,
+      -2.206843376159668,
+      -1.4156893491744995
+    ],
+    [
+      4.721022605895996,
+      -2.778158187866211,
+      -1.6715891361236572
+    ],
+    [
+      2.1700146198272705,
+      -0.7557358145713806,
+      -1.491989016532898
+    ],
+    [
+      -3.70538592338562,
+      4.034456729888916,
+      -0.7929351925849915
+    ]
+  ]
+}

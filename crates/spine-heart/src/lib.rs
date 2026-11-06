@@ -9,6 +9,7 @@ mod embedding;
 mod error;
 mod event;
 mod facts;
+mod grounding;
 mod heart;
 mod ids;
 mod projection;
@@ -36,6 +37,10 @@ pub use event::{
 pub use facts::{
     Fact, FactAggregation, FactAggregationIntent, FactAggregationRouter, FactCandidate,
     FactExtractor, FactHit, FactQueryAggregation, FactSlotType, FactStore, FactValue, TimeSource,
+};
+pub use grounding::{
+    GroundingClaimReport, GroundingEvidence, GroundingMethod, GroundingReport, GroundingVerdict,
+    GroundingVerifier,
 };
 pub use heart::{
     CommitReceipt, CreatedHeart, HeartConfig, ReadOnlyHeart, RecalledMemory, SpineHeart,

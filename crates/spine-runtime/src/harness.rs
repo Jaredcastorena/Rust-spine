@@ -1009,9 +1009,10 @@ impl Harness {
                         .max_action_calls
                         .is_some_and(|ceiling| completed.action_calls >= ceiling.get())
                 {
-                    messages.push(Message::tool(
+                    messages.push(Message::tool_result(
                         &call.id,
                         "[skipped: host action budget for this run was reached]",
+                        false,
                     ));
                 } else {
                     if is_action {
@@ -1022,9 +1023,10 @@ impl Harness {
                         tool.spec().category != ToolCategory::Action || result.success
                     });
                     completed.tool_calls = completed.tool_calls.saturating_add(1);
-                    messages.push(Message::tool(
+                    messages.push(Message::tool_result(
                         &call.id,
                         result.model_text(self.config.max_tool_result_chars),
+                        result.success && result.error.is_none(),
                     ));
                 }
                 self.save_progress(
@@ -1041,9 +1043,10 @@ impl Harness {
                 let controls = self.controls.drain();
                 if !controls.is_empty() {
                     for skipped in &calls[index + 1..] {
-                        messages.push(Message::tool(
+                        messages.push(Message::tool_result(
                             &skipped.id,
                             "[skipped after an operator control at the completed-tool boundary]",
+                            false,
                         ));
                     }
                     self.append_controls(&mut messages, &controls);

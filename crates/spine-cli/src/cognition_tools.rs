@@ -274,7 +274,11 @@ pub fn rehydrate_triangle_context_for_goal(
                 if let Content::Inline(text) = &event.body.interaction.content {
                     result.push(serde_json::json!({
                         "node_id": coordinate.node_id.to_string(),
-                        "role": format!("{:?}", coordinate.role),
+                        "role": format!("{:?}", event.body.interaction.role),
+                        "kind": format!("{:?}", event.body.interaction.kind),
+                        "tool_succeeded": event.body.interaction.tool.as_ref().and_then(|tool| tool.succeeded),
+                        "tool_name": event.body.interaction.tool.as_ref().map(|tool| &tool.tool_name),
+                        "provenance": &event.body.interaction.provenance,
                         "depth": coordinate.depth,
                         "event_id": event.id.to_string(),
                         "text": bounded_text(text, 1_000),
@@ -515,6 +519,10 @@ fn hybrid_recall(
                 "score": score,
                 "event_id": event.id.to_string(),
                 "role": format!("{:?}", event.body.interaction.role),
+                "kind": format!("{:?}", event.body.interaction.kind),
+                "tool_succeeded": event.body.interaction.tool.as_ref().and_then(|tool| tool.succeeded),
+                        "tool_name": event.body.interaction.tool.as_ref().map(|tool| &tool.tool_name),
+                "provenance": &event.body.interaction.provenance,
                 "source": event.body.interaction.provenance.source_uri,
                 "text": bounded_text(&text, 3_000),
             }));
@@ -535,6 +543,10 @@ fn hybrid_recall(
                     "node_id": memory.hit.node_id.to_string(),
                     "event_id": event.id.to_string(),
                     "role": format!("{:?}", event.body.interaction.role),
+                    "kind": format!("{:?}", event.body.interaction.kind),
+                    "tool_succeeded": event.body.interaction.tool.as_ref().and_then(|tool| tool.succeeded),
+                        "tool_name": event.body.interaction.tool.as_ref().map(|tool| &tool.tool_name),
+                    "provenance": &event.body.interaction.provenance,
                     "source": event.body.interaction.provenance.source_uri,
                     "text": bounded_text(&text, 3_000),
                 }));
