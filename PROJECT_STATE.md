@@ -1,5 +1,18 @@
 # Project state
 
+## v0.3.4 plan and web-tool fixes
+
+- Host plans require explicit plan fences; terminal and web controls can discard
+  them across resume. Failed tools do not advance steps, and stalled plans are bounded.
+- Shell checks distinguish command names from harmless quoted arguments while
+  retaining guards for destructive commands, substitutions, and common wrappers.
+- Search prefers an HTML endpoint, rejects interstitials and challenges, and
+  falls back without recording rejected pages in navigation history.
+- Optional [browser tools](docs/browser.md) support rendered pages and forms
+  through an external WebDriver, with separate sessions for each harness.
+- Local validation: 363 workspace tests plus a real Firefox form/navigation
+  test passed. PR checks passed on Linux, macOS, and Windows before versioning.
+
 ## v0.3.3 grounding repair
 
 - [Answer grounding](docs/grounding.md) describes full-statement verification,

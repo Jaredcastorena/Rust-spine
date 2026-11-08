@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod agent_tools;
+mod browser_tools;
 #[cfg(test)]
 mod checkpoint_recovery_tests;
 mod cognition_tools;
@@ -13,6 +14,7 @@ mod onboarding;
 mod partner_tools;
 mod resilience;
 mod setup;
+mod shell_safety;
 mod terminal_input;
 #[cfg(test)]
 mod tool_smoke_tests;
@@ -1016,7 +1018,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             if !quit_after_onboarding {
                 println!(
-                    "Spine ready: Rust heart={} events={} tools={} grounding={} (/tasks, /circuit, /stop, /interrupt, /resume, /quit)",
+                    "Spine ready: Rust heart={} events={} tools={} grounding={} (/tasks, /circuit, /discard-plan, /stop, /interrupt, /resume, /quit)",
                     path.display(),
                     heart.stats()?.events,
                     harness.registry().len(),
@@ -1047,6 +1049,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         break;
                     }
                     if task.is_empty() {
+                        continue;
+                    }
+                    if plan_discard_reason(task).is_some() {
+                        let notice =
+                            "No run is active. Resume a saved run before discarding its plan.";
+                        println!("[{notice}]");
+                        if let Some(web) = &web_ui {
+                            web.complete_command(notice, checkpoint.is_some());
+                        }
                         continue;
                     }
                     if matches!(task, "reset" | "reset cb" | "reset circuit breaker") {
@@ -2960,7 +2971,9 @@ fn tool_activity(name: &str) -> &'static str {
         "shell" => "Running command",
         "file_read" | "file_list" | "file_search" => "Reading workspace",
         "file_write" => "Updating workspace",
-        "web_fetch" | "web_search" | "web_navigate" | "web_back" | "web_forward" => "Browsing",
+        "web_fetch" | "web_search" | "web_navigate" | "web_back" | "web_forward"
+        | "browser_open" | "browser_snapshot" | "browser_click" | "browser_type"
+        | "browser_select" | "browser_submit" | "browser_close" => "Browsing",
         "ingest_documents" => "Ingesting documents",
         "delegate" => "Starting sub-agent",
         "check_results" => "Checking sub-agent",
@@ -2975,6 +2988,19 @@ fn tool_activity(name: &str) -> &'static str {
 struct ControlledRun {
     outcome: spine_runtime::Result<Option<RunOutcome>>,
     quit_after: bool,
+}
+
+fn plan_discard_reason(line: &str) -> Option<&str> {
+    let reason = line.strip_prefix("/discard-plan")?;
+    if !reason.is_empty() && !reason.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let reason = reason.trim();
+    Some(if reason.is_empty() {
+        "Operator discarded the active plan."
+    } else {
+        reason
+    })
 }
 
 async fn run_with_operator_controls<'a>(
@@ -3006,6 +3032,11 @@ async fn run_with_operator_controls<'a>(
                     }
                 };
                 let line = line.trim();
+                if let Some(reason) = plan_discard_reason(line) {
+                    controls.request_plan_discard(reason);
+                    status.show("Plan discard requested");
+                    continue;
+                }
                 match line {
                     "/interrupt" => {
                         return ControlledRun {

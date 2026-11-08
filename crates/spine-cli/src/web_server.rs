@@ -467,17 +467,22 @@ async fn api_control(
     if !authorized(&headers, &state) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let (busy, checkpoint) = {
+    let (busy, checkpoint, onboarding) = {
         let snapshot = state.ui.state.read().expect("web state poisoned");
-        (snapshot.busy, snapshot.checkpoint_available)
+        (
+            snapshot.busy,
+            snapshot.checkpoint_available,
+            snapshot.phase == "onboarding",
+        )
     };
     let command = match body.action.as_str() {
         "stop" if busy => "/stop",
         "interrupt" if busy => "/interrupt",
+        "discard-plan" if busy && !onboarding => "/discard-plan",
         "resume" if !busy && checkpoint => "/resume",
         "quit" => "/quit",
         "tasks" if !busy => "/tasks",
-        "stop" | "interrupt" => {
+        "stop" | "interrupt" | "discard-plan" => {
             return (StatusCode::CONFLICT, "no turn is active").into_response();
         }
         "resume" => {
@@ -503,6 +508,70 @@ async fn api_control(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn discard_plan_requires_an_authenticated_active_run() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = start(
+            WebBind {
+                host: "127.0.0.1",
+                port: 0,
+                allow_remote: false,
+            },
+            tx,
+            "test".into(),
+            true,
+            false,
+            1,
+        )
+        .await
+        .unwrap();
+        let (base, token) = server.access_url.split_once('#').unwrap();
+        let url = format!("{}/api/control", base.trim_end_matches('/'));
+        let client = reqwest::Client::new();
+        let request = || {
+            client
+                .post(&url)
+                .json(&serde_json::json!({"action":"discard-plan"}))
+        };
+        assert_eq!(
+            request().send().await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            request()
+                .header("x-spine-token", token)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        assert!(rx.try_recv().is_err());
+        server.ui().begin_onboarding_model_turn();
+        assert_eq!(
+            request()
+                .header("x-spine-token", token)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        server.ui().begin_turn("inspect the project");
+        assert_eq!(
+            request()
+                .header("x-spine-token", token)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(rx.recv().await.unwrap().unwrap(), "/discard-plan");
+        assert!(server.ui().state.read().unwrap().busy);
+        server.shutdown().await;
+    }
 
     #[tokio::test]
     async fn rejects_remote_binding_without_an_explicit_opt_in() {

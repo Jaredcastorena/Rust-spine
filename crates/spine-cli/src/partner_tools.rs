@@ -72,6 +72,7 @@ pub(crate) fn register_action_tools<E: SemanticEncoder + 'static>(
         browser: Arc::clone(&browser),
     })?;
     registry.register(WebForwardTool { browser })?;
+    crate::browser_tools::register_browser_tools(registry)?;
     registry.register(DocumentIngestTool {
         heart,
         encoder,
@@ -613,45 +614,7 @@ struct ShellTool {
 
 impl ShellTool {
     fn destructive(command: &str) -> bool {
-        let command = command.to_ascii_lowercase();
-        [
-            "rm ",
-            "rm\t",
-            "rm -rf",
-            "rm -fr",
-            "rmdir",
-            "pkill -9",
-            "kill -9",
-            "killall -9",
-            "mkfs",
-            "wipefs",
-            "git reset --hard",
-            "git clean -f",
-            "truncate ",
-            "shred ",
-            "chmod 000",
-            "crontab -r",
-            "shutdown",
-            "reboot",
-            "poweroff",
-            "drop database",
-            "drop table",
-            "> /dev/sd",
-            "dd if=",
-            ":(){",
-            "remove-item",
-            "clear-disk",
-            "format-volume",
-            "initialize-disk",
-            "remove-partition",
-            "stop-computer",
-            "restart-computer",
-            "diskpart",
-            "del /",
-            "erase /",
-        ]
-        .iter()
-        .any(|needle| command.contains(needle))
+        crate::shell_safety::is_destructive(command)
     }
 
     fn audit(&self, command: &str, status: &str, detail: &str, elapsed: f64) {
@@ -841,6 +804,7 @@ struct WebPage {
     title: String,
     text: String,
     links: Vec<(String, String)>,
+    search_error: Option<&'static str>,
 }
 
 struct BrowserState {
@@ -911,13 +875,19 @@ impl WebBrowser {
             Regex::new(r#"(?is)<a[^>]+href=["']([^"']+)["'][^>]*>(.*?)</a>"#).expect("valid regex");
         let tag_re = Regex::new(r"(?is)<[^>]+>").expect("valid regex");
         let space_re = Regex::new(r"[ \t\r\f\v]+").expect("valid regex");
+        // Script strings and comments are not page links or search results.
+        let without_scripts = Regex::new(
+            r"(?is)<!--.*?-->|<(?:script|style|noscript)\b[^>]*>.*?</(?:script|style|noscript)\s*>",
+        )
+        .expect("valid regex")
+        .replace_all(&body, " ");
         let title = title_re
-            .captures(&body)
+            .captures(&without_scripts)
             .and_then(|capture| capture.get(1))
             .map(|value| tag_re.replace_all(value.as_str(), " ").trim().to_owned())
             .unwrap_or_default();
         let mut links = Vec::new();
-        for capture in link_re.captures_iter(&body).take(100) {
+        for capture in link_re.captures_iter(&without_scripts).take(100) {
             let href = capture
                 .get(1)
                 .map(|value| value.as_str())
@@ -927,16 +897,13 @@ impl WebBrowser {
                 .map(|value| value.as_str())
                 .unwrap_or_default();
             let label = decode_html_entities(tag_re.replace_all(label, " ").trim());
+            let href = decode_html_entities(href);
             let href = reqwest::Url::parse(&final_url)
                 .ok()
-                .and_then(|base| base.join(href).ok())
-                .map_or_else(|| href.to_owned(), |url| url.to_string());
+                .and_then(|base| base.join(&href).ok())
+                .map_or(href, |url| url.to_string());
             links.push((label, href));
         }
-        let without_scripts =
-            Regex::new(r"(?is)<(?:script|style|noscript)[^>]*>.*?</(?:script|style|noscript)>")
-                .expect("valid regex")
-                .replace_all(&body, " ");
         let text = tag_re.replace_all(&without_scripts, "\n");
         let text = space_re.replace_all(&text, " ");
         let text = decode_html_entities(
@@ -948,6 +915,7 @@ impl WebBrowser {
                 .collect::<Vec<_>>()
                 .join("\n"),
         );
+        let search_error = search_page_error(&without_scripts, &final_url, &title, &text, &links);
         let page = WebPage {
             url: final_url,
             title: if title.is_empty() {
@@ -957,16 +925,21 @@ impl WebBrowser {
             },
             text: text.chars().take(MAX_WEB_CHARS).collect(),
             links,
+            search_error,
         };
         if record {
-            let mut state = self.state.lock().expect("browser lock poisoned");
-            if let Some(cursor) = state.cursor {
-                state.history.truncate(cursor + 1);
-            }
-            state.history.push(page.clone());
-            state.cursor = Some(state.history.len() - 1);
+            self.record(&page);
         }
         Ok(page)
+    }
+
+    fn record(&self, page: &WebPage) {
+        let mut state = self.state.lock().expect("browser lock poisoned");
+        if let Some(cursor) = state.cursor {
+            state.history.truncate(cursor + 1);
+        }
+        state.history.push(page.clone());
+        state.cursor = Some(state.history.len() - 1);
     }
 
     fn move_history(&self, offset: isize) -> Option<WebPage> {
@@ -983,9 +956,9 @@ impl WebBrowser {
 
 fn search_endpoints(override_url: Option<&str>) -> Result<Vec<reqwest::Url>, String> {
     const DEFAULTS: [&str; 3] = [
-        "https://www.google.com/search",
+        "https://html.duckduckgo.com/html/",
         "https://search.brave.com/search",
-        "https://duckduckgo.com/",
+        "https://www.google.com/search",
     ];
     let values = override_url.map_or_else(|| DEFAULTS.to_vec(), |value| vec![value.trim()]);
     values
@@ -999,6 +972,162 @@ fn search_endpoints(override_url: Option<&str>) -> Result<Vec<reqwest::Url>, Str
             Ok(url)
         })
         .collect()
+}
+
+fn search_page_error(
+    html: &str,
+    final_url: &str,
+    title: &str,
+    text: &str,
+    links: &[(String, String)],
+) -> Option<&'static str> {
+    let base = reqwest::Url::parse(final_url).ok()?;
+    let path = base.path().to_ascii_lowercase();
+    let host = base.host_str().unwrap_or_default();
+    // Inspect URL paths and actual elements, never query terms or snippets:
+    // a search about CAPTCHA or JavaScript is still a legitimate search.
+    if host.starts_with("consent.")
+        || ["/sorry", "/enablejs", "/challenge", "/captcha", "/consent"]
+            .iter()
+            .any(|value| path == *value || path.starts_with(&format!("{value}/")))
+        || path.contains("/httpservice/retry/enablejs")
+    {
+        return Some("search redirected to a JavaScript, consent, or verification page");
+    }
+    let challenge = Regex::new(
+        r#"(?is)<form\b[^>]*(?:id|action)\s*=\s*["'][^"']*(?:captcha|challenge|consent|anomaly)[^"']*["']|<(?:div|iframe|input)\b[^>]*(?:id|class|name)\s*=\s*["'][^"']*(?:g-recaptcha|h-captcha|cf-challenge|cf-turnstile|captcha-response)[^"']*["']"#,
+    )
+    .expect("valid regex");
+    if challenge.is_match(html) {
+        return Some("search requires a consent or CAPTCHA/challenge interaction");
+    }
+    // Google's HTTP-200 redirect page can include external help links. Those
+    // links do not make its same-origin JavaScript retry screen a result page.
+    let javascript_retry = links.iter().any(|(label, href)| {
+        let Ok(target) = reqwest::Url::parse(href) else {
+            return false;
+        };
+        target.origin() == base.origin()
+            && (target.path() == "/enablejs"
+                || target.path().contains("/httpservice/retry/enablejs"))
+            && (label.to_ascii_lowercase().contains("javascript")
+                || text
+                    .to_ascii_lowercase()
+                    .contains("please click here if you are not redirected"))
+    });
+    if javascript_retry {
+        return Some("search returned a JavaScript redirect interstitial");
+    }
+    if [
+        "just a moment...",
+        "checking your browser",
+        "checking your browser...",
+        "verify you are human",
+        "attention required! | cloudflare",
+        "before you continue to google",
+    ]
+    .contains(&title.trim().to_ascii_lowercase().as_str())
+    {
+        return Some("search returned a browser verification or consent interstitial");
+    }
+    let provider = |candidate: &str| {
+        ["duckduckgo.com", "google.com", "brave.com"]
+            .into_iter()
+            .find(|domain| candidate == *domain || candidate.ends_with(&format!(".{domain}")))
+    };
+    let usable_result = links.iter().any(|(label, href)| {
+        let Ok(mut target) = reqwest::Url::parse(href) else {
+            return false;
+        };
+        let label = label.trim().to_ascii_lowercase();
+        if label.is_empty() || !matches!(target.scheme(), "http" | "https") {
+            return false;
+        }
+        // Search engines may wrap outbound destinations in redirect links.
+        if target.host_str() == base.host_str() && ["/l/", "/url"].contains(&target.path()) {
+            let destination = target
+                .query_pairs()
+                .find(|(key, _)| matches!(key.as_ref(), "uddg" | "url" | "q"))
+                .and_then(|(_, value)| reqwest::Url::parse(&value).ok());
+            if let Some(destination) = destination {
+                target = destination;
+            }
+        }
+        if !matches!(target.scheme(), "http" | "https") {
+            return false;
+        }
+        let target_path = target.path().to_ascii_lowercase();
+        let target_host = target.host_str().unwrap_or_default();
+        let same_provider = provider(host).is_some() && provider(host) == provider(target_host);
+        let control_link = [
+            "privacy",
+            "terms",
+            "settings",
+            "preferences",
+            "feedback",
+            "support",
+            "help",
+            "enablejs",
+            "captcha",
+            "challenge",
+            "consent",
+            "login",
+            "signin",
+        ]
+        .iter()
+        .any(|part| target_path.split('/').any(|segment| segment == *part));
+        let navigation_label = [
+            "here",
+            "click here",
+            "retry",
+            "retry with javascript",
+            "enable javascript",
+            "privacy",
+            "privacy policy",
+            "terms",
+            "terms of service",
+            "settings",
+            "feedback",
+            "help",
+            "support",
+            "learn more",
+            "home",
+            "next",
+            "previous",
+            "sign in",
+            "accept all",
+            "reject all",
+            "images",
+            "videos",
+            "news",
+            "maps",
+        ]
+        .contains(&label.as_str());
+        // Provider-owned navigation and boilerplate are not evidence of results.
+        // Custom endpoints can return same-origin relative result URLs.
+        !navigation_label
+            && !(control_link && (target.host_str() == base.host_str() || same_provider))
+            && !(same_provider
+                && (["/", "/search", "/html/"].contains(&target.path())
+                    || ["support.", "policies.", "accounts.", "myaccount."]
+                        .iter()
+                        .any(|prefix| target_host.starts_with(prefix))))
+            && !(target.origin() == base.origin() && target.path() == base.path())
+            && !(target.origin() == base.origin() && target.path() == "/")
+    });
+    if usable_result {
+        return None;
+    }
+    // A complete search can honestly return no matches. Require a page message,
+    // rather than a substring in a snippet or a script.
+    let no_results = Regex::new(
+        r"(?i)^(?:no (?:search )?results(?: found)?(?:[.!]| for\b.*)?|your search\b.*did not match any documents[.!]?|we (?:could not|couldn't|did not|didn't) find (?:any )?results\b.*)$",
+    )
+    .expect("valid regex");
+    if text.lines().any(|line| no_results.is_match(line.trim())) {
+        return None;
+    }
+    Some("response contains no usable search results; it may require JavaScript or verification")
 }
 
 fn decode_html_entities(value: &str) -> String {
@@ -1034,7 +1163,7 @@ impl Tool for WebFetchTool {
     fn spec(&self) -> ToolSpec {
         web_spec(
             "web_fetch",
-            "Fetch a URL and return rendered text and links.",
+            "Fetch a URL over HTTP and extract static text and links. Does not execute JavaScript or interact with forms.",
             true,
         )
     }
@@ -1062,7 +1191,7 @@ impl Tool for WebNavigateTool {
     fn spec(&self) -> ToolSpec {
         web_spec(
             "web_navigate",
-            "Navigate to a URL in the shared browser session.",
+            "Fetch static text and links at a URL into shared text-page history. Does not execute JavaScript or interact with forms.",
             true,
         )
     }
@@ -1082,7 +1211,7 @@ impl Tool for WebSearchTool {
     fn spec(&self) -> ToolSpec {
         web_spec(
             "web_search",
-            "Search the web and return rendered results and links.",
+            "Search the web for static text results and links, falling back when an engine is unavailable or requires browser interaction. Does not execute JavaScript or submit forms.",
             false,
         )
     }
@@ -1102,8 +1231,13 @@ impl Tool for WebSearchTool {
             url.query_pairs_mut()
                 .extend_pairs(parameters)
                 .append_pair("q", query);
-            match self.browser.fetch(url.as_str(), true).await {
+            match self.browser.fetch(url.as_str(), false).await {
                 Ok(page) => {
+                    if let Some(error) = page.search_error {
+                        last_error = format!("{error} at {}", page.url);
+                        continue;
+                    }
+                    self.browser.record(&page);
                     return Ok(ToolResult::success(format!(
                         "Search results for: {query}\nEngine: {}\n{}",
                         endpoint.host_str().unwrap_or("unknown"),
@@ -1142,7 +1276,10 @@ struct WebBackTool {
 #[async_trait]
 impl Tool for WebBackTool {
     fn spec(&self) -> ToolSpec {
-        empty_spec("web_back", "Go back one page in browser history.")
+        empty_spec(
+            "web_back",
+            "Go back one page in the shared static text-page history.",
+        )
     }
     async fn execute(&self, _: &ToolCall, _: &ToolContext) -> spine_runtime::Result<ToolResult> {
         Ok(self.browser.move_history(-1).map_or_else(
@@ -1159,7 +1296,10 @@ struct WebForwardTool {
 #[async_trait]
 impl Tool for WebForwardTool {
     fn spec(&self) -> ToolSpec {
-        empty_spec("web_forward", "Go forward one page in browser history.")
+        empty_spec(
+            "web_forward",
+            "Go forward one page in the shared static text-page history.",
+        )
     }
     async fn execute(&self, _: &ToolCall, _: &ToolContext) -> spine_runtime::Result<ToolResult> {
         Ok(self.browser.move_history(1).map_or_else(
@@ -1924,7 +2064,7 @@ mod tests {
     }
 
     #[test]
-    fn search_engine_defaults_match_python_and_invalid_overrides_are_not_ignored() {
+    fn search_engine_defaults_prefer_html_and_invalid_overrides_are_not_ignored() {
         let defaults = search_endpoints(None).unwrap();
         assert_eq!(
             defaults
@@ -1932,9 +2072,9 @@ mod tests {
                 .map(reqwest::Url::as_str)
                 .collect::<Vec<_>>(),
             [
-                "https://www.google.com/search",
+                "https://html.duckduckgo.com/html/",
                 "https://search.brave.com/search",
-                "https://duckduckgo.com/"
+                "https://www.google.com/search"
             ]
         );
         for invalid in [
@@ -1962,7 +2102,7 @@ mod tests {
                 "/search",
                 get(|| async {
                     Html(
-                        "<html><title>Search Results</title><body>deterministic result</body></html>"
+                        "<html><title>Search Results</title><body><a href='/result'>deterministic result</a></body></html>"
                             .to_owned(),
                     )
                 }),
@@ -2008,3 +2148,7 @@ mod tests {
 #[cfg(test)]
 #[path = "pagination_tests.rs"]
 mod pagination_tests;
+
+#[cfg(test)]
+#[path = "web_search_tests.rs"]
+mod web_search_tests;

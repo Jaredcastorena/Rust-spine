@@ -7,9 +7,10 @@ Python, Node.js, npm, or separate web server to install.
 
 ## First-time setup
 
-Spine v0.3.3 adds evidence-scoped answer checking, one repair attempt with
-rechecking, and consistent uncertainty notices across recovery. It includes
-automatic memory-model setup and remembers successful launch settings.
+Spine v0.3.4 fixes accidental plans, adds a control to discard an active plan,
+and improves shell command checks and web search. Optional browser tools support
+JavaScript pages and forms through a configured WebDriver service. It includes
+evidence-scoped answer checking, automatic memory-model setup, and saved launch settings.
 Download the package for your platform, open Spine, connect your
 model service once, and choose a heart passphrase.
 
@@ -452,6 +453,7 @@ identity, or demographic profiling.
 | Ordinary text while a tool is running | Queues your guidance for the next completed-tool boundary. |
 | `/stop` | Saves a checkpoint and stops gracefully. |
 | `/interrupt` | Stops immediately. |
+| `/discard-plan [reason]` | Discards the active host plan, records the reason, and continues the current task without enforcing a plan. Also available as **Discard plan** in the browser UI. |
 | `/resume` | Continues a saved checkpoint. |
 | `/tasks` | Shows work managed by the host. |
 | `/circuit` | Shows LLM, Thymos, and DCMDb circuit-breaker state. |
@@ -737,8 +739,16 @@ The resulting executable is `target/release/spine`.
 
 The harness accepts native OpenAI tool calls and the reference text forms used
 by existing Spine integrations: canonical, legacy, unfenced, truncated,
-bare-JSON, and Laguna calls. Multi-step plans advance only after tool evidence;
-a response that merely promises more work is not treated as complete.
+bare-JSON, and Laguna calls. Host plans require an explicit `plan` code fence;
+ordinary instructional lists do not create plans. Successful tools advance plan
+steps, and a final writeup can complete the final step. Open plans stop enforcing
+work after repeated turns without progress; a response that merely promises more
+work is not treated as completion.
+
+The text web tools fetch HTML without executing JavaScript. Optional
+[browser tools](docs/browser.md) connect to a WebDriver service for JavaScript
+pages and form interaction. Search tries another engine when a page is an
+interstitial or challenge instead of usable results.
 
 The file reader returns bounded pages with Unicode character offsets and a
 `next_offset` cursor, so the harness can continue reading large files without

@@ -17,6 +17,8 @@ use crate::{
 };
 
 const PLAN_GUIDANCE_MARKER: &str = "[HOST PLAN CONTRACT]";
+const PLAN_DISCARD_MARKER: &str = "[HOST PLAN DISCARDED]";
+const PLAN_DISCARD_GUIDANCE: &str = "\n\n[HOST PLAN DISCARDED]\nThe host plan is discarded for this task. Do not install a replacement plan or follow its old step prompts.";
 const MAX_EMPTY_MODEL_RETRIES: u64 = 1;
 
 #[derive(Clone, Debug)]
@@ -25,6 +27,8 @@ pub struct HarnessConfig {
     pub max_tool_result_chars: usize,
     pub allow_destructive_tools: bool,
     pub enforce_host_plans: bool,
+    /// Consecutive turns without progress on an explicit plan (including tool turns).
+    /// Also bounds tool-free promises made without a plan.
     pub max_empty_plan_continuations: u64,
 }
 
@@ -60,6 +64,7 @@ struct CompletedWork {
 #[derive(Default)]
 struct PendingControls {
     guidance: VecDeque<String>,
+    plan_discards: VecDeque<String>,
 }
 
 #[derive(Clone, Default)]
@@ -84,6 +89,44 @@ impl ControlPlane {
         true
     }
 
+    /// Discard the current task's host plan at the next safe boundary.
+    /// A nonempty operator reason is retained in model context and checkpoints.
+    pub fn request_plan_discard(&self, reason: impl Into<String>) -> bool {
+        let reason = reason.into();
+        let reason = reason.trim();
+        if reason.is_empty() {
+            return false;
+        }
+        self.pending
+            .lock()
+            .expect("operator control lock poisoned")
+            .plan_discards
+            .push_back(reason.to_owned());
+        self.wake.notify_waiters();
+        true
+    }
+
+    fn has_plan_discard(&self) -> bool {
+        !self
+            .pending
+            .lock()
+            .expect("operator control lock poisoned")
+            .plan_discards
+            .is_empty()
+    }
+
+    async fn plan_discard_requested(&self) {
+        loop {
+            let notified = self.wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.has_plan_discard() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     pub fn request_graceful_stop(&self) {
         self.stop.store(true, Ordering::Release);
         self.wake.notify_waiters();
@@ -102,26 +145,27 @@ impl ControlPlane {
     }
 
     fn drain(&self) -> OperatorControls {
-        let guidance = self
-            .pending
-            .lock()
-            .expect("operator control lock poisoned")
-            .guidance
-            .drain(..)
-            .collect();
+        let mut pending = self.pending.lock().expect("operator control lock poisoned");
+        let guidance = pending.guidance.drain(..).collect();
+        let plan_discards = pending.plan_discards.drain(..).collect();
         let stop = self.stop.swap(false, Ordering::AcqRel);
-        OperatorControls { guidance, stop }
+        OperatorControls {
+            guidance,
+            plan_discards,
+            stop,
+        }
     }
 }
 
 struct OperatorControls {
     guidance: Vec<String>,
+    plan_discards: Vec<String>,
     stop: bool,
 }
 
 impl OperatorControls {
     fn is_empty(&self) -> bool {
-        self.guidance.is_empty() && !self.stop
+        self.guidance.is_empty() && self.plan_discards.is_empty() && !self.stop
     }
 }
 
@@ -577,6 +621,7 @@ impl Harness {
             CompletedWork::default(),
             None,
             self.default_policy(),
+            false,
         )
         .await
     }
@@ -590,7 +635,7 @@ impl Harness {
         let task = task.into();
         let mut messages = Vec::with_capacity(history.len() + 2);
         messages.push(Message::new(MessageRole::System, system));
-        messages.extend_from_slice(history);
+        messages.extend(history.iter().cloned().map(clear_task_plan_discard));
         messages.push(Message::new(MessageRole::User, task.clone()));
         self.run_messages(
             messages,
@@ -598,6 +643,7 @@ impl Harness {
             CompletedWork::default(),
             None,
             self.default_policy(),
+            false,
         )
         .await
     }
@@ -612,10 +658,17 @@ impl Harness {
         let task = task.into();
         let mut messages = Vec::with_capacity(history.len() + 2);
         messages.push(Message::new(MessageRole::System, system));
-        messages.extend_from_slice(history);
+        messages.extend(history.iter().cloned().map(clear_task_plan_discard));
         messages.push(Message::new(MessageRole::User, task.clone()));
-        self.run_messages(messages, task, CompletedWork::default(), None, policy)
-            .await
+        self.run_messages(
+            messages,
+            task,
+            CompletedWork::default(),
+            None,
+            policy,
+            false,
+        )
+        .await
     }
 
     fn default_policy(&self) -> HarnessPolicy {
@@ -656,6 +709,7 @@ impl Harness {
                 },
                 previous.host_plan.clone(),
                 previous.policy,
+                task_plan_was_discarded(&previous.messages),
             )
             .await?;
         outcome.usage.add(previous.usage);
@@ -665,6 +719,7 @@ impl Harness {
     pub async fn resume(&self, checkpoint: HarnessCheckpoint) -> Result<RunOutcome> {
         checkpoint.validate()?;
         let policy = self.policy_for_checkpoint(&checkpoint);
+        let plan_discarded = task_plan_was_discarded(&checkpoint.messages);
         let mut messages = checkpoint.messages;
         messages.push(Message::new(
             MessageRole::User,
@@ -682,6 +737,7 @@ impl Harness {
             },
             host_plan,
             policy,
+            plan_discarded,
         )
         .await
     }
@@ -693,6 +749,7 @@ impl Harness {
         completed: CompletedWork,
         host_plan: Option<HostPlan>,
         policy: HarnessPolicy,
+        plan_discarded: bool,
     ) -> Result<RunOutcome> {
         static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
         let now = std::time::SystemTime::now()
@@ -708,7 +765,15 @@ impl Harness {
             start: messages.len(),
         };
         let mut result = self
-            .run_messages_inner(messages, task.clone(), completed, host_plan, policy, &run)
+            .run_messages_inner(
+                messages,
+                task.clone(),
+                completed,
+                host_plan,
+                policy,
+                &run,
+                plan_discarded,
+            )
             .await?;
         self.save_progress(
             &run,
@@ -739,12 +804,13 @@ impl Harness {
         mut host_plan: Option<HostPlan>,
         policy: HarnessPolicy,
         journal_run: &JournalRun,
+        mut plan_discarded: bool,
     ) -> Result<RunOutcome> {
         let mut usage = TokenUsage::default();
         let mut empty_plan_continuations = 0_u64;
         let mut empty_model_retries = 0_u64;
         self.ensure_plan_guidance(&mut messages);
-        loop {
+        'turns: loop {
             self.save_progress(
                 journal_run,
                 &mut messages,
@@ -796,6 +862,15 @@ impl Harness {
                             partial_dirty = false;
                         }
                     }
+                    () = self.controls.plan_discard_requested() => {
+                        let controls = self.controls.drain();
+                        plan_discarded |= self.append_controls(&mut messages, &controls, &mut host_plan);
+                        empty_plan_continuations = 0;
+                        if controls.stop {
+                            return self.finish_gracefully(messages, task, completed, usage, host_plan, policy).await;
+                        }
+                        continue 'turns;
+                    }
                     () = self.controls.stopped(), if !initially_stopping => {
                         break Err(RuntimeError::Provider("stopped by operator".into()));
                     }
@@ -815,6 +890,23 @@ impl Harness {
                             Vec::new(),
                         ));
                     }
+                    // A provider may fail immediately after a discard was queued.
+                    // Apply it before journaling or retrying instead of preserving
+                    // a plan that the operator has already cancelled.
+                    if self.controls.has_plan_discard() {
+                        let controls = self.controls.drain();
+                        plan_discarded |=
+                            self.append_controls(&mut messages, &controls, &mut host_plan);
+                        empty_plan_continuations = 0;
+                        if controls.stop {
+                            return self
+                                .finish_gracefully(
+                                    messages, task, completed, usage, host_plan, policy,
+                                )
+                                .await;
+                        }
+                        continue;
+                    }
                     if !self.controls.stop.load(Ordering::Acquire) {
                         self.save_progress(
                             journal_run,
@@ -828,7 +920,8 @@ impl Harness {
                         )?;
                         return Err(error);
                     }
-                    self.controls.drain();
+                    let controls = self.controls.drain();
+                    self.append_controls(&mut messages, &controls, &mut host_plan);
                     let response = format!(
                         "Model request interrupted or failed: {error}. Completed tool results are retained. Resume when ready; do not repeat completed side effects."
                     );
@@ -860,8 +953,21 @@ impl Harness {
             };
             usage.add(turn.usage);
             let _ = self.events.send(HarnessEvent::ModelTurnCompleted);
+            // An immediately ready provider may win the select above. Honor a queued
+            // discard before installing its plan or dispatching any of its tools.
+            if self.controls.has_plan_discard() {
+                let controls = self.controls.drain();
+                plan_discarded |= self.append_controls(&mut messages, &controls, &mut host_plan);
+                empty_plan_continuations = 0;
+                if controls.stop {
+                    return self
+                        .finish_gracefully(messages, task, completed, usage, host_plan, policy)
+                        .await;
+                }
+                continue;
+            }
             if turn.tool_calls.is_empty() {
-                self.maybe_install_plan(&mut host_plan, &task, &turn.content);
+                self.maybe_install_plan(&mut host_plan, &task, &turn.content, plan_discarded);
                 let controls = self.controls.drain();
                 messages.push(Message::assistant(
                     &turn.content,
@@ -869,14 +975,15 @@ impl Harness {
                     Vec::new(),
                 ));
                 if !controls.is_empty() {
-                    self.append_controls(&mut messages, &controls);
+                    plan_discarded |=
+                        self.append_controls(&mut messages, &controls, &mut host_plan);
                 }
                 if controls.stop {
                     return self
                         .finish_gracefully(messages, task, completed, usage, host_plan, policy)
                         .await;
                 }
-                if !controls.guidance.is_empty() {
+                if !controls.guidance.is_empty() || !controls.plan_discards.is_empty() {
                     self.append_open_plan_prompt(&mut messages, host_plan.as_ref());
                     continue;
                 }
@@ -915,6 +1022,7 @@ impl Harness {
                             && !promised_more_work(&turn.content)
                         {
                             plan.mark_current_done("writeup");
+                            empty_plan_continuations = 0;
                         }
                     }
                     if host_plan.as_ref().is_some_and(|plan| !plan.done()) {
@@ -933,7 +1041,7 @@ impl Harness {
                         self.append_open_plan_prompt(&mut messages, host_plan.as_ref());
                         continue;
                     }
-                    if host_plan.is_none() && promised_more_work(&turn.content) {
+                    if !plan_discarded && host_plan.is_none() && promised_more_work(&turn.content) {
                         empty_plan_continuations = empty_plan_continuations.saturating_add(1);
                         if empty_plan_continuations <= self.config.max_empty_plan_continuations {
                             messages.push(Message::new(
@@ -959,7 +1067,7 @@ impl Harness {
             }
 
             empty_model_retries = 0;
-            self.maybe_install_plan(&mut host_plan, &task, &turn.content);
+            self.maybe_install_plan(&mut host_plan, &task, &turn.content, plan_discarded);
 
             if policy
                 .max_tool_rounds
@@ -1019,9 +1127,7 @@ impl Harness {
                         completed.action_calls = completed.action_calls.saturating_add(1);
                     }
                     let result = self.execute_tool(call, &task).await;
-                    plan_evidence |= self.registry.get(&call.name).is_some_and(|tool| {
-                        tool.spec().category != ToolCategory::Action || result.success
-                    });
+                    plan_evidence |= result.success && result.error.is_none();
                     completed.tool_calls = completed.tool_calls.saturating_add(1);
                     messages.push(Message::tool_result(
                         &call.id,
@@ -1049,7 +1155,8 @@ impl Harness {
                             false,
                         ));
                     }
-                    self.append_controls(&mut messages, &controls);
+                    plan_discarded |=
+                        self.append_controls(&mut messages, &controls, &mut host_plan);
                     boundary_controls = Some(controls);
                     break;
                 }
@@ -1059,6 +1166,7 @@ impl Harness {
                 && let Some(plan) = host_plan.as_mut().filter(|plan| !plan.done())
             {
                 plan.mark_current_done("tools");
+                empty_plan_continuations = 0;
             }
             if boundary_controls
                 .as_ref()
@@ -1067,6 +1175,23 @@ impl Harness {
                 return self
                     .finish_gracefully(messages, task, completed, usage, host_plan, policy)
                     .await;
+            }
+            if self.config.enforce_host_plans
+                && host_plan.as_ref().is_some_and(|plan| !plan.done())
+                && (!plan_evidence || promised_more)
+            {
+                empty_plan_continuations = empty_plan_continuations.saturating_add(1);
+                if empty_plan_continuations > self.config.max_empty_plan_continuations {
+                    messages.push(Message::new(
+                        MessageRole::User,
+                        "[HOST PLAN CEILING] Tool turns did not advance the open step. Return a concise progress report and explicitly state what remains, without claiming that work already completed.",
+                    ));
+                    return self
+                        .finish_without_tools(
+                            messages, task, false, completed, usage, host_plan, policy,
+                        )
+                        .await;
+                }
             }
             self.append_open_plan_prompt(&mut messages, host_plan.as_ref());
         }
@@ -1084,13 +1209,19 @@ impl Harness {
         };
         if !system.content.contains(PLAN_GUIDANCE_MARKER) {
             system.content.push_str(
-                "\n\n[HOST PLAN CONTRACT]\nIf the task needs multiple actions, include a ```plan block with 2-8 short numbered steps and call tools for the current step only. The host advances the cursor only after tool evidence. Never end a response by promising work for later; call the needed tool now.",
+                "\n\n[HOST PLAN CONTRACT]\nIf the task needs multiple actions, include a ```plan block with 2-8 short numbered steps and call tools for the current step only. Only an explicit plan fence installs a host plan; ordinary lists are explanations. The host advances the cursor only after successful tool evidence (or a substantive final-step writeup). Never end a response by promising work for later; call the needed tool now.",
             );
         }
     }
 
-    fn maybe_install_plan(&self, host_plan: &mut Option<HostPlan>, task: &str, response: &str) {
-        if !self.config.enforce_host_plans || host_plan.is_some() {
+    fn maybe_install_plan(
+        &self,
+        host_plan: &mut Option<HostPlan>,
+        task: &str,
+        response: &str,
+        plan_discarded: bool,
+    ) {
+        if !self.config.enforce_host_plans || plan_discarded || host_plan.is_some() {
             return;
         }
         let steps = parse_plan_steps(response);
@@ -1158,7 +1289,35 @@ impl Harness {
         result
     }
 
-    fn append_controls(&self, messages: &mut Vec<Message>, controls: &OperatorControls) {
+    fn append_controls(
+        &self,
+        messages: &mut Vec<Message>,
+        controls: &OperatorControls,
+        host_plan: &mut Option<HostPlan>,
+    ) -> bool {
+        let discarded = !controls.plan_discards.is_empty();
+        if discarded {
+            // The leading system message is replaced for every fresh user task,
+            // but retained on resume/repair. This preserves cancellation without
+            // changing the checkpoint schema or inheriting it from old history.
+            if let Some(system) = messages
+                .iter_mut()
+                .find(|message| message.role == MessageRole::System)
+                && !system
+                    .content
+                    .lines()
+                    .any(|line| line == PLAN_DISCARD_MARKER)
+            {
+                system.content.push_str(PLAN_DISCARD_GUIDANCE);
+            }
+            let previous = host_plan
+                .take()
+                .map_or_else(|| "No active host plan.".to_owned(), |plan| plan.progress());
+            messages.push(Message::new(
+                MessageRole::User,
+                format!("{PLAN_DISCARD_MARKER}\nOperator reason: {}\nDiscarded state:\n{previous}\nThe host plan is cleared for this task, including resume. Do not reinstall it or continue its steps. Answer the operator's task from retained results and guidance.", controls.plan_discards.join("\n")),
+            ));
+        }
         if !controls.guidance.is_empty() {
             let _ = self.events.send(HarnessEvent::GuidanceInjected {
                 messages: controls.guidance.clone(),
@@ -1178,6 +1337,7 @@ impl Harness {
                 "[OPERATOR GRACEFUL STOP] Preserve completed work, state open obligations, and return a concise resumable summary without more tools.",
             ));
         }
+        discarded
     }
 
     async fn finish_gracefully(
@@ -1201,7 +1361,7 @@ impl Harness {
         stopped_gracefully: bool,
         completed: CompletedWork,
         mut usage: TokenUsage,
-        host_plan: Option<HostPlan>,
+        mut host_plan: Option<HostPlan>,
         policy: HarnessPolicy,
     ) -> Result<RunOutcome> {
         let completion = self.provider.complete(CompletionRequest {
@@ -1219,13 +1379,18 @@ impl Harness {
                 Err(_) => Err(RuntimeError::Provider("summary deadline reached".into())),
             },
             () = self.controls.stopped() => Err(RuntimeError::Provider("summary stopped by operator".into())),
+            () = self.controls.plan_discard_requested() => Err(RuntimeError::Provider("summary interrupted by plan discard".into())),
         }.unwrap_or_else(|error| crate::ModelTurn {
             content: format!("Stopped at a safe boundary. Completed tool results are retained; model summary unavailable: {error}"),
             ..crate::ModelTurn::default()
         });
-        let stopped_gracefully = self.controls.drain().stop || stopped_gracefully;
+        let controls = self.controls.drain();
+        self.append_controls(&mut messages, &controls, &mut host_plan);
+        let stopped_gracefully = controls.stop || stopped_gracefully;
         usage.add(turn.usage);
-        let response = if turn.content.trim().is_empty() {
+        let response = if !controls.plan_discards.is_empty() {
+            "Host plan discarded at a safe boundary. Completed tool results are retained; the discarded plan will not resume.".into()
+        } else if turn.content.trim().is_empty() {
             "Stopped at a safe tool boundary; completed results are retained in the checkpoint."
                 .into()
         } else {
@@ -1256,4 +1421,25 @@ impl Harness {
             host_plan,
         })
     }
+}
+
+// This host-authored system state is retained by the existing checkpoint schema.
+// Fresh tasks deliberately ignore prior controls; resume/repair retain cancellation.
+fn task_plan_was_discarded(messages: &[Message]) -> bool {
+    messages
+        .iter()
+        .find(|message| message.role == MessageRole::System)
+        .is_some_and(|message| {
+            message
+                .content
+                .lines()
+                .any(|line| line == PLAN_DISCARD_MARKER)
+        })
+}
+
+fn clear_task_plan_discard(mut message: Message) -> Message {
+    if message.role == MessageRole::System {
+        message.content = message.content.replace(PLAN_DISCARD_GUIDANCE, "");
+    }
+    message
 }

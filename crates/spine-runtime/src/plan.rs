@@ -102,28 +102,56 @@ impl HostPlan {
     }
 }
 
+/// Only a standalone, explicitly labeled Markdown plan fence opts into host control.
 pub fn parse_plan_steps(text: &str) -> Vec<String> {
-    static FENCE: OnceLock<Regex> = OnceLock::new();
-    let fence = FENCE
-        .get_or_init(|| Regex::new(r"(?is)```plan\s*\n(.*?)```").expect("static plan fence regex"));
-    if let Some(captures) = fence.captures(text) {
-        let body = captures.get(1).map_or("", |item| item.as_str()).trim();
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
-            let values = value
-                .as_array()
-                .or_else(|| value.get("steps").and_then(|steps| steps.as_array()));
-            if let Some(values) = values {
-                return clean_steps(
-                    values
-                        .iter()
-                        .filter_map(|value| value.as_str())
-                        .map(str::to_owned),
-                );
+    let mut fence: Option<(char, usize, bool)> = None;
+    let mut body = String::new();
+    for line in text.lines() {
+        let trimmed = line.trim_start_matches(' ');
+        let indent = line.len() - trimmed.len();
+        let marker = trimmed.chars().next().unwrap_or(' ');
+        let width = trimmed.chars().take_while(|value| *value == marker).count();
+        let is_fence = indent <= 3 && matches!(marker, '`' | '~') && width >= 3;
+        if let Some((open_marker, open_width, is_plan)) = fence {
+            if is_fence
+                && marker == open_marker
+                && width >= open_width
+                && trimmed[width..].trim().is_empty()
+            {
+                if is_plan {
+                    return parse_plan_body(body.trim());
+                }
+                fence = None;
+            } else if is_plan {
+                body.push_str(line);
+                body.push('\n');
             }
+        } else if is_fence {
+            fence = Some((
+                marker,
+                width,
+                marker == '`' && trimmed[width..].trim().eq_ignore_ascii_case("plan"),
+            ));
         }
-        return numbered_steps(body, false);
     }
-    numbered_steps(text, true)
+    Vec::new()
+}
+
+fn parse_plan_body(body: &str) -> Vec<String> {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+        let values = value
+            .as_array()
+            .or_else(|| value.get("steps").and_then(|steps| steps.as_array()));
+        if let Some(values) = values {
+            return clean_steps(
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .map(str::to_owned),
+            );
+        }
+    }
+    numbered_steps(body)
 }
 
 pub fn promised_more_work(text: &str) -> bool {
@@ -148,20 +176,14 @@ pub fn promised_more_work(text: &str) -> bool {
     })
 }
 
-fn numbered_steps(text: &str, require_action: bool) -> Vec<String> {
+fn numbered_steps(text: &str) -> Vec<String> {
     static NUMBERED: OnceLock<Regex> = OnceLock::new();
-    static ACTION: OnceLock<Regex> = OnceLock::new();
     let numbered = NUMBERED.get_or_init(|| {
         Regex::new(r"(?m)^\s*(?:\d+[.)-]|[-*])\s+(\S.+)$").expect("static numbered regex")
     });
-    let action = ACTION.get_or_init(|| {
-        Regex::new(r"(?i)\b(list|read|open|find|search|inspect|check|run|group|summarize|compare|locate|scan|collect|map|pull|look|test|verify|investigate|edit|update|change|fix|implement)\b")
-            .expect("static plan-action regex")
-    });
     clean_steps(numbered.captures_iter(text).filter_map(|captures| {
         let line = captures.get(1)?.as_str().trim();
-        (line.chars().count() <= 160 && (!require_action || action.is_match(line)))
-            .then(|| line.to_owned())
+        (line.chars().count() <= 160).then(|| line.to_owned())
     }))
 }
 
@@ -203,6 +225,41 @@ mod tests {
             parse_plan_steps("1. kangaroo — confidence 0.8\n2. sims — confidence 0.4").is_empty()
         );
         assert!(parse_plan_steps("```plan\n1. Only one\n```").is_empty());
+    }
+
+    #[test]
+    fn ordinary_lists_and_other_fences_never_install_a_plan() {
+        for text in [
+            "1. Open account settings.\n2. **Permissions:** select **Read and write**.",
+            "- **Permissions:** choose **Read** and write\n- **Repository:** **Open** access is disabled",
+            "```text\n1. Read the page\n2. Open settings\n```",
+            "````text\n```plan\n1. Read the page\n2. Open settings\n```\n````",
+            "> ```plan\n> 1. Read the page\n> 2. Open settings\n> ```",
+            "Example: ```plan\n1. Read the page\n2. Open settings\n```",
+            "```plan\n1. Read the page\n2. Open settings",
+            "```planet\n1. Read the page\n2. Open settings\n```",
+        ] {
+            assert!(parse_plan_steps(text).is_empty(), "{text}");
+        }
+    }
+
+    #[test]
+    fn explicit_plans_retain_bounds_and_case_insensitive_deduplication() {
+        assert_eq!(
+            parse_plan_steps("```text\nexample\n```\n```PLAN\n[\"alpha\", \"beta\"]\n```"),
+            ["alpha", "beta"]
+        );
+        assert!(parse_plan_steps("```plan\n1. Read page\n2. read PAGE\n```").is_empty());
+        let nine = (1..=9)
+            .map(|i| format!("{i}. Read page {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(parse_plan_steps(&format!("```plan\n{nine}\n```")).is_empty());
+        let long = format!(
+            "```plan\n1. Read {}\n2. Open settings\n```",
+            "x".repeat(161)
+        );
+        assert!(parse_plan_steps(&long).is_empty());
     }
 
     #[test]
