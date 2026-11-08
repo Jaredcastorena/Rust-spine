@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- Require explicit `plan` fences before enforcing host plans. Add terminal and
+  web controls to discard an active plan across resume, count tool turns that
+  make no plan progress, and stop treating failed tools as step completion.
+- Classify destructive shell operations by command position, accounting for
+  quoting, comments, substitutions and common wrappers. Harmless arguments such
+  as `echo "confirm repo"` no longer trigger the deletion gate.
+- Reject search interstitials and challenges, continue to another engine, and
+  prefer an HTML search endpoint. Keep rejected pages out of navigation history.
+- Add optional JavaScript browser and form tools through a separately configured
+  WebDriver service. See [Browser tools](docs/browser.md) for setup and limits.
+
 ## 0.3.3 — 2026-11-05
 
 - Check full answer statements so ASCII and Unicode string assertions cannot

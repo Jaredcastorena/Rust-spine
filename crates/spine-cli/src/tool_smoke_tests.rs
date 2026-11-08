@@ -1059,6 +1059,59 @@ async fn subagent_tools_start_report_finish_and_cancel() {
 }
 
 #[tokio::test]
+async fn harness_allows_harmless_shell_arguments_without_disabling_the_gate() {
+    let fixture = fixture(false, false);
+    let expected = [
+        "confirm repo",
+        "form something",
+        "alarm clock",
+        "xrm y",
+        "confirm",
+        "platform",
+        "term",
+        "rm",
+    ];
+    let provider = Arc::new(ScriptedProvider {
+        turns: Mutex::new(VecDeque::from([
+            ModelTurn {
+                tool_calls: expected
+                    .iter()
+                    .enumerate()
+                    .map(|(index, text)| ToolCall {
+                        id: format!("echo-{index}"),
+                        name: "shell".into(),
+                        arguments: json!({"command":format!("echo \"{text}\"")}),
+                    })
+                    .collect(),
+                ..ModelTurn::default()
+            },
+            ModelTurn {
+                content: "Output probes complete.".into(),
+                ..ModelTurn::default()
+            },
+        ])),
+    });
+    let harness = Harness::new(provider, fixture.registry, HarnessConfig::default()).unwrap();
+    let outcome = harness
+        .run("test system", "run harmless output probes")
+        .await
+        .unwrap();
+    let results: Vec<_> = outcome
+        .messages
+        .iter()
+        .filter(|message| message.role == MessageRole::Tool)
+        .collect();
+    assert_eq!(results.len(), expected.len());
+    for (result, text) in results.iter().zip(expected) {
+        assert_eq!(result.tool_succeeded, Some(true), "{}", result.content);
+        assert!(result.content.contains(text), "{}", result.content);
+        assert!(result.content.contains("exit_code=0"), "{}", result.content);
+    }
+    let audit = fs::read_to_string(fixture.audit_path).unwrap();
+    assert_eq!(audit.lines().count(), expected.len());
+}
+
+#[tokio::test]
 async fn harness_blocks_a_real_destructive_shell_call_by_default() {
     let fixture = fixture(false, false);
     let victim = fixture._directory.path().join("victim.txt");
