@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.4 — 2026-11-08
 
 - Require explicit `plan` fences before enforcing host plans. Add terminal and
   web controls to discard an active plan across resume, count tool turns that
