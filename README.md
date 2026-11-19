@@ -7,10 +7,10 @@ Python, Node.js, npm, or separate web server to install.
 
 ## First-time setup
 
-Spine v0.3.4 fixes accidental plans, adds a control to discard an active plan,
-and improves shell command checks and web search. Optional browser tools support
-JavaScript pages and forms through a configured WebDriver service. It includes
-evidence-scoped answer checking, automatic memory-model setup, and saved launch settings.
+Spine v0.3.5 improves answer checking, recovers complete recalled evidence when
+available, and reports failed repairs and unresolved details more accurately.
+It includes automatic memory-model setup, saved launch settings, and optional
+browser tools for JavaScript pages and forms through a configured WebDriver service.
 Download the package for your platform, open Spine, connect your
 model service once, and choose a heart passphrase.
 
