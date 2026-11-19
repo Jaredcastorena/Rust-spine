@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Keep greetings, emoji and complete questions out of factual claims; allow compatible partial quantity evidence without suppressing complete support.
+- Check standalone quoted drafting text as proposed wording while retaining exact-quotation checks for explicit exact-word requests.
+- Recover bounded complete canonical recall records before deciding that previews leave evidence missing.
+- Treat exhausted empty repairs as failures, retain completed work, and identify unresolved claims in completed verification notices.
+
 ## 0.3.4 — 2026-11-08
 
 - Require explicit `plan` fences before enforcing host plans. Add terminal and
