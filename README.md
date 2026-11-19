@@ -691,6 +691,9 @@ Rust is needed only when building from source.
 
 ## Developer reference
 
+[How Experience Becomes Structure](docs/images/how-experience-becomes-structure.png)
+is a mathematical field guide to DCMDb memory and the linear Thymos variant.
+
 ### What is in this repository
 
 - `spine-heart`: encrypted storage, identity, DCMDb memory, Thymos state,
