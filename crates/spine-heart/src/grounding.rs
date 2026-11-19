@@ -595,6 +595,20 @@ impl<M: NliModel> GroundingVerifier<M> {
         // Extra source numbers need not change a claimed fact (opening and
         // closing times, or "six inspected, not one wet"). Preserve the whole
         // original pair for inference when every claimed quantity is present.
+        // Partial positive measurements cannot establish the full claim, but
+        // provide no incompatible quantity to veto a complete source.
+        if p_dates.is_empty()
+            && h_dates.is_empty()
+            && p_relation.is_some()
+            && p_relation == h_relation
+            && !negative_text(premise)
+            && !negative_text(hypothesis)
+            && p_quantities.len() < h_quantities.len()
+            && quantity_subset(&p_quantities, &h_quantities)
+            && (p_quantities.is_empty() || p_tokens.is_subset(&h_tokens))
+        {
+            return PairRule::Irrelevant;
+        }
         if p_quantities.len() != h_quantities.len() {
             return if h_dates.is_empty()
                 && p_dates.is_empty()
@@ -719,6 +733,11 @@ impl<M: NliModel> GroundingVerifier<M> {
     fn statements<'a>(&self, text: &'a str) -> Vec<&'a str> {
         let mut statements = Vec::new();
         for sentence in sentence_spans(text) {
+            // Keep interrogatives whole: conjunctions do not create assertions.
+            if starts_question(clean_statement(sentence)) {
+                statements.push(sentence);
+                continue;
+            }
             let lower = clean_statement(sentence).to_lowercase();
             let conditional = ["if ", "assuming ", "suppose ", "supposing ", "imagine "]
                 .iter()
@@ -932,7 +951,7 @@ fn has_nonassertive_prefix(text: &str) -> bool {
 
 fn is_nonfactual(text: &str) -> bool {
     let text = clean_statement(text);
-    if text.ends_with('?') || starts_question(text) {
+    if !text.chars().any(char::is_alphanumeric) || text.ends_with('?') || starts_question(text) {
         return true;
     }
     let lower = text.to_lowercase();
@@ -948,6 +967,8 @@ fn is_nonfactual(text: &str) -> bool {
         "got it",
         "sure",
         "hello",
+        "howdy",
+        "hey",
         "hi",
         "done",
         "understood, thanks",

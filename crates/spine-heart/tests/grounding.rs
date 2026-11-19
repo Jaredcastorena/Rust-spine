@@ -201,8 +201,9 @@ fn no_recognized_attribute_still_gets_a_report_without_evidence() {
         .unwrap()
         .verify("Whales can fly. 🧭", &[], 0.8)
         .unwrap();
-    assert_eq!(report.claim_count(), 2);
-    assert!(report.claims.iter().all(|c| c.verdict == V::Unverified));
+    assert_eq!(report.claim_count(), 1);
+    assert_eq!(report.claims[0].verdict, V::Unverified);
+    assert_eq!(report.claims[1].verdict, V::NonFactual);
     assert!(report.needs_repair());
     assert_eq!(report.risk_target(), Some(1.0));
 }
@@ -954,4 +955,30 @@ fn unsupported_exponent_forms_cannot_escape_numeric_checks() {
         assert_eq!(report.claims[0].verdict, V::Unverified);
         assert_eq!(report.evaluated_pairs, 0);
     }
+}
+
+#[test]
+fn reported_greetings_questions_and_partial_sources_do_not_force_repair() {
+    let verifier = GroundingVerifier::new(Model::new([-10.0, 10.0, -10.0])).unwrap();
+    for text in [
+        "Howdy! 👋",
+        "How many tiles and trays does the kiln hold, and what temperature does it reach?",
+    ] {
+        assert_eq!(
+            verifier.verify(text, &[], 0.65).unwrap().claim_count(),
+            0,
+            "{text}"
+        );
+    }
+    let report = verifier
+        .verify(
+            "The kiln holds 12 tiles.",
+            &[
+                source("The kiln holds 12 tiles."),
+                source("The kiln holds glazed tiles."),
+            ],
+            0.65,
+        )
+        .unwrap();
+    assert!(!report.needs_repair(), "{report:?}");
 }

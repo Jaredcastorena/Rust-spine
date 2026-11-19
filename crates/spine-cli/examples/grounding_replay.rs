@@ -13,6 +13,8 @@ mod grounding {
 #[derive(Deserialize)]
 struct Case {
     id: String,
+    #[serde(default)]
+    task: String,
     group: String,
     response: String,
     evidence: Vec<String>,
@@ -41,7 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .collect::<Vec<_>>();
             let started = Instant::now();
-            let result = gate.verify(&case.response, &evidence, 0.65);
+            let result = gate.verify_for_task(&case.task, &case.response, &evidence, 0.65);
             let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
             let (repair, label, report, error) = match result {
                 Ok(decision) => {

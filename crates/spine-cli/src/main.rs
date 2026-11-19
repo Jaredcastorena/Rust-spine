@@ -1456,13 +1456,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             let grounding_recall =
                                 grounding::recall_with_rehydrated(&recalled, &triangle_context);
+                            let grounding_task = outcome
+                                .messages
+                                .iter()
+                                .rev()
+                                .find(|m| {
+                                    m.role == spine_runtime::MessageRole::User
+                                        && !m.content.starts_with("[HOST ")
+                                })
+                                .map(|m| m.content.clone())
+                                .unwrap_or_default();
                             let mut grounded = grounding::ground_answer(
                                 outcome,
                                 &grounding_recall,
                                 persist_start.saturating_sub(1),
                                 policy.coverage_threshold,
                                 |response, evidence, threshold| {
-                                    gate.verify(response, evidence, threshold)
+                                    gate.verify_for_task(
+                                        &grounding_task,
+                                        response,
+                                        &grounding::rehydrate_evidence(&heart, evidence)?,
+                                        threshold,
+                                    )
                                 },
                                 |previous, repair_task| {
                                     let (
@@ -1861,13 +1876,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // Legacy checkpoints do not carry an evidence-scope boundary.
                         // Resume may recall sources again; historical messages alone
                         // cannot silently become fresh verification evidence.
+                        let grounding_task = outcome
+                            .messages
+                            .iter()
+                            .rev()
+                            .find(|m| {
+                                m.role == spine_runtime::MessageRole::User
+                                    && !m.content.starts_with("[HOST ")
+                                    && !m.content.starts_with("[RESUME FROM SAFE CHECKPOINT]")
+                            })
+                            .map(|m| m.content.clone())
+                            .unwrap_or_default();
                         let mut grounded = grounding::ground_answer(
                             outcome,
                             "[]",
                             persist_start,
                             0.8,
                             |response, evidence, threshold| {
-                                gate.verify(response, evidence, threshold)
+                                gate.verify_for_task(
+                                    &grounding_task,
+                                    response,
+                                    &grounding::rehydrate_evidence(&heart, evidence)?,
+                                    threshold,
+                                )
                             },
                             |previous, repair_task| {
                                 let (

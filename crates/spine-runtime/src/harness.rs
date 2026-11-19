@@ -997,6 +997,10 @@ impl Harness {
                         self.append_open_plan_prompt(&mut messages, host_plan.as_ref());
                         continue;
                     }
+                    messages.push(Message::new(
+                        MessageRole::System,
+                        "[HOST EMPTY RESPONSE EXHAUSTED]",
+                    ));
                     let response = "The provider returned repeated empty responses. Completed tool results were retained; please retry the request.".to_owned();
                     messages.push(Message::new(MessageRole::Assistant, &response));
                     return Ok(RunOutcome {

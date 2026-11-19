@@ -20,6 +20,8 @@ request. Additional recall during repair is therefore available for the second
 check. Older checkpoints do not reliably identify their original evidence
 boundary; resumed work can retrieve those sources again.
 
+Clipped recall evidence is reloaded by its already-selected event ID when a complete, bounded canonical record is available. Canonical role, success and provenance checks still apply. Missing or oversized records retain uncertainty.
+
 Every assessed statement receives an explicit disposition:
 
 | Disposition | Meaning |
@@ -50,6 +52,8 @@ synthetic past-tense sentences. Confirmed exact comparisons do not receive an
 unrelated semantic veto. Relevant incompletely interpreted competing evidence
 remains unresolved.
 
+For explicit drafting requests, outer quotation marks around the entire proposed answer delimit wording; the enclosed factual text is still checked. Requests for exact or verbatim source words retain literal quotation checking. Inline attributed quotations remain literal.
+
 Reports include evidence IDs, the method used, and optional NLI scores.
 Unevaluated statements do not receive fabricated zero probabilities. Coverage
 is the fraction of factual statements supported; it is distinct from an NLI
@@ -62,6 +66,8 @@ repaired answer is checked against the original evidence and any additional
 eligible evidence obtained during repair. The final answer receives an explicit
 uncertainty caveat when claims remain unresolved, verification fails, repair
 fails or is interrupted, or work stops before checking finishes.
+
+Completed checks name unresolved details in the notice. Incomplete checks retain a general caveat. An exhausted empty provider response is runtime retry guidance, not a corrected answer to verify; the rejected draft remains caveated and completed tool work is retained.
 
 The visible answer, transcript, and checkpoint carry the same final caveat.
 Device-local journals mark output awaiting grounding. Failed or interrupted

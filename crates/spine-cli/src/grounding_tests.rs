@@ -65,7 +65,7 @@ fn recall(text: &str) -> String {
 }
 fn assert_caveated(result: &GroundedAnswer) {
     assert!(result.caveated);
-    assert!(result.outcome.response.contains(TERMINAL_CAVEAT));
+    assert!(result.outcome.response.contains("I could not verify"));
     assert_eq!(
         result.outcome.messages.last().unwrap().content,
         result.outcome.response
@@ -1317,4 +1317,157 @@ async fn duplicate_tool_ids_cannot_launder_model_output_through_persistence_and_
             "{evidence:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn reported_empty_repair_is_not_a_completed_correction() {
+    let harness = Harness::new(
+        provider(vec![answer("The label is B2."), answer(""), answer("")]),
+        ToolRegistry::default(),
+        config(),
+    )
+    .unwrap();
+    let draft = harness.run("system", "Describe the label").await.unwrap();
+    let verifier = GroundingVerifier::new(NeutralNli).unwrap();
+    let result = ground_answer(
+        draft,
+        &recall("The label is A1."),
+        2,
+        0.65,
+        |text, evidence, threshold| check(&verifier, text, evidence, threshold),
+        |draft, feedback| async move { harness.repair(&draft, feedback).await.map(Some) },
+    )
+    .await;
+    assert!(
+        matches!(result.repair, RepairState::Failed(_)),
+        "{:?}",
+        result.repair
+    );
+    assert_eq!(
+        result
+            .outcome
+            .response
+            .matches("please retry the request")
+            .count(),
+        1
+    );
+    assert_eq!(
+        result
+            .outcome
+            .messages
+            .iter()
+            .map(|m| m.content.matches("please retry the request").count())
+            .sum::<usize>(),
+        1
+    );
+    assert!(result.final_decision.is_none());
+}
+
+#[tokio::test]
+async fn reported_unresolved_notice_identifies_the_claim() {
+    let text = "The label is A1. The workshop has a balcony.";
+    let harness = Harness::new(
+        provider(vec![answer(text), answer(text)]),
+        ToolRegistry::default(),
+        config(),
+    )
+    .unwrap();
+    let draft = harness
+        .run("system", "Describe the workshop")
+        .await
+        .unwrap();
+    let verifier = GroundingVerifier::new(NeutralNli).unwrap();
+    let result = ground_answer(
+        draft,
+        &recall("The label is A1."),
+        2,
+        0.65,
+        |text, evidence, threshold| check(&verifier, text, evidence, threshold),
+        |draft, feedback| async move { harness.repair(&draft, feedback).await.map(Some) },
+    )
+    .await;
+    let notice = result.outcome.response.strip_prefix(text).unwrap();
+    assert!(notice.contains("balcony"), "{notice}");
+    assert!(!notice.contains("A1"));
+}
+
+#[test]
+fn reported_clipped_nested_recall_requires_full_evidence() {
+    let nested =
+        json!([{"event_id":"cart", "role":"User", "text":"The cart is blue. ".repeat(210)}])
+            .to_string();
+    let records = |text: &str| {
+        json!([
+        {"event_id":"label", "role":"User", "text":"The label is A1."},
+        {"event_id":"search", "role":"Tool", "kind":"ToolResult", "tool_name":"search_memory", "tool_succeeded":true,"text":text}
+    ]).to_string()
+    };
+    let verifier = GroundingVerifier::new(NeutralNli).unwrap();
+    let full = evidence_from_recall_and_messages(&records(&nested), &[]);
+    assert!(
+        !verifier
+            .verify("The label is A1.", &full, 0.65)
+            .unwrap()
+            .needs_repair()
+    );
+    let clipped = evidence_from_recall_and_messages(
+        &records(&format!("{}\n[truncated]", &nested[..3000])),
+        &[],
+    );
+    assert!(
+        verifier
+            .verify("The label is A1.", &clipped, 0.65)
+            .unwrap()
+            .needs_repair()
+    );
+}
+
+#[test]
+fn clipped_recall_rehydrates_only_selected_canonical_sources() {
+    use spine_heart::{
+        Content, EventKind, InteractionInput, ParticipantRole, Provenance, ToolExchange,
+    };
+    let (_directory, heart, _encoder, agent, thread) = journal_fixture();
+    let nested =
+        json!([{"event_id":"cart", "role":"User", "text":"The cart is blue. ".repeat(210)}])
+            .to_string();
+    for succeeded in [true, false] {
+        let receipt = heart
+            .commit_interaction(InteractionInput {
+                agent_id: agent.clone(),
+                thread_id: thread.clone(),
+                role: ParticipantRole::Tool,
+                kind: EventKind::ToolResult,
+                content: Content::Inline(nested.clone()),
+                causal_parents: vec![],
+                provenance: Provenance::default(),
+                tool: Some(ToolExchange {
+                    operation_id: format!("recall-{succeeded}"),
+                    tool_name: "search_memory".into(),
+                    arguments: Content::Inline("{}".into()),
+                    result: None,
+                    succeeded: Some(succeeded),
+                    background: false,
+                }),
+                attachments: vec![],
+                outcome: None,
+            })
+            .unwrap();
+        let selected = vec![GroundingEvidence {
+            id: format!("memory:{}", receipt.event.id),
+            text: "[truncated]".into(),
+        }];
+        let hydrated = rehydrate_evidence(&heart, &selected).unwrap();
+        if succeeded {
+            assert_eq!(hydrated[0].id, "memory:cart");
+            assert!(hydrated[0].text.contains("cart is blue"));
+        } else {
+            assert_eq!(hydrated, selected);
+        }
+    }
+    let missing = vec![GroundingEvidence {
+        id: "memory:missing".into(),
+        text: "[truncated]".into(),
+    }];
+    assert_eq!(rehydrate_evidence(&heart, &missing).unwrap(), missing);
 }
