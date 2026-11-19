@@ -1107,20 +1107,22 @@ mod tests {
     #[tokio::test]
     async fn timeout_size_and_malformed_response_fail_closed() {
         let mut delayed = snapshot();
-        delayed.delay = Duration::from_millis(200);
+        delayed.delay = Duration::from_secs(3);
         let malformed = Reply {
             status: StatusCode::OK,
             body: "secret-invalid-json".into(),
-            delay: Duration::ZERO,
+            delay: Duration::from_millis(200),
         };
         let oversized = Reply::value(json!("x".repeat(MAX_RESPONSE_BYTES)));
-        for (reply, expected) in [
-            (delayed, "timed out"),
-            (malformed, "invalid JSON"),
-            (oversized, "size limit"),
+        // Only the timeout scenario needs a short deadline. Slow CI runners
+        // must still reach JSON parsing and size validation in the other cases.
+        for (reply, expected, timeout) in [
+            (delayed, "timed out", Duration::from_secs(1)),
+            (malformed, "invalid JSON", REQUEST_TIMEOUT),
+            (oversized, "size limit", REQUEST_TIMEOUT),
         ] {
             let fixture = Fixture::start(vec![session(), null(), snapshot(), reply, null()]).await;
-            let browser = fixture.browser(Duration::from_millis(80));
+            let browser = fixture.browser(timeout);
             open(&browser).await;
             let error = browser
                 .execute(Action::Snapshot, &json!({}))
