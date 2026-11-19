@@ -982,3 +982,47 @@ fn reported_greetings_questions_and_partial_sources_do_not_force_repair() {
         .unwrap();
     assert!(!report.needs_repair(), "{report:?}");
 }
+
+#[test]
+fn partial_measurement_does_not_hide_explicit_absence() {
+    let verifier = GroundingVerifier::new(Model::new([0.0, 0.0, 10.0])).unwrap();
+    for text in ["The kiln holds no tiles.", "The kiln holds nothing."] {
+        let report = verifier
+            .verify(
+                "The kiln holds 12 tiles.",
+                &[source("The kiln holds 12 tiles."), source(text)],
+                0.65,
+            )
+            .unwrap();
+        assert!(report.needs_repair(), "{text}: {report:?}");
+    }
+}
+
+#[test]
+fn partial_measurements_keep_counts_bound_to_objects() {
+    let verifier = GroundingVerifier::new(Model::new([0.0, 0.0, 10.0])).unwrap();
+    let claim = "The kiln holds 12 tiles and 3 trays.";
+    let report = verifier
+        .verify(
+            claim,
+            &[source(claim), source("The kiln holds 12 trays.")],
+            0.65,
+        )
+        .unwrap();
+    assert!(report.needs_repair(), "{report:?}");
+}
+
+#[test]
+fn partial_measurement_does_not_hide_exclusive_objects() {
+    let verifier = GroundingVerifier::new(Model::new([0.0, 0.0, 10.0])).unwrap();
+    let claim = "The kiln holds 12 tiles and 3 trays.";
+    for text in [
+        "The kiln holds only tiles.",
+        "The kiln holds tiles exclusively.",
+    ] {
+        let report = verifier
+            .verify(claim, &[source(claim), source(text)], 0.65)
+            .unwrap();
+        assert!(report.needs_repair(), "{text}: {report:?}");
+    }
+}

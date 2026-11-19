@@ -595,6 +595,40 @@ impl<M: NliModel> GroundingVerifier<M> {
         // Extra source numbers need not change a claimed fact (opening and
         // closing times, or "six inspected, not one wet"). Preserve the whole
         // original pair for inference when every claimed quantity is present.
+        // Preserve the object immediately following each count. A bag of numbers
+        // could otherwise confuse 12 trays with 12 tiles and 3 trays.
+        let bindings = |text: &str| {
+            self.numbers
+                .find_iter(text)
+                .map(|m| {
+                    (
+                        m.as_str().to_lowercase(),
+                        text[m.end()..]
+                            .trim_start()
+                            .split(|c: char| !c.is_alphanumeric())
+                            .next()
+                            .unwrap_or("")
+                            .to_lowercase(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let p_bindings = bindings(&p_without_dates);
+        let h_bindings = bindings(&h_without_dates);
+        let p_lower = premise.to_lowercase();
+        if let Some(prefix) = p_lower
+            .trim_end_matches(['.', '!', ';'])
+            .strip_suffix("nothing")
+            && p_relation.is_some()
+            && p_relation == h_relation
+            && !prefix.trim().is_empty()
+            && !negative_text(hypothesis)
+            && !h_tokens.contains("no")
+            && hypothesis.to_lowercase().starts_with(prefix)
+            && h_quantities.iter().any(|q| q.value.coefficient > 0)
+        {
+            return PairRule::Contradicted;
+        }
         // Partial positive measurements cannot establish the full claim, but
         // provide no incompatible quantity to veto a complete source.
         if p_dates.is_empty()
@@ -602,10 +636,26 @@ impl<M: NliModel> GroundingVerifier<M> {
             && p_relation.is_some()
             && p_relation == h_relation
             && !negative_text(premise)
+            && ![
+                "no",
+                "none",
+                "nothing",
+                "neither",
+                "without",
+                "empty",
+                "only",
+                "exclusively",
+            ]
+            .iter()
+            .any(|word| p_tokens.contains(*word))
             && !negative_text(hypothesis)
             && p_quantities.len() < h_quantities.len()
             && quantity_subset(&p_quantities, &h_quantities)
-            && (p_quantities.is_empty() || p_tokens.is_subset(&h_tokens))
+            && (p_quantities.is_empty()
+                || (p_tokens.is_subset(&h_tokens)
+                    && p_bindings
+                        .iter()
+                        .all(|binding| h_bindings.contains(binding))))
         {
             return PairRule::Irrelevant;
         }

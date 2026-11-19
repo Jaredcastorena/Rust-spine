@@ -98,5 +98,77 @@
     "expected": "supported",
     "should_repair": false,
     "note": "Partial duplicate does not veto"
+  },
+  {
+    "id": "52-no-tiles",
+    "group": "control",
+    "response": "The kiln holds 12 tiles.",
+    "evidence": [
+      "The kiln holds 12 tiles.",
+      "The kiln holds no tiles."
+    ],
+    "expected": "unverified",
+    "should_repair": true,
+    "note": "Independent review regression: preserve absence and object/count binding"
+  },
+  {
+    "id": "52-nothing",
+    "group": "control",
+    "response": "The kiln holds 12 tiles.",
+    "evidence": [
+      "The kiln holds 12 tiles.",
+      "The kiln holds nothing."
+    ],
+    "expected": "conflicting",
+    "should_repair": true,
+    "note": "Independent review regression: preserve absence and object/count binding"
+  },
+  {
+    "id": "52-count-object",
+    "group": "control",
+    "response": "The kiln holds 12 tiles and 3 trays.",
+    "evidence": [
+      "The kiln holds 12 tiles and 3 trays.",
+      "The kiln holds 12 trays."
+    ],
+    "expected": "unverified",
+    "should_repair": true,
+    "note": "Independent review regression: preserve absence and object/count binding"
+  },
+  {
+    "id": "52-compatible-trays",
+    "group": "control",
+    "response": "The kiln holds 12 tiles and 3 trays.",
+    "evidence": [
+      "The kiln holds 12 tiles and 3 trays.",
+      "The kiln holds 3 trays."
+    ],
+    "expected": "supported",
+    "should_repair": false,
+    "note": "Independent review regression: preserve absence and object/count binding"
+  },
+  {
+    "id": "52-only",
+    "group": "control",
+    "response": "The kiln holds 12 tiles and 3 trays.",
+    "evidence": [
+      "The kiln holds 12 tiles and 3 trays.",
+      "The kiln holds only tiles."
+    ],
+    "expected": "unverified",
+    "should_repair": true,
+    "note": "Exclusive object restrictions cannot be discarded as compatible partial quantities"
+  },
+  {
+    "id": "52-exclusively",
+    "group": "control",
+    "response": "The kiln holds 12 tiles and 3 trays.",
+    "evidence": [
+      "The kiln holds 12 tiles and 3 trays.",
+      "The kiln holds tiles exclusively."
+    ],
+    "expected": "unverified",
+    "should_repair": true,
+    "note": "Exclusive object restrictions cannot be discarded as compatible partial quantities"
   }
 ]
